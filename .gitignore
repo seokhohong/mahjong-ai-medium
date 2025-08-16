@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+venv*/
+ENV/
+.env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Jupyter checkpoints
+*.ipynb_checkpoints/
+
+# Large data artifacts
+*.npz
+*.npy
+*.csv
+*.tsv
+*.parquet
+*.joblib
+*.pkl
+
+# Model artifacts
+*.pt
+*.pth
+*.onnx
+
+# Project data/output directories
+training_data/
+data/
+logs/
+training_data/logs/
+
+# Coverage / test cache
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Node (if used)
+node_modules/
+
+# IDE/editor
+.vscode/
+.idea/

@@ -1,0 +1,13 @@
+# Full Riichi Mah-jong Project
+
+Medium game implements a full game of riichi (east round 1 only)
+
+Not implemented yet:
+- houtei, haitei
+- renchan
+- rare yaku (sankantsu, yakuman)
+- kyushuu kyuhai (or 4 winds draw)
+- daburii
+- rinshan as yaku
+- fu from kanchan/penchan/tanki wins
+- fu from yakuhai pairs

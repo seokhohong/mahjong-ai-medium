@@ -1,0 +1,11 @@
+# Web
+Flask==2.3.3
+Werkzeug==2.3.7
+
+# Core numerics (Python 3.13 compatible)
+numpy>=1.26
+scipy>=1.11
+tqdm==4.66.1
+
+# Note: Install PyTorch separately using the official wheel index, e.g.:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121

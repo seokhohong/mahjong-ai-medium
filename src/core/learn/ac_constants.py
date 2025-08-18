@@ -9,18 +9,23 @@ MAIN_HEAD_INDEX = {name: idx for idx, name in enumerate(MAIN_HEAD_ORDER)}
 
 # Generic MediumJong constants for AC components
 NUM_PLAYERS: int = 4
-# Flat policy space sizing (discard 18 + chi 3 + pon 1 + ron 1 + tsumo 1 + pass 1 = 25)
-FLAT_POLICY_SIZE: int = 25
-# Tile index space (0 is padding; 1..18 represent suited ranks/suits per encoding)
+# Flat policy space sizing (discard (27 normal tiles + 3 aka + 7 honors) + chi (3 * 2, low, mid, high, with or without aka)
+# + pon (2, with or without aka) + kan (1, lets keep it simple) + riichi (37 tiles) + ron 1 + tsumo 1 + pass 1 = 76?
+FLAT_POLICY_SIZE: int = 76
+# Tile index space (0 is padding; 1..37 represent suited ranks/suits per encoding)
 TILE_INDEX_PAD: int = 0
-TILE_INDEX_SIZE: int = 19
-# Called-sets serialized default shape: [player, set_index, tiles_in_set]
-CALLED_SETS_DEFAULT_SHAPE = (4, 3, 3)
+TILE_INDEX_SIZE: int = 38
+
 # Training-time caps
-AC_MAX_CALLED_TILES_PER_PLAYER: int = 9
-AC_MAX_DISCARDS_PER_PLAYER: int = 30
+AC_MAX_CALLED_TILES_PER_PLAYER: int = 12
+AC_MAX_CALLS: int = 4
+AC_MAX_CALLED_SET_SIZE: int = 4
+# Called-sets serialized default shape: [player, set_index, tiles_in_set]
+CALLED_SETS_DEFAULT_SHAPE = (AC_MAX_CALLED_SET_SIZE, AC_MAX_CALLS, AC_MAX_CALLED_SET_SIZE)
+
+AC_MAX_DISCARDS_PER_PLAYER: int = 21
 # Game-state vector length used by serialization pipeline (fallback default)
-GAME_STATE_VEC_LEN: int = 64
+GAME_STATE_VEC_LEN: int = 32
 # Default maximum turns for episode rollout
 MAX_TURNS: int = 200
 

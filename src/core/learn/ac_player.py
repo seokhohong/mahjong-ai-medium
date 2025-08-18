@@ -17,9 +17,8 @@ from ..game import (
 	PassCall,
 )
 from ..game import MediumJong
-from ..encoding import tile_to_index
 from .ac_constants import chi_variant_index
-from .policy_utils import build_move_from_flat, legal_flat_mask
+from .policy_utils import build_move_from_flat
 
 
 class ACPlayer(Player):

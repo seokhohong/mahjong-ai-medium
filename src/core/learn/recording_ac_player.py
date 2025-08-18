@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import random
 from .ac_constants import chi_variant_index
-from .policy_utils import flat_index_for_action
-from ..learn.pure_policy_dataset import serialize_state, serialize_action  # type: ignore
+from .policy_utils import flat_index_for_action, serialize_action
+from .feature_engineering import encode_game_perspective
 
 from ..game import (
     Player,
@@ -24,9 +24,12 @@ from .ac_player import ACPlayer
 
 
 class ExperienceBuffer:
-    """Simple experience buffer for AC training: (GamePerspective, Action, Reward)."""
+    """Simple experience buffer for AC training: (encoded_features, action, reward).
+
+    encoded_features is the dict returned by encode_game_perspective.
+    """
     def __init__(self) -> None:
-        self.states: List[GamePerspective] = []
+        self.states: List[Dict[str, Any]] = []
         self.actions: List[Any] = []
         self.rewards: List[float] = []
         # Optional value baseline per step (e.g., V(s_t) from a network)
@@ -35,10 +38,10 @@ class ExperienceBuffer:
         self.main_log_probs: List[float] = []
         self.main_probs: List[List[float]] = []
 
-    def add(self, state: GamePerspective, action: Any, reward: float, value: float,
+    def add(self, state_features: Dict[str, Any], action: Any, reward: float, value: float,
             main_logp: float,
             main_probs: Optional[List[float]] = None) -> None:
-        self.states.append(state)
+        self.states.append(state_features)
         self.actions.append(action)
         self.rewards.append(float(reward))
         self.values.append(float(value))
@@ -95,13 +98,11 @@ class RecordingACPlayer(ACPlayer):
     # Record decisions along with value estimates from the network
     def play(self, game_state: GamePerspective):  # type: ignore[override]
         move, value, log_policy = self.compute_play(game_state)
-        # Use single source of truth for flat index mapping
-        sd = serialize_state(game_state)
-        ad = serialize_action(move)
-        flat_idx = int(flat_index_for_action(sd, ad))
+        # Build minimal state/action dicts for flat index mapping
+        flat_idx = int(flat_index_for_action(game_state, move))
         main_logp = float(log_policy[flat_idx]) if 0 <= flat_idx < log_policy.size else 0.0
         self.experience.add(
-            game_state,
+            encode_game_perspective(game_state),
             move,
             0.0,
             float(value if not self._zero_network_reward else 0.0),
@@ -112,13 +113,11 @@ class RecordingACPlayer(ACPlayer):
 
     def choose_reaction(self, game_state: GamePerspective, options: Dict[str, List[List[Tile]]]):  # type: ignore[override]
         move, value, log_policy = self.compute_play(game_state)
-        # Use single source of truth for flat index mapping
-        sd = serialize_state(game_state)
-        ad = serialize_action(move)
-        flat_idx = int(flat_index_for_action(sd, ad))
+        # Build minimal state/action dicts for flat index mapping
+        flat_idx = int(flat_index_for_action(game_state, move))
         main_logp = float(log_policy[flat_idx]) if 0 <= flat_idx < log_policy.size else 0.0
         self.experience.add(
-            game_state,
+            encode_game_perspective(game_state),
             move,
             0.0,
             float(value if not self._zero_network_reward else 0.0),
@@ -180,40 +179,3 @@ class RecordingHeuristicACPlayer(Player):
         self.experience.add(game_state, move, 0.0, 0.0, main_logp=0.0)
         return move
 
-
-
-def decode_action_from_logs(gs: GamePerspective, flat_policy: List[float], flat_logp: float) -> Any:
-    """Reconstruct an approximate action from recorded flat policy and chosen log-prob."""
-    # Prefer matching the exact flat index by probability
-    import math
-    target_p = math.exp(flat_logp)
-    tol = 1e-9
-
-    # Find any index in the flat policy that matches target probability within tolerance
-    for idx, p in enumerate(flat_policy):
-        if abs(float(p) - float(target_p)) <= max(tol, 1e-12):
-            # Map index to an action
-            if 0 <= idx <= 17:
-                # Pick a matching tile from hand if present
-                for t in gs.player_hand:
-                    if int(tile_to_index(t)) == int(idx):
-                        return Discard(t)
-                return Discard(gs.player_hand[0]) if gs.player_hand else PassCall()
-            if 18 <= idx <= 20:
-                opts = gs.get_call_options().get('chi', [])
-                last = getattr(gs, 'last_discarded_tile', None)
-                for pair in opts:
-                    v = chi_variant_index(last, pair)
-                    if v == (idx - 18):
-                        return Chi(pair)
-            if idx == 21:
-                opts = gs.get_call_options().get('pon', [])
-                return Pon(opts[0]) if opts else PassCall()
-            if idx == 22:
-                return Ron()
-            if idx == 23:
-                return Tsumo()
-            if idx == 24:
-                return PassCall()
-    # Fallback
-    return PassCall()

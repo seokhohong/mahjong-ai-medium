@@ -6,7 +6,7 @@ DEALER_ID_START: int = 0
 
 # Tiles
 TILE_COPIES_DEFAULT: int = 4
-STARTING_HAND_TILES: int = 13
+STANDARD_HAND_TILE_COUNT: int = 13
 DEAD_WALL_TILES: int = 14  # Riichi dead wall contains 14 tiles
 
 # Dora/Uradora

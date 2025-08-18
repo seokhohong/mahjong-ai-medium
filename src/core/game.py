@@ -7,7 +7,7 @@ from .constants import (
     NUM_PLAYERS as MC_NUM_PLAYERS,
     DEALER_ID_START,
     TILE_COPIES_DEFAULT,
-    STARTING_HAND_TILES,
+    STANDARD_HAND_TILE_COUNT,
     DEAD_WALL_TILES,
     INITIAL_DORA_INDICATORS,
     INITIAL_URADORA_INDICATORS,
@@ -239,8 +239,11 @@ def _can_complete_standard_with_calls(concealed_tiles: List[Tile], called_sets: 
     This function validates that the concealed tiles can be arranged into the
     remaining required melds plus a single pair.
     """
-    total_tiles = len(concealed_tiles) + sum(len(cs.tiles) for cs in called_sets)
-    if total_tiles != 14:
+    # For hand-completion purposes, each called set (including kans) contributes one meld
+    # worth of 3 tiles in the 4-melds+pair composition, not their literal 3 or 4 tiles.
+    effective_called_tiles = 3 * len(called_sets)
+    total_effective_tiles = len(concealed_tiles) + effective_called_tiles
+    if total_effective_tiles != 14:
         return False
     # Count how many called melds are already completed (all call types represent melds)
     called_melds = len(called_sets)
@@ -467,6 +470,57 @@ def _dora_next(tile: Tile) -> Tile:
     return Tile(tile.suit, TileType(nv))
 
 
+def hand_is_tenpai_for_tiles(tiles: List[Tile]) -> bool:
+    """Return True if the given 13-tile hand is in tenpai (one tile from completion).
+
+    Checks completion by adding any tile (including honors) to see if a standard
+    hand or seven pairs can be formed.
+    """
+    if len(tiles) != 13:
+        return False
+    # Try adding any suited tile
+    for suit in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
+        for value in range(1, 10):
+            t = Tile(suit, TileType(value))
+            if _can_form_standard_hand(tiles + [t]):
+                return True
+    # Honors
+    for honor in Honor:
+        t = Tile(Suit.HONORS, honor)
+        if _can_form_standard_hand(tiles + [t]):
+            return True
+    # Seven pairs check: 6 pairs + 1 singleton
+    counts = _count_tiles(tiles)
+    pairs = sum(1 for c in counts.values() if c == 2)
+    singles = sum(1 for c in counts.values() if c == 1)
+    return pairs == 6 and singles == 1
+
+
+def hand_is_tenpai(hand: List[Tile]) -> bool:
+    """Return True if the hand (expected size 13 in turn structure) is tenpai.
+
+    Mirrors the previous GamePerspective._is_tenpai behavior: only returns True
+    for hands with size congruent to 1 mod 3, using the same checks as
+    hand_is_tenpai_for_tiles when size is exactly 13.
+    """
+    if len(hand) % 3 != 1:
+        return False
+    if len(hand) == 13:
+        return hand_is_tenpai_for_tiles(hand)
+    # Fallback for abnormal sizes: try the generic completion probe
+    for suit in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
+        for value in range(1, 10):
+            t = Tile(suit, TileType(value))
+            if _can_form_standard_hand(hand + [t]):
+                return True
+    for honor in Honor:
+        t = Tile(Suit.HONORS, honor)
+        if _can_form_standard_hand(hand + [t]):
+            return True
+    # Seven pairs heuristic for 13 only already handled
+    return False
+
+
 def _calc_dora_han(hand_tiles: List[Tile], called_sets: List[CalledSet], indicators: List[Tile]) -> int:
     all_tiles: List[Tile] = []
     all_tiles.extend(hand_tiles)
@@ -643,8 +697,8 @@ class GamePerspective:
                  last_discard_player: Optional[int],
                  called_sets: Dict[int, List[CalledSet]],
                  player_discards: Dict[int, List[Tile]],
+                 called_discards: Dict[int, List[int]],
                  state: type,
-                 is_current_turn: bool,
                  newly_drawn_tile: Optional[Tile],
                  can_call: bool,
                  seat_winds: Dict[int, Honor],
@@ -658,8 +712,8 @@ class GamePerspective:
         self.last_discard_player = last_discard_player
         self.called_sets = {pid: list(sets) for pid, sets in called_sets.items()}
         self.player_discards = {pid: list(ts) for pid, ts in player_discards.items()}
+        self.called_discards = {pid: list(idxs) for pid, idxs in called_discards.items()}
         self.state = state
-        self.is_current_turn = is_current_turn
         self.newly_drawn_tile = newly_drawn_tile
         self.can_call = can_call
         self.seat_winds = dict(seat_winds)
@@ -689,55 +743,34 @@ class GamePerspective:
                 return True
         return False
 
-    def _is_tenpai(self) -> bool:
-        # Very rough: in action state, if adding any tile completes a standard/chiitoi hand
-        hand = list(self.player_hand)
-        if len(hand) % 3 != 1:
-            return False
-        for s in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
-            for v in range(1, 10):
-                t = Tile(s, TileType(v))
-                if _can_form_standard_hand(hand + [t]):
-                    return True
-        # Honors
-        for h in Honor:
-            t = Tile(Suit.HONORS, h)
-            if _can_form_standard_hand(hand + [t]):
-                return True
-        # Seven pairs check: if 13 tiles with 6 pairs and one singleton
-        if len(hand) == 13:
-            cnt = _count_tiles(hand)
-            pairs = sum(1 for c in cnt.values() if c == 2)
-            singles = sum(1 for c in cnt.values() if c == 1)
-            if pairs == 6 and singles == 1:
-                return True
-        return False
-
-    def _is_tenpai_for_tiles(self, tiles: List[Tile]) -> bool:
-        # Check tenpai for an arbitrary 13-tile hand
-        if len(tiles) != 13:
-            return False
-        # Try adding any tile to see completion
-        for s in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
-            for v in range(1, 10):
-                t = Tile(s, TileType(v))
-                if _can_form_standard_hand(tiles + [t]):
-                    return True
-        for h in Honor:
-            t = Tile(Suit.HONORS, h)
-            if _can_form_standard_hand(tiles + [t]):
-                return True
-        # Seven pairs check: 6 pairs + 1 singleton
-        cnt = _count_tiles(tiles)
-        pairs = sum(1 for c in cnt.values() if c == 2)
-        singles = sum(1 for c in cnt.values() if c == 1)
-        return pairs == 6 and singles == 1
+    # _is_tenpai and _is_tenpai_for_tiles moved to module-level helpers:
+    # use hand_is_tenpai and hand_is_tenpai_for_tiles
 
     def can_tsumo(self) -> bool:
         if self.newly_drawn_tile is None:
             return False
         # Require yaku
-        return self._win_possible(require_yaku=True)
+        # Evaluate win using current hand (already includes the drawn tile)
+        ct = list(self.player_hand)
+        cs = self.called_sets.get(self.player_id, [])
+        # Hand must be complete in standard or chiitoi form
+        complete = _is_chiitoi(ct, cs) or _can_complete_standard_with_calls(ct, cs)
+        if not complete:
+            return False
+        # Check yaku presence (menzen tsumo counts as yaku for closed hands)
+        all_tiles = ct + [t for s in cs for t in s.tiles]
+        if _is_tanyao(all_tiles) or _is_toitoi(all_tiles, cs) or _is_honitsu(all_tiles) or _is_chinitsu(all_tiles) or _is_chanta(all_tiles) or _is_junchan(all_tiles):
+            return True
+        if len(cs) == 0 and _has_iipeikou(ct):
+            return True
+        if _has_sanshoku_sequences(all_tiles) or _has_ittsu(all_tiles):
+            return True
+        if _yakuhai_han(ct, cs, self.seat_winds[self.player_id], self.round_wind) > 0:
+            return True
+        # Menzen tsumo yaku
+        if not _is_open_hand(cs):
+            return True
+        return False
 
     def can_ron(self) -> bool:
         if self.last_discarded_tile is None or self.last_discard_player == self.player_id:
@@ -751,18 +784,14 @@ class GamePerspective:
         ct = list(self.player_hand)
         if include_last_discard and self.last_discarded_tile is not None:
             ct = ct + [self.last_discarded_tile]
-        elif self.newly_drawn_tile is not None:
-            ct = ct + [self.newly_drawn_tile]
         cs = self.called_sets.get(self.player_id, [])
         ok = False
         if _is_chiitoi(ct, cs):
             ok = True
         # For standard hand, consider called sets when checking completeness
-        if _can_complete_standard_with_calls(ct, cs):
+        if _can_complete_standard_with_calls(ct, cs) or _can_form_standard_hand(ct):
             ok = True
-        # Fallback: if evaluating on a draw and the 14-tile concealed hand is standard-complete, allow win
-        if not ok and self.newly_drawn_tile is not None and len(ct) == 14 and _can_form_standard_hand(ct):
-            ok = True
+        # No extra fallback; standard completion already considered via ct (which may include drawn tile)
         if not ok:
             return False
         if not require_yaku:
@@ -842,6 +871,137 @@ class GamePerspective:
                 return True
         return False
 
+    def _tile_flat_index(self, tile: Tile) -> int:
+        """Map a Tile to a compact 0..34 index for action masks.
+        Suited aka 5s are mapped to 0m/0p/0s as 0, 9, 18 respectively.
+        Honors are 28..34 (E,S,W,N,P,G,R).
+        """
+        if tile.suit == Suit.MANZU:
+            if tile.tile_type == TileType.FIVE and tile.aka:
+                return 0
+            return int(tile.tile_type.value)
+        if tile.suit == Suit.PINZU:
+            if tile.tile_type == TileType.FIVE and tile.aka:
+                return 9
+            return 9 + int(tile.tile_type.value)
+        if tile.suit == Suit.SOUZU:
+            if tile.tile_type == TileType.FIVE and tile.aka:
+                return 18
+            return 18 + int(tile.tile_type.value)
+        # Honors 28..34
+        return 27 + int(tile.tile_type.value)
+
+    def _chi_variant_index(self, last_discarded_tile: Optional[Tile], tiles: List[Tile]) -> int:
+        # 0: [d-2, d-1], 1: [d-1, d+1], 2: [d+1, d+2]; -1 otherwise
+        if last_discarded_tile is None or len(tiles) < 2:
+            return -1
+        if last_discarded_tile.suit == Suit.HONORS:
+            return -1
+        d = int(last_discarded_tile.tile_type.value)
+        ranks = sorted(int(t.tile_type.value) for t in tiles)
+        if ranks == [d - 2, d - 1]:
+            return 0
+        if ranks == [d - 1, d + 1]:
+            return 1
+        if ranks == [d + 1, d + 2]:
+            return 2
+        return -1
+
+    def legal_flat_mask(self) -> List[int]:
+        """Return a flat 0/1 mask indicating legal actions in a fixed action space.
+
+        Layout (length 152):
+        - 0..34: Discard by tile index (0..34)
+        - 35..69: Riichi by discard tile index (0..34)
+        - 70: Tsumo
+        - 71: Ron
+        - 72..77: Chi variants without aka [low, mid, high] then with aka [low, mid, high]
+        - 78..79: Pon [no-aka, with-aka]
+        - 80: Kan (daiminkan) on last discard
+        - 81..115: Kan Kakan by tile index (0..34)
+        - 116..150: Kan Ankan by tile index (0..34)
+        - 151: Pass (only meaningful in reaction state)
+        """
+        TOTAL = 152
+        OFF_DISCARD = 0
+        OFF_RIICHI = 35
+        OFF_TSUMO = 70
+        OFF_RON = 71
+        OFF_CHI = 72            # 0..2 no-aka, 3..5 with-aka
+        OFF_PON_NOAKA = 78
+        OFF_PON_AKA = 79
+        OFF_KAN_DAIMIN = 80
+        OFF_KAKAN = 81
+        OFF_ANKAN = 116
+        OFF_PASS = 151
+
+        mask = [0] * TOTAL
+
+        # Tsumo
+        if self.is_legal(Tsumo()):
+            mask[OFF_TSUMO] = 1
+        # Ron
+        if self.can_ron():
+            mask[OFF_RON] = 1
+
+        # Discards
+        seen: set = set()
+        for t in self.player_hand:
+            idx = self._tile_flat_index(t)
+            if idx in seen:
+                continue
+            seen.add(idx)
+            if self.is_legal(Discard(t)):
+                mask[OFF_DISCARD + idx] = 1
+
+        # Riichi (parameterized by discard tile)
+        for m in self.legal_moves():
+            if isinstance(m, Riichi):
+                idx = self._tile_flat_index(m.tile)
+                mask[OFF_RIICHI + idx] = 1
+
+        # Kakan/Ankan opportunities
+        seen_kakan: set = set()
+        seen_ankan: set = set()
+        for t in self.player_hand:
+            idx = self._tile_flat_index(t)
+            if idx not in seen_kakan and self.is_legal(KanKakan(t)):
+                mask[OFF_KAKAN + idx] = 1
+                seen_kakan.add(idx)
+            if idx not in seen_ankan and self.is_legal(KanAnkan(t)):
+                mask[OFF_ANKAN + idx] = 1
+                seen_ankan.add(idx)
+
+        # Reaction options: Chi/Pon/KanDaimin/Pass
+        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player != self.player_id:
+            opts = self.get_call_options()
+            # Chi variants
+            for pair in opts.get('chi', []):
+                v = self._chi_variant_index(self.last_discarded_tile, pair)
+                if 0 <= v <= 2:
+                    # Aka if any of the three tiles is aka
+                    aka = any(t.aka for t in (pair + [self.last_discarded_tile]))
+                    offset = OFF_CHI + v + (3 if aka else 0)
+                    mask[offset] = 1
+            # Pon
+            for pon_pair in opts.get('pon', []):
+                aka = any(t.aka for t in (pon_pair + [self.last_discarded_tile]))
+                if aka:
+                    mask[OFF_PON_AKA] = 1
+                else:
+                    mask[OFF_PON_NOAKA] = 1
+            # Daiminkan
+            if opts.get('kan_daimin'):
+                mask[OFF_KAN_DAIMIN] = 1
+            # Pass
+            if self.is_legal(PassCall()):
+                mask[OFF_PASS] = 1
+
+        return mask
+
+    def discard_is_called(self, player_id: int, discard_index: int) -> bool:
+        return discard_index in self.called_discards.get(player_id, [])
+
     def get_call_options(self) -> Dict[str, List[List[Tile]]]:
         options = {'pon': [], 'chi': [], 'kan_daimin': []}  # kan_daimin: react to discard
         last = self.last_discarded_tile
@@ -866,7 +1026,7 @@ class GamePerspective:
         # Riichi restriction: after declaring, only Tsumo or Kan actions are allowed on own turn
         riichi_locked = self.riichi_declared.get(self.player_id, False)
         if isinstance(move, (Tsumo, Discard, Riichi, KanKakan, KanAnkan)):
-            if self.state is not Action or not self.is_current_turn:
+            if self.state is not Action:
                 return False
             if isinstance(move, Tsumo):
                 return self.can_tsumo()
@@ -881,7 +1041,7 @@ class GamePerspective:
                 # Check tenpai after discarding this tile (13 tiles state)
                 hand_after = list(self.player_hand)
                 hand_after.remove(move.tile)
-                return self._is_tenpai_for_tiles(hand_after)
+                return hand_is_tenpai_for_tiles(hand_after)
             if isinstance(move, KanKakan):
                 # Must have an existing pon of this tile
                 for cs in self.called_sets.get(self.player_id, []):
@@ -900,7 +1060,7 @@ class GamePerspective:
             return False
 
         # Reactions
-        if self.state is not Reaction or self.last_discarded_tile is None or self.last_discard_player == self.player_id:
+        if self.state is not Reaction:
             return False
         # Riichi restriction on reactions: cannot Chi/Pon/KanDaimin after declaring Riichi
         if riichi_locked and isinstance(move, (Pon, Chi, KanDaimin)):
@@ -945,7 +1105,7 @@ class GamePerspective:
                 moves.insert(0, PassCall())
             return moves
 
-        if self.state is Action and self.is_current_turn:
+        if self.state is Action:
             if self.can_tsumo():
                 moves.append(Tsumo())
             # Riichi declaration
@@ -1026,16 +1186,20 @@ class MediumJong:
         self._player_hands: Dict[int, List[Tile]] = {i: [] for i in range(4)}
         self._player_called_sets: Dict[int, List[CalledSet]] = {i: [] for i in range(4)}
         self.player_discards: Dict[int, List[Tile]] = {i: [] for i in range(4)}
+        # Track which discard indices were called by other players for each player
+        self.called_discards: Dict[int, List[int]] = {i: [] for i in range(4)}
         self.current_player_idx: int = 0
         self.game_over: bool = False
         self.winners: List[int] = []
         self.loser: Optional[int] = None
+        # whether the next step is an action or a reaction
+        self._next_move_is_action = True
         self.last_discarded_tile: Optional[Tile] = None
         self.last_discard_player: Optional[int] = None
         self.last_drawn_tile: Optional[Tile] = None
-        self.last_drawn_player: Optional[int] = None
+        # number of copies per tile
         self.tile_copies = tile_copies
-        self._skip_draw_for_current: bool = False
+        
         # Winds
         self.round_wind: Honor = Honor.EAST
         self.seat_winds: Dict[int, Honor] = {
@@ -1090,10 +1254,13 @@ class MediumJong:
 
         # Deal 13 tiles to each player (dealer draws first turn tile later)
         for pid in range(4):
-            for _ in range(STARTING_HAND_TILES):
+            for _ in range(STANDARD_HAND_TILE_COUNT):
                 self._player_hands[pid].append(self.tiles.pop())
 
     class IllegalMoveException(Exception):
+        pass
+
+    class IllegalGamePerspective(Exception):
         pass
 
     def hand(self, player_id: int) -> List[Tile]:
@@ -1103,13 +1270,13 @@ class MediumJong:
         return list(self._player_called_sets[player_id])
 
     def get_game_perspective(self, player_id: int) -> GamePerspective:
-        if self.current_player_idx == player_id:
-            state = Action
-            newly_drawn = self.last_drawn_tile if self.last_drawn_player == player_id else None
+        if self._next_move_is_action:
+            if player_id != self.current_player_idx:
+                raise MediumJong.IllegalGamePerspective("Instantiating Game Perspective for a player who has no legal action now")
         else:
-            state = Reaction if self.last_discarded_tile is not None and self.last_discard_player != player_id else Action
-            newly_drawn = None
-        is_current_turn = (self.current_player_idx == player_id) and (self.last_discarded_tile is None)
+            if player_id == self.current_player_idx:
+                raise MediumJong.IllegalGamePerspective(
+                    "Instantiating Game Perspective for a player who has no legal action now")
         return GamePerspective(
             player_hand=self._player_hands[player_id],
             player_id=player_id,
@@ -1118,9 +1285,9 @@ class MediumJong:
             last_discard_player=self.last_discard_player,
             called_sets=self._player_called_sets,
             player_discards=self.player_discards,
-            state=state,
-            is_current_turn=is_current_turn,
-            newly_drawn_tile=newly_drawn,
+            called_discards=self.called_discards,
+            state=Action if self._next_move_is_action else Reaction,
+            newly_drawn_tile=self.last_drawn_tile,
             can_call=self.last_discarded_tile is not None and self.last_discard_player != player_id,
             seat_winds=self.seat_winds,
             round_wind=self.round_wind,
@@ -1137,27 +1304,18 @@ class MediumJong:
             return []
         return self.get_game_perspective(actor_id).legal_moves()
 
-    def _draw_for_current_if_needed(self) -> None:
-        if self._skip_draw_for_current:
-            self._skip_draw_for_current = False
-            return
-        # If the current player already has a pending newly drawn tile (e.g., from rinshan),
-        # do not draw again before they act.
-        if self.last_drawn_tile is not None and self.last_drawn_player == self.current_player_idx:
-            return
-        if self.tiles:
-            t = self.tiles.pop()
-            self._player_hands[self.current_player_idx].append(t)
-            self.last_drawn_tile = t
-            self.last_drawn_player = self.current_player_idx
+    def _draw_tile(self) -> None:
+        assert self.tiles
+        t = self.tiles.pop()
+        self._player_hands[self.current_player_idx].append(t)
+        self.last_drawn_tile = t
 
     def _rinshan_draw(self) -> None:
         # Draw from dead wall (rinshan) after a Kan
-        if self.dead_wall:
-            t = self.dead_wall.pop()
-            self._player_hands[self.current_player_idx].append(t)
-            self.last_drawn_tile = t
-            self.last_drawn_player = self.current_player_idx
+        assert self.dead_wall
+        t = self.dead_wall.pop()
+        self._player_hands[self.current_player_idx].append(t)
+        self.last_drawn_tile = t
 
     def _add_kan_dora(self) -> None:
         # Flip an additional dora indicator from the dead wall (kandora); uradora mirrors count
@@ -1166,88 +1324,89 @@ class MediumJong:
         if len(self.dead_wall) >= 2:
             self.ura_dora_indicators.append(self.dead_wall[-2])
 
-    def step(self, actor_id: int, move: Union[Action, Reaction]) -> bool:
-        if not self.is_legal(actor_id, move):
-            raise MediumJong.IllegalMoveException("Illegal move")
+    def _step_action(self, actor_id, move: Action):
+        if isinstance(move, Tsumo):
+            self._on_win(actor_id, win_by_tsumo=True)
+        if isinstance(move, Riichi):
+            # Declare riichi by discarding specified tile
+            self.riichi_declared[actor_id] = True
+            self.riichi_ippatsu_active[actor_id] = True
+            self.riichi_sticks_pot += 1000
+            self._player_hands[actor_id].remove(move.tile)
+            self.player_discards[actor_id].append(move.tile)
+            self.last_discarded_tile = move.tile
+            self.last_discard_player = actor_id
+            self.last_discard_was_riichi = True
+            self._next_move_is_action = False
+        if isinstance(move, Discard):
+            self._player_hands[actor_id].remove(move.tile)
+            self.player_discards[actor_id].append(move.tile)
+            self.last_discarded_tile = move.tile
+            self.last_discard_player = actor_id
+            # Discard after riichi cancels ippatsu for this player
+            if self.riichi_declared.get(actor_id, False):
+                self.riichi_ippatsu_active[actor_id] = False
+            self.last_discard_was_riichi = False
+            self._next_move_is_action = False
+        if isinstance(move, KanKakan):
+            # Upgrade an existing pon to kan
+            # Remove the drawn tile from hand
+            self._player_hands[actor_id].remove(move.tile)
+            # Update called set to 4 tiles
+            for cs in self._player_called_sets[actor_id]:
+                if cs.call_type == 'pon' and cs.tiles and cs.tiles[0].suit == move.tile.suit and cs.tiles[
+                    0].tile_type == move.tile.tile_type:
+                    cs.call_type = 'kan_kakan'
+                    cs.tiles.append(move.tile)
+                    cs.called_tile = None
+                    cs.source_position = None
+                    break
+            # Any kan cancels ippatsu for all players
+            for pid in range(4):
+                self.riichi_ippatsu_active[pid] = False
+            self._add_kan_dora()
+            self._rinshan_draw()
+            # Continue action within the same overall turn after Kan
+            self._action()
+        if isinstance(move, KanAnkan):
+            # Remove four from hand
+            rm = 0
+            new_hand: List[Tile] = []
+            for t in self._player_hands[actor_id]:
+                if rm < 4 and t.suit == move.tile.suit and t.tile_type == move.tile.tile_type:
+                    rm += 1
+                else:
+                    new_hand.append(t)
+            self._player_hands[actor_id] = new_hand
+            self._player_called_sets[actor_id].append(
+                CalledSet(tiles=[Tile(move.tile.suit, move.tile.tile_type) for _ in range(4)], call_type='kan_ankan',
+                          called_tile=None, caller_position=actor_id, source_position=None))
+            # Any kan cancels ippatsu for all players
+            for pid in range(4):
+                self.riichi_ippatsu_active[pid] = False
+            self._add_kan_dora()
+            self._rinshan_draw()
+            # Continue action within the same overall turn after Kan
+            self._action()
 
-        # Actions by current player
-        if isinstance(move, (Tsumo, Discard, Riichi, KanKakan, KanAnkan)):
-            if isinstance(move, Tsumo):
-                self._on_win(actor_id, win_by_tsumo=True)
-                return True
-            if isinstance(move, Riichi):
-                # Declare riichi by discarding specified tile
-                self.riichi_declared[actor_id] = True
-                self.riichi_ippatsu_active[actor_id] = True
-                self.riichi_sticks_pot += 1000
-                self._player_hands[actor_id].remove(move.tile)
-                self.player_discards[actor_id].append(move.tile)
-                self.last_discarded_tile = move.tile
-                self.last_discard_player = actor_id
-                self.last_drawn_tile = None
-                self.last_drawn_player = None
-                self.last_discard_was_riichi = True
-                return True
-            if isinstance(move, Discard):
-                self._player_hands[actor_id].remove(move.tile)
-                self.player_discards[actor_id].append(move.tile)
-                self.last_discarded_tile = move.tile
-                self.last_discard_player = actor_id
-                self.last_drawn_tile = None
-                self.last_drawn_player = None
-                # Discard after riichi cancels ippatsu for this player
-                if self.riichi_declared.get(actor_id, False):
-                    self.riichi_ippatsu_active[actor_id] = False
-                self.last_discard_was_riichi = False
-                return True
-            if isinstance(move, KanKakan):
-                # Upgrade an existing pon to kan
-                # Remove the drawn tile from hand
-                self._player_hands[actor_id].remove(move.tile)
-                # Update called set to 4 tiles
-                for cs in self._player_called_sets[actor_id]:
-                    if cs.call_type == 'pon' and cs.tiles and cs.tiles[0].suit == move.tile.suit and cs.tiles[0].tile_type == move.tile.tile_type:
-                        cs.call_type = 'kan_kakan'
-                        cs.tiles.append(move.tile)
-                        cs.called_tile = None
-                        cs.source_position = None
-                        break
-                # Any kan cancels ippatsu for all players
-                for pid in range(4):
-                    self.riichi_ippatsu_active[pid] = False
-                self._add_kan_dora()
-                self._rinshan_draw()
-                return True
-            if isinstance(move, KanAnkan):
-                # Remove four from hand
-                rm = 0
-                new_hand: List[Tile] = []
-                for t in self._player_hands[actor_id]:
-                    if rm < 4 and t.suit == move.tile.suit and t.tile_type == move.tile.tile_type:
-                        rm += 1
-                    else:
-                        new_hand.append(t)
-                self._player_hands[actor_id] = new_hand
-                self._player_called_sets[actor_id].append(CalledSet(tiles=[Tile(move.tile.suit, move.tile.tile_type) for _ in range(4)], call_type='kan_ankan', called_tile=None, caller_position=actor_id, source_position=None))
-                # Any kan cancels ippatsu for all players
-                for pid in range(4):
-                    self.riichi_ippatsu_active[pid] = False
-                self._add_kan_dora()
-                self._rinshan_draw()
-                return True
-
+    def _step_reactions(self, actor_id, move: Reaction):
         # Reactions to discard
         if isinstance(move, Ron):
             if actor_id not in self.winners:
                 self.winners.append(actor_id)
             self.loser = self.last_discard_player
-            return True
         if isinstance(move, Pon):
             # Any call cancels ippatsu
             for pid in range(4):
                 self.riichi_ippatsu_active[pid] = False
             self.last_discard_was_riichi = False
             last = self.last_discarded_tile
+            # Mark the discarder index as called
+            discarder = self.last_discard_player
+            if discarder is not None:
+                called_idx = len(self.player_discards[discarder]) - 1
+                if called_idx >= 0:
+                    self.called_discards[discarder].append(called_idx)
             # Consume two tiles
             consumed = 0
             new_hand: List[Tile] = []
@@ -1258,17 +1417,21 @@ class MediumJong:
                     new_hand.append(t)
             self._player_hands[actor_id] = new_hand
             self._player_called_sets[actor_id].append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(3)], call_type='pon', called_tile=Tile(last.suit, last.tile_type), caller_position=actor_id, source_position=self.last_discard_player))
-            self.last_discarded_tile = None
-            self.last_discard_player = None
             self.current_player_idx = actor_id
-            self._skip_draw_for_current = True
-            return True
+            self._next_move_is_action= True
+            self._action()
         if isinstance(move, Chi):
             # Any call cancels ippatsu
             for pid in range(4):
                 self.riichi_ippatsu_active[pid] = False
             self.last_discard_was_riichi = False
             last = self.last_discarded_tile
+            # Mark the discarder index as called
+            discarder = self.last_discard_player
+            if discarder is not None:
+                called_idx = len(self.player_discards[discarder]) - 1
+                if called_idx >= 0:
+                    self.called_discards[discarder].append(called_idx)
             # Remove provided two tiles
             for t in move.tiles:
                 removed = False
@@ -1284,14 +1447,20 @@ class MediumJong:
             self.last_discarded_tile = None
             self.last_discard_player = None
             self.current_player_idx = actor_id
-            self._skip_draw_for_current = True
-            return True
+            self._next_move_is_action = True
+            self._action()
         if isinstance(move, KanDaimin):
             # Any call cancels ippatsu
             for pid in range(4):
                 self.riichi_ippatsu_active[pid] = False
             self.last_discard_was_riichi = False
             last = self.last_discarded_tile
+            # Mark the discarder index as called
+            discarder = self.last_discard_player
+            if discarder is not None:
+                called_idx = len(self.player_discards[discarder]) - 1
+                if called_idx >= 0:
+                    self.called_discards[discarder].append(called_idx)
             # Remove three from hand
             consumed = 0
             new_hand: List[Tile] = []
@@ -1307,30 +1476,40 @@ class MediumJong:
             self.current_player_idx = actor_id
             self._skip_draw_for_current = True
             self._add_kan_dora()
-            return True
 
-        raise MediumJong.IllegalMoveException("Unsupported move")
+    # performs exactly one action or reaction without triggering additional ones
+    # useful if we want to say, discard and then return before the other 3 players have a chance to react
+    def step(self, actor_id: int, move: Union[Action, Reaction]):
+        if not self.is_legal(actor_id, move):
+            raise MediumJong.IllegalMoveException("Illegal move")
 
+        # Actions by current player
+        if isinstance(move, (Tsumo, Discard, Riichi, KanKakan, KanAnkan)):
+            self._step_action(actor_id, move)
+        else:
+            self._step_reactions(actor_id, move)
+
+    # plays a full turn, an action + gives other players a chance to react
     def play_turn(self) -> Optional[int]:
-        # Do not declare exhaustive draw before the current player has a chance to act.
-        # We handle exhaustive draw after actions/reactions are resolved.
-        # Draw if needed
-        self._draw_for_current_if_needed()
-        # Act
+        # If we're out of tiles, we handle exhaustive draw
+        if not self.tiles and not self.game_over:
+            self._on_exhaustive_draw()
+            return
+
+        assert len(self._player_hands[self.current_player_idx]) <= STANDARD_HAND_TILE_COUNT
+        self._draw_tile()
+        self._action()
+        self.current_player_idx = (self.current_player_idx + 1) % 4
+
+    def _action(self) -> None:
         action = self.players[self.current_player_idx].play(self.get_game_perspective(self.current_player_idx))
         self.step(self.current_player_idx, action)
-        # Resolve reactions
-        if self.last_discarded_tile is not None and self.last_discard_player is not None:
+        # Resolve reactions if any
+        if self.last_discarded_tile is not None:
             self._resolve_reactions()
-            if self._skip_draw_for_current:
-                return None
-        # Exhaustive draw: if wall is empty now, no pending discard, and game not already over
-        if not self.tiles and self.last_discarded_tile is None and not self.game_over:
-            self._on_exhaustive_draw()
-            return None
-        # Advance
-        self.current_player_idx = (self.current_player_idx + 1) % 4
-        return None
+            # we already handled reactions
+            self.last_discarded_tile = None
+            self._next_move_is_action = True
 
     def _resolve_reactions(self) -> None:
         discarder = self.last_discard_player
@@ -1367,9 +1546,6 @@ class MediumJong:
         if isinstance(ch, Chi) and self.is_legal(left, ch):
             self.step(left, ch)
             return
-        # No calls; clear
-        self.last_discarded_tile = None
-        self.last_discard_player = None
 
     def _on_win(self, winner_id: int, win_by_tsumo: bool) -> None:
         self.winners = [winner_id]
@@ -1380,8 +1556,8 @@ class MediumJong:
         # Determine tenpai players using current hands
         tenpai_players: List[int] = []
         for pid in range(4):
-            gp = self.get_game_perspective(pid)
-            if gp._is_tenpai():
+            # Use direct hand tenpai check to avoid perspective constraints
+            if hand_is_tenpai(self._player_hands[pid]):
                 tenpai_players.append(pid)
         n_t = len(tenpai_players)
         payments: Dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}

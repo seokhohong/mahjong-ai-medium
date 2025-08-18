@@ -29,8 +29,8 @@ from src.core.game import (
     Ron,
     Discard,
 )
-from src.core.learn_ac.ac_network import ACNetwork
-from src.core.learn_ac.ac_player import ACPlayer
+from src.core.learn.ac_network import ACNetwork
+from src.core.learn.ac_player import ACPlayer
 
 
 def _fmt_hand(tiles: List[Tile]) -> str:

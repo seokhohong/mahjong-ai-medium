@@ -342,7 +342,7 @@ class TestScoring(unittest.TestCase):
             Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
             Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.THREE),
         ]
-        g._player_hands[0] = dealer_wait
+        g._player_hands[0] = dealer_wait.copy()
         # Deterministic draw and indicators
         g.tiles = [Tile(Suit.SOUZU, TileType.SIX)]  # any simple that completes the third sequence
         g.dead_wall = []
@@ -358,7 +358,7 @@ class TestScoring(unittest.TestCase):
                          NoReactionPlayer(2),
                          NoReactionPlayer(3)])
         nondealer_wait = list(dealer_wait)
-        g2._player_hands[1] = list(nondealer_wait)
+        g2._player_hands[1] = nondealer_wait.copy()
         # Make it player 1's turn directly and provide winning tile draw
         g2.current_player_idx = 1
         g2.tiles = [Tile(Suit.SOUZU, TileType.SIX)]

@@ -69,9 +69,7 @@ class ACPlayer(Player):
 		"""Evaluate once and return (move, value, log_policy) over 25 actions."""
 		policy, value = self.network.evaluate(gs)
 		flat = np.asarray(policy, dtype=np.float64)
-		mask = legal_flat_mask(gs)
-		if not np.any(mask):
-			raise MediumJong.IllegalMoveException("No legal actions available")
+		mask = gs.legal_flat_mask_np()
 		eff_policy = self._temper_and_mask(flat, mask)
 		move = np.argmax(eff_policy)
 		# Avoid log(0) by clipping for logging

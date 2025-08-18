@@ -4,18 +4,14 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-try:
-	import torch
-	import torch.nn as nn
-	import torch.nn.functional as F
-	TORCH_AVAILABLE = True
-except Exception:  # pragma: no cover
-	TORCH_AVAILABLE = False
+# Torch is installed in the project's Python environment (.venv312). Import directly.
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from ..game import GamePerspective, Tile, TileType, Suit
 from .feature_engineering import encode_game_perspective
 from .ac_constants import (
-	MAX_TURNS,
 	NUM_PLAYERS as AC_NUM_PLAYERS,
 	FLAT_POLICY_SIZE,
 	TILE_INDEX_SIZE,
@@ -35,12 +31,9 @@ class ACNetwork:
 	All heads share the same feature extractor from inputs to the pre-head layer.
 	"""
 
-	def __init__(self, hidden_size: int = 128, embedding_dim: int = 4, max_turns: int = MAX_TURNS, temperature: float = 1.0):
-		if not TORCH_AVAILABLE:
-			raise ImportError("PyTorch is required for ACNetwork. Please install torch.")
+	def __init__(self, hidden_size: int = 128, embedding_dim: int = 4, temperature: float = 1.0):
 		self.hidden_size = hidden_size
 		self.embedding_dim = embedding_dim
-		self.max_turns = max_turns
 		self.temperature = float(max(0.0, temperature))
 
 		from ..constants import TOTAL_TILES, GAME_STATE_VEC_LEN as GSV
@@ -129,7 +122,7 @@ class ACNetwork:
 		from ..constants import GAME_STATE_VEC_LEN as GSV
 		# Hand embeddings (index < 0 is padding and will be zeroed). We assume inputs are already fixed-size.
 		hand_idx_safe = np.asarray(hand_idx, dtype=np.int32)
-		valid_mask = (hand_idx_safe >= 0)
+		valid_mask = (hand_idx_safe >= 0) #need the >=0 to avoid padding
 		hand_emb = np.zeros((hand_idx_safe.shape[0], self.embedding_dim), dtype=np.float32)
 		hand_emb[valid_mask] = self._embedding_table[hand_idx_safe[valid_mask]]
 		hand_seq = np.transpose(hand_emb, (1, 0))  # (embed, hand_len)
@@ -196,9 +189,6 @@ class ACNetwork:
 		- When load_entire_module is True: if the file contains a serialized nn.Module, replace the internal
 		  module with it. This allows swapping in networks with different parameterizations.
 		"""
-		if not TORCH_AVAILABLE:
-			raise ImportError("PyTorch is required for ACNetwork.load_model. Please install torch.")
-		import torch  # local import for consistency with environment
 		obj = torch.load(path, map_location=(map_location or self._device))
 		# Case 1: replace entire module
 		if load_entire_module and isinstance(obj, torch.nn.Module):
@@ -231,8 +221,6 @@ class ACNetwork:
 		- When save_entire_module is False (default): saves only state_dict for portability.
 		- When True: saves the entire nn.Module (architecture + weights).
 		"""
-		if not TORCH_AVAILABLE:
-			raise ImportError("PyTorch is required for ACNetwork.save_model. Please install torch.")
 		import torch
 		if save_entire_module:
 			torch.save(self._net, path)

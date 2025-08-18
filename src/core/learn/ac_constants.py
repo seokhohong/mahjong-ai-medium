@@ -9,9 +9,19 @@ MAIN_HEAD_INDEX = {name: idx for idx, name in enumerate(MAIN_HEAD_ORDER)}
 
 # Generic MediumJong constants for AC components
 NUM_PLAYERS: int = 4
-# Flat policy space sizing (discard (27 normal tiles + 3 aka + 7 honors) + chi (3 * 2, low, mid, high, with or without aka)
-# + pon (2, with or without aka) + kan (1, lets keep it simple) + riichi (37 tiles) + ron 1 + tsumo 1 + pass 1 = 76?
-FLAT_POLICY_SIZE: int = 76
+# Flat policy space sizing matches policy_utils/build_move_from_flat and GamePerspective.legal_flat_mask
+# Layout (length 152):
+# 0..34:  Discard by tile index
+# 35..69: Riichi by discard tile
+# 70:     Tsumo
+# 71:     Ron
+# 72..77: Chi variants (no-aka 0..2, with-aka 3..5)
+# 78..79: Pon (no-aka, with-aka)
+# 80:     Kan Daimin
+# 81..115: Kan Kakan by tile index
+# 116..150: Kan Ankan by tile index
+# 151:    Pass
+FLAT_POLICY_SIZE: int = 152
 # Tile index space (0 is padding; 1..37 represent suited ranks/suits per encoding)
 TILE_INDEX_PAD: int = 0
 TILE_INDEX_SIZE: int = 38

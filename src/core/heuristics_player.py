@@ -65,16 +65,18 @@ class MediumHeuristicsPlayer(Player):
     """
 
     def play(self, game_state: GamePerspective):  # type: ignore[override]
+        # Fetch legal moves once to avoid repeated computation
+        legal_moves = game_state.legal_moves()
         # Win immediately if possible
-        for m in game_state.legal_moves():
+        for m in legal_moves:
             if isinstance(m, Tsumo):
                 return m
         # Declare Riichi if available
-        for m in game_state.legal_moves():
+        for m in legal_moves:
             if isinstance(m, Riichi):
                 return m
         # Choose a discard per heuristic
-        discards = [m for m in game_state.legal_moves() if isinstance(m, Discard)]
+        discards = [m for m in legal_moves if isinstance(m, Discard)]
         if discards:
             hand = list(game_state.player_hand)
             counts = _count_in_hand(hand)
@@ -112,24 +114,30 @@ class MediumHeuristicsPlayer(Player):
             return discards[0]
 
         # Fallback: first legal move
-        return game_state.legal_moves()[0]
+        return legal_moves[0]
 
     def choose_reaction(self, game_state: GamePerspective, options):  # type: ignore[override]
-        # Ron if possible
+        # Ron if possible (fast path)
         if game_state.can_ron():
             return Ron()
-        # Decide if we allow calling chi/pon
+        # Avoid recomputing derived values repeatedly
         hand = list(game_state.player_hand)
-        allow_calls = _has_yakuhai_anko(hand, game_state.seat_winds[game_state.player_id], game_state.round_wind) or _is_tanyao_hand(hand)
+        seat_wind = game_state.seat_winds[game_state.player_id]
+        round_wind = game_state.round_wind
+        allow_calls = _has_yakuhai_anko(hand, seat_wind, round_wind) or _is_tanyao_hand(hand)
         if not allow_calls:
             return PassCall()
         # Prefer KanDaimin over Pon over Chi if allowed
-        if options and options.get('kan_daimin'):
-            return KanDaimin(options['kan_daimin'][0])
-        if options and options.get('pon'):
-            return Pon(options['pon'][0])
-        if options and options.get('chi'):
-            return Chi(options['chi'][0])
+        if options:
+            kd = options.get('kan_daimin')
+            if kd:
+                return KanDaimin(kd[0])
+            p = options.get('pon')
+            if p:
+                return Pon(p[0])
+            c = options.get('chi')
+            if c:
+                return Chi(c[0])
         return PassCall()
 
 

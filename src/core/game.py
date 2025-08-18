@@ -24,7 +24,7 @@ from .constants import (
     SANSOKU_CLOSED_HAN,
     IIPEIKOU_HAN,
     ITTSU_OPEN_HAN,
-    ITTSU_CLOSED_HAN,
+    ITTSU_CLOSED_HAN, STANDARD_HAND_TILE_COUNT,
 )
 
 
@@ -166,100 +166,6 @@ def _is_suited(t: Tile) -> bool:
 
 def _tile_sort_key(t: Tile) -> Tuple[int, int]:
     return (SUIT_ORDER[t.suit.value], int(t.tile_type.value))
-
-
-def _can_form_melds_concealed(tiles: List[Tile], num_melds: int) -> bool:
-    # Triplets/sequences; honors cannot form sequences
-    if num_melds == 0:
-        return len(tiles) == 0
-    if len(tiles) != 3 * num_melds:
-        return False
-
-    # Build counts by suit
-    counts: Dict[Suit, List[int]] = {
-        Suit.MANZU: [0] * 10,
-        Suit.PINZU: [0] * 10,
-        Suit.SOUZU: [0] * 10,
-    }
-    honors = [0] * 8  # 1..7
-    for t in tiles:
-        if t.suit == Suit.HONORS:
-            honors[int(t.tile_type.value)] += 1
-        else:
-            counts[t.suit][int(t.tile_type.value)] += 1
-
-    # Honors: must form triplets only
-    for i in range(1, 8):
-        if honors[i] % 3 != 0:
-            return False
-
-    def dfs() -> bool:
-        # First any suit with tiles
-        for suit in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
-            c = counts[suit]
-            for i in range(1, 10):
-                if c[i] > 0:
-                    # Triplet
-                    if c[i] >= 3:
-                        c[i] -= 3
-                        if dfs():
-                            return True
-                        c[i] += 3
-                    # Sequence
-                    if i <= 7 and c[i+1] > 0 and c[i+2] > 0:
-                        c[i] -= 1; c[i+1] -= 1; c[i+2] -= 1
-                        if dfs():
-                            return True
-                        c[i] += 1; c[i+1] += 1; c[i+2] += 1
-                    return False
-        return True
-
-    return dfs()
-
-
-def _can_form_standard_hand(tiles: List[Tile]) -> bool:
-    # 14 tiles: 4 melds + 1 pair; honors can only be triplets/pairs
-    if len(tiles) != 14:
-        return False
-    tiles = sorted(list(tiles), key=_tile_sort_key)
-    # Try all possible pairs by value
-    for idx in range(len(tiles) - 1):
-        a, b = tiles[idx], tiles[idx + 1]
-        if a.suit == b.suit and a.tile_type == b.tile_type:
-            remaining = tiles[:idx] + tiles[idx+2:]
-            if _can_form_melds_concealed(remaining, 4):
-                return True
-    return False
-
-
-def _can_complete_standard_with_calls(concealed_tiles: List[Tile], called_sets: List[CalledSet]) -> bool:
-    """Return True if the player's hand can form a standard hand (4 melds + 1 pair)
-    considering that some melds may already be completed via called sets.
-
-    This function validates that the concealed tiles can be arranged into the
-    remaining required melds plus a single pair.
-    """
-    # For hand-completion purposes, each called set (including kans) contributes one meld
-    # worth of 3 tiles in the 4-melds+pair composition, not their literal 3 or 4 tiles.
-    effective_called_tiles = 3 * len(called_sets)
-    total_effective_tiles = len(concealed_tiles) + effective_called_tiles
-    if total_effective_tiles != 14:
-        return False
-    # Count how many called melds are already completed (all call types represent melds)
-    called_melds = len(called_sets)
-    if called_melds > 4:
-        return False
-    needed_melds_from_concealed = 4 - called_melds
-    # After taking out one pair, the number of tiles left in concealed must be 3 * needed_melds_from_concealed
-    tiles = sorted(list(concealed_tiles), key=_tile_sort_key)
-    for idx in range(len(tiles) - 1):
-        a, b = tiles[idx], tiles[idx + 1]
-        if a.suit == b.suit and a.tile_type == b.tile_type:
-            remaining = tiles[:idx] + tiles[idx+2:]
-            if len(remaining) == 3 * needed_melds_from_concealed and _can_form_melds_concealed(remaining, needed_melds_from_concealed):
-                return True
-    return needed_melds_from_concealed == 0 and len(concealed_tiles) == 2 and concealed_tiles[0].suit == concealed_tiles[1].suit and concealed_tiles[0].tile_type == concealed_tiles[1].tile_type
-
 
 def _decompose_standard_with_pred(tiles: List[Tile], pred_meld, pred_pair) -> bool:
     """Try to decompose into 4 melds + 1 pair satisfying predicates.
@@ -471,54 +377,15 @@ def _dora_next(tile: Tile) -> Tile:
 
 
 def hand_is_tenpai_for_tiles(tiles: List[Tile]) -> bool:
-    """Return True if the given 13-tile hand is in tenpai (one tile from completion).
-
-    Checks completion by adding any tile (including honors) to see if a standard
-    hand or seven pairs can be formed.
-    """
-    if len(tiles) != 13:
-        return False
-    # Try adding any suited tile
-    for suit in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
-        for value in range(1, 10):
-            t = Tile(suit, TileType(value))
-            if _can_form_standard_hand(tiles + [t]):
-                return True
-    # Honors
-    for honor in Honor:
-        t = Tile(Suit.HONORS, honor)
-        if _can_form_standard_hand(tiles + [t]):
-            return True
-    # Seven pairs check: 6 pairs + 1 singleton
-    counts = _count_tiles(tiles)
-    pairs = sum(1 for c in counts.values() if c == 2)
-    singles = sum(1 for c in counts.values() if c == 1)
-    return pairs == 6 and singles == 1
+    # Use extracted implementation
+    from .tenpai import hand_is_tenpai_for_tiles as _tenpai_tiles
+    return _tenpai_tiles(tiles)
 
 
 def hand_is_tenpai(hand: List[Tile]) -> bool:
-    """Return True if the hand (expected size 13 in turn structure) is tenpai.
-
-    Mirrors the previous GamePerspective._is_tenpai behavior: only returns True
-    for hands with size congruent to 1 mod 3, using the same checks as
-    hand_is_tenpai_for_tiles when size is exactly 13.
-    """
-    if len(hand) % 3 != 1:
-        return False
-    if len(hand) == 13:
-        return hand_is_tenpai_for_tiles(hand)
-    # Fallback for abnormal sizes: try the generic completion probe
-    for suit in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
-        for value in range(1, 10):
-            t = Tile(suit, TileType(value))
-            if _can_form_standard_hand(hand + [t]):
-                return True
-    for honor in Honor:
-        t = Tile(Suit.HONORS, honor)
-        if _can_form_standard_hand(hand + [t]):
-            return True
-    # Seven pairs heuristic for 13 only already handled
-    return False
+    from .tenpai import hand_is_tenpai as _tenpai
+    # Closed hand path preserved; game-level exhaustive draw checks tenpai without calls
+    return _tenpai(hand)
 
 
 def _calc_dora_han(hand_tiles: List[Tile], called_sets: List[CalledSet], indicators: List[Tile]) -> int:
@@ -546,12 +413,8 @@ def _is_tanyao(all_tiles: List[Tile]) -> bool:
 
 
 def _is_chiitoi(concealed_tiles: List[Tile], called_sets: List[CalledSet]) -> bool:
-    if called_sets:
-        return False
-    if len(concealed_tiles) != 14:
-        return False
-    cnt = _count_tiles(concealed_tiles)
-    return sum(1 for c in cnt.values() if c == 2) == 7
+    from .tenpai import is_chiitoi as _chiitoi
+    return _chiitoi(concealed_tiles, called_sets)
 
 
 def _count_triplet_value(cnt: Dict[Tuple[Suit, int], int], suit: Suit, val: int) -> int:
@@ -729,7 +592,8 @@ class GamePerspective:
         cs = self.called_sets.get(self.player_id, [])
         if _is_chiitoi(ct, cs):
             return True
-        if len(ct) == 14 and _can_form_standard_hand(ct + []):
+        from .tenpai import can_complete_standard_with_calls
+        if can_complete_standard_with_calls(ct, cs):
             all_tiles = ct + [t for s in cs for t in s.tiles]
             if _is_tanyao(all_tiles):
                 return True
@@ -743,9 +607,6 @@ class GamePerspective:
                 return True
         return False
 
-    # _is_tenpai and _is_tenpai_for_tiles moved to module-level helpers:
-    # use hand_is_tenpai and hand_is_tenpai_for_tiles
-
     def can_tsumo(self) -> bool:
         if self.newly_drawn_tile is None:
             return False
@@ -754,7 +615,8 @@ class GamePerspective:
         ct = list(self.player_hand)
         cs = self.called_sets.get(self.player_id, [])
         # Hand must be complete in standard or chiitoi form
-        complete = _is_chiitoi(ct, cs) or _can_complete_standard_with_calls(ct, cs)
+        from .tenpai import can_complete_standard_with_calls
+        complete = _is_chiitoi(ct, cs) or can_complete_standard_with_calls(ct, cs)
         if not complete:
             return False
         # Check yaku presence (menzen tsumo counts as yaku for closed hands)
@@ -789,7 +651,8 @@ class GamePerspective:
         if _is_chiitoi(ct, cs):
             ok = True
         # For standard hand, consider called sets when checking completeness
-        if _can_complete_standard_with_calls(ct, cs) or _can_form_standard_hand(ct):
+        from .tenpai import can_complete_standard_with_calls
+        if can_complete_standard_with_calls(ct, cs):
             ok = True
         # No extra fallback; standard completion already considered via ct (which may include drawn tile)
         if not ok:
@@ -828,39 +691,9 @@ class GamePerspective:
         return False
 
     def _waits(self) -> List[Tile]:
-        # List all tiles that complete a standard 4+pair or chiitoi from current 13-tile hand (ignoring yaku)
-        hand = list(self.player_hand)
-        waits: List[Tile] = []
-        if len(hand) != 13:
-            return waits
-        seen_keys: set = set()
-        # Standard waits
-        for s in (Suit.MANZU, Suit.PINZU, Suit.SOUZU):
-            for v in range(1, 10):
-                t = Tile(s, TileType(v))
-                if _can_form_standard_hand(hand + [t]):
-                    key = (t.suit.value, int(t.tile_type.value))
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        waits.append(t)
-        for h in Honor:
-            t = Tile(Suit.HONORS, h)
-            if _can_form_standard_hand(hand + [t]):
-                key = (t.suit.value, int(t.tile_type.value))
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    waits.append(t)
-        # Seven pairs wait (6 pairs + 1 singleton)
-        cnt = _count_tiles(hand)
-        pairs = sum(1 for c in cnt.values() if c == 2)
-        if pairs == 6:
-            for (suit, val), c in cnt.items():
-                if c == 1:
-                    t = Tile(suit, TileType(val)) if suit != Suit.HONORS else Tile(Suit.HONORS, Honor(val))
-                    key = (t.suit.value, int(t.tile_type.value))
-                    if key not in seen_keys:
-                        waits.append(t)
-        return waits
+        # Delegate to extracted waits function for consistency and speed
+        from .tenpai import waits_for_tiles
+        return waits_for_tiles(list(self.player_hand))
 
     def _is_furiten(self) -> bool:
         # If any wait tile is in own discards, furiten applies
@@ -999,6 +832,14 @@ class GamePerspective:
 
         return mask
 
+    def legal_flat_mask_np(self):
+        """Return the legal actions mask as a numpy 1D array of 0/1 with length 152.
+
+        This mirrors legal_flat_mask but returns an np.ndarray for downstream models.
+        """
+        import numpy as _np  # local import to avoid hard dependency at module import time
+        return _np.asarray(self.legal_flat_mask(), dtype=_np.float64)
+
     def discard_is_called(self, player_id: int, discard_index: int) -> bool:
         return discard_index in self.called_discards.get(player_id, [])
 
@@ -1039,9 +880,10 @@ class GamePerspective:
                 if move.tile not in self.player_hand:
                     return False
                 # Check tenpai after discarding this tile (13 tiles state)
+                from .tenpai import hand_is_tenpai_for_tiles as _tenpai_tiles
                 hand_after = list(self.player_hand)
                 hand_after.remove(move.tile)
-                return hand_is_tenpai_for_tiles(hand_after)
+                return _tenpai_tiles(hand_after)
             if isinstance(move, KanKakan):
                 # Must have an existing pon of this tile
                 for cs in self.called_sets.get(self.player_id, []):
@@ -1496,7 +1338,6 @@ class MediumJong:
             self._on_exhaustive_draw()
             return
 
-        assert len(self._player_hands[self.current_player_idx]) <= STANDARD_HAND_TILE_COUNT
         self._draw_tile()
         self._action()
         self.current_player_idx = (self.current_player_idx + 1) % 4
@@ -1553,10 +1394,9 @@ class MediumJong:
         self.game_over = True
 
     def _on_exhaustive_draw(self) -> None:
-        # Determine tenpai players using current hands
+        # Determine tenpai players using current hands without constructing perspectives
         tenpai_players: List[int] = []
         for pid in range(4):
-            # Use direct hand tenpai check to avoid perspective constraints
             if hand_is_tenpai(self._player_hands[pid]):
                 tenpai_players.append(pid)
         n_t = len(tenpai_players)

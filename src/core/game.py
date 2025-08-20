@@ -554,7 +554,6 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
 class GamePerspective:
     def __init__(self,
                  player_hand: List[Tile],
-                 player_id: int,
                  remaining_tiles: int,
                  last_discarded_tile: Optional[Tile],
                  last_discard_player: Optional[int],
@@ -569,7 +568,6 @@ class GamePerspective:
                  riichi_declared: Dict[int, bool],
                  ) -> None:
         self.player_hand = sorted(list(player_hand), key=_tile_sort_key)
-        self.player_id = player_id
         self.remaining_tiles = remaining_tiles
         self.last_discarded_tile = last_discarded_tile
         self.last_discard_player = last_discard_player
@@ -589,7 +587,7 @@ class GamePerspective:
     def _has_yaku_if_complete(self) -> bool:
         # Simple heuristic: evaluate yaku on this hand if it is standard or chiitoi
         ct = self._concealed_tiles()
-        cs = self.called_sets.get(self.player_id, [])
+        cs = self.called_sets.get(0, [])
         if _is_chiitoi(ct, cs):
             return True
         from .tenpai import can_complete_standard_with_calls
@@ -603,7 +601,7 @@ class GamePerspective:
                 return True
             if _is_chanta(all_tiles) or _is_junchan(all_tiles):
                 return True
-            if _yakuhai_han(ct, cs, self.seat_winds[self.player_id], self.round_wind) > 0:
+            if _yakuhai_han(ct, cs, self.seat_winds[0], self.round_wind) > 0:
                 return True
         return False
 
@@ -613,7 +611,7 @@ class GamePerspective:
         # Require yaku
         # Evaluate win using current hand (already includes the drawn tile)
         ct = list(self.player_hand)
-        cs = self.called_sets.get(self.player_id, [])
+        cs = self.called_sets.get(0, [])
         # Hand must be complete in standard or chiitoi form
         from .tenpai import can_complete_standard_with_calls
         complete = _is_chiitoi(ct, cs) or can_complete_standard_with_calls(ct, cs)
@@ -627,7 +625,7 @@ class GamePerspective:
             return True
         if _has_sanshoku_sequences(all_tiles) or _has_ittsu(all_tiles):
             return True
-        if _yakuhai_han(ct, cs, self.seat_winds[self.player_id], self.round_wind) > 0:
+        if _yakuhai_han(ct, cs, self.seat_winds[0], self.round_wind) > 0:
             return True
         # Menzen tsumo yaku
         if not _is_open_hand(cs):
@@ -635,7 +633,7 @@ class GamePerspective:
         return False
 
     def can_ron(self) -> bool:
-        if self.last_discarded_tile is None or self.last_discard_player == self.player_id:
+        if self.last_discarded_tile is None or self.last_discard_player == 0:
             return False
         # Furiten blocks ron
         if self._is_furiten():
@@ -646,7 +644,7 @@ class GamePerspective:
         ct = list(self.player_hand)
         if include_last_discard and self.last_discarded_tile is not None:
             ct = ct + [self.last_discarded_tile]
-        cs = self.called_sets.get(self.player_id, [])
+        cs = self.called_sets.get(0, [])
         ok = False
         if _is_chiitoi(ct, cs):
             ok = True
@@ -678,10 +676,10 @@ class GamePerspective:
         # Ittsu contributes yaku for win
         if _has_ittsu(all_tiles):
             return True
-        if _yakuhai_han(ct, cs, self.seat_winds[self.player_id], self.round_wind) > 0:
+        if _yakuhai_han(ct, cs, self.seat_winds[0], self.round_wind) > 0:
             return True
         # Pinfu (closed only) counts as yaku for win condition
-        if not _is_open_hand(cs) and _is_pinfu(all_tiles, cs, self.seat_winds[self.player_id], self.round_wind):
+        if not _is_open_hand(cs) and _is_pinfu(all_tiles, cs, self.seat_winds[0], self.round_wind):
             return True
         if _is_chiitoi(ct, cs):
             return True
@@ -698,7 +696,7 @@ class GamePerspective:
     def _is_furiten(self) -> bool:
         # If any wait tile is in own discards, furiten applies
         waits = self._waits()
-        own_discards = self.player_discards.get(self.player_id, [])
+        own_discards = self.player_discards.get(0, [])
         for w in waits:
             if any(d.suit == w.suit and d.tile_type == w.tile_type for d in own_discards):
                 return True
@@ -806,7 +804,7 @@ class GamePerspective:
                 seen_ankan.add(idx)
 
         # Reaction options: Chi/Pon/KanDaimin/Pass
-        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player != self.player_id:
+        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player != 0:
             opts = self.get_call_options()
             # Chi variants
             for pair in opts.get('chi', []):
@@ -847,7 +845,7 @@ class GamePerspective:
         options = {'pon': [], 'chi': [], 'kan_daimin': []}  # kan_daimin: react to discard
         last = self.last_discarded_tile
         lp = self.last_discard_player
-        if last is None or lp is None or lp == self.player_id:
+        if last is None or lp is None or lp == 0:
             return options
         hand = list(self.player_hand)
         # Pon
@@ -855,7 +853,7 @@ class GamePerspective:
         if len(same) >= 2:
             options['pon'].append([same[0], same[1]])
         # Chi (left player only)
-        if self.player_id == (lp + 1) % 4 and last.suit != Suit.HONORS:
+        if 0 == (lp + 1) % 4 and last.suit != Suit.HONORS:
             for pair in _is_chi_possible_with(hand, last):
                 options['chi'].append(pair)
         # Daiminkan: need three in hand
@@ -865,7 +863,7 @@ class GamePerspective:
 
     def is_legal(self, move: Union[Action, Reaction]) -> bool:
         # Riichi restriction: after declaring, only Tsumo or Kan actions are allowed on own turn
-        riichi_locked = self.riichi_declared.get(self.player_id, False)
+        riichi_locked = self.riichi_declared.get(0, False)
         if isinstance(move, (Tsumo, Discard, Riichi, KanKakan, KanAnkan)):
             if self.state is not Action:
                 return False
@@ -873,9 +871,9 @@ class GamePerspective:
                 return self.can_tsumo()
             if isinstance(move, Riichi):
                 # Closed hand, not already in riichi, and discarding specified tile keeps tenpai
-                if self.riichi_declared.get(self.player_id, False):
+                if self.riichi_declared.get(0, False):
                     return False
-                if self.called_sets.get(self.player_id, []):
+                if self.called_sets.get(0, []):
                     return False
                 if move.tile not in self.player_hand:
                     return False
@@ -886,7 +884,7 @@ class GamePerspective:
                 return _tenpai_tiles(hand_after)
             if isinstance(move, KanKakan):
                 # Must have an existing pon of this tile
-                for cs in self.called_sets.get(self.player_id, []):
+                for cs in self.called_sets.get(0, []):
                     if cs.call_type == 'pon' and cs.tiles and cs.tiles[0].suit == move.tile.suit and cs.tiles[0].tile_type == move.tile.tile_type:
                         return move.tile in self.player_hand
                 return False
@@ -928,8 +926,8 @@ class GamePerspective:
 
     def legal_moves(self) -> List[Union[Action, Reaction]]:
         moves: List[Union[Action, Reaction]] = []
-        riichi_locked = self.riichi_declared.get(self.player_id, False)
-        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player is not None and self.last_discard_player != self.player_id:
+        riichi_locked = self.riichi_declared.get(0, False)
+        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player is not None and self.last_discard_player != 0:
             if self.can_ron():
                 return [PassCall(), Ron()]
             if riichi_locked:
@@ -951,7 +949,7 @@ class GamePerspective:
             if self.can_tsumo():
                 moves.append(Tsumo())
             # Riichi declaration
-            if not self.riichi_declared.get(self.player_id, False) and not self.called_sets.get(self.player_id, []):
+            if not self.riichi_declared.get(0, False) and not self.called_sets.get(0, []):
                 # Propose riichi options per discardable tile that keeps tenpai
                 seen: set = set()
                 for t in self.player_hand:
@@ -1004,7 +1002,7 @@ class Player:
             if isinstance(m, Discard):
                 return m
         # Fallback
-        return Discard(game_state.player_hand[0])
+        return moves[0]
 
     def choose_reaction(self, game_state: GamePerspective, options: Dict[str, List[List[Tile]]]) -> Reaction:
         if game_state.can_ron():
@@ -1060,6 +1058,8 @@ class MediumJong:
         self.last_discard_was_riichi: bool = False
         # Keiten payments on exhaustive draw (None unless draw occurs)
         self.keiten_payments: Optional[Dict[int, int]] = None
+        # Per-player point deltas at end of game (win/tsumo/ron or exhaustive draw)
+        self.points: Optional[List[int]] = None
 
         # Build wall and dead wall
         self.tiles: List[Tile] = []
@@ -1119,21 +1119,29 @@ class MediumJong:
             if player_id == self.current_player_idx:
                 raise MediumJong.IllegalGamePerspective(
                     "Instantiating Game Perspective for a player who has no legal action now")
+        # Rotate all per-player structures so that the requesting player is index 0
+        def rot_idx(idx: int) -> int:
+            return (idx - player_id) % 4
+        called_sets = {rot_idx(pid): list(sets) for pid, sets in self._player_called_sets.items()}
+        player_discards = {rot_idx(pid): list(ts) for pid, ts in self.player_discards.items()}
+        called_discards = {rot_idx(pid): list(idxs) for pid, idxs in self.called_discards.items()}
+        seat_winds = {rot_idx(pid): wind for pid, wind in self.seat_winds.items()}
+        riichi_declared = {rot_idx(pid): val for pid, val in self.riichi_declared.items()}
+        last_discard_player_rel = None if self.last_discard_player is None else rot_idx(self.last_discard_player)
         return GamePerspective(
             player_hand=self._player_hands[player_id],
-            player_id=player_id,
             remaining_tiles=len(self.tiles),
             last_discarded_tile=self.last_discarded_tile,
-            last_discard_player=self.last_discard_player,
-            called_sets=self._player_called_sets,
-            player_discards=self.player_discards,
-            called_discards=self.called_discards,
+            last_discard_player=last_discard_player_rel,
+            called_sets=called_sets,
+            player_discards=player_discards,
+            called_discards=called_discards,
             state=Action if self._next_move_is_action else Reaction,
             newly_drawn_tile=self.last_drawn_tile,
-            can_call=self.last_discarded_tile is not None and self.last_discard_player != player_id,
-            seat_winds=self.seat_winds,
+            can_call=self.last_discarded_tile is not None and self.last_discard_player is not None and self.last_discard_player != player_id,
+            seat_winds=seat_winds,
             round_wind=self.round_wind,
-            riichi_declared=self.riichi_declared,
+            riichi_declared=riichi_declared,
         )
 
     def is_legal(self, actor_id: int, move: Union[Action, Reaction]) -> bool:
@@ -1234,9 +1242,7 @@ class MediumJong:
     def _step_reactions(self, actor_id, move: Reaction):
         # Reactions to discard
         if isinstance(move, Ron):
-            if actor_id not in self.winners:
-                self.winners.append(actor_id)
-            self.loser = self.last_discard_player
+            self._on_win(actor_id, win_by_tsumo=False)
         if isinstance(move, Pon):
             # Any call cancels ippatsu
             for pid in range(4):
@@ -1370,9 +1376,11 @@ class MediumJong:
         # Ron first
         rons = [pid for pid, ch in choices.items() if isinstance(ch, Ron) and can_ron.get(pid, False)]
         if rons:
-            self.winners = rons
-            self.loser = discarder
-            self.game_over = True
+            # Multiple-ron support: resolve all rons in turn order from discarder+1
+            order = [(discarder + 1) % 4, (discarder + 2) % 4, (discarder + 3) % 4] if discarder is not None else [0,1,2]
+            ordered_rons = [pid for pid in order if pid in rons]
+            # Finalize multi-ron outcome
+            self._on_multiple_ron(ordered_rons, discarder)
             return
         # Priority: Pon/ Kan over Chi by seat order from left
         order = [(discarder + 1) % 4, (discarder + 2) % 4, (discarder + 3) % 4]
@@ -1392,6 +1400,72 @@ class MediumJong:
         self.winners = [winner_id]
         self.loser = None if win_by_tsumo else self.last_discard_player
         self.game_over = True
+        # Populate per-player points for this outcome
+        deltas = [0, 0, 0, 0]
+        score = self._score_hand(winner_id, win_by_tsumo=win_by_tsumo)
+        if score.get('tsumo', False):
+            # Winner gains total points; others pay according to split
+            if winner_id == DEALER_ID_START:
+                # Dealer tsumo: split evenly among the three others
+                total = int(score['points'])
+                each = total // 3
+                for pid in range(4):
+                    if pid == winner_id:
+                        continue
+                    deltas[pid] -= each
+                deltas[winner_id] += total
+            else:
+                payments = score.get('payments', {})
+                from_dealer = int(payments.get('from_dealer', 0))
+                from_others = int(payments.get('from_others', 0))
+                for pid in range(4):
+                    if pid == winner_id:
+                        continue
+                    if pid == DEALER_ID_START:
+                        deltas[pid] -= from_dealer
+                    else:
+                        deltas[pid] -= from_others
+                deltas[winner_id] += int(payments.get('total_from_all', from_dealer + 2 * from_others))
+            # Add riichi sticks if present (pot already cleared in score_hand)
+            rs = int(score.get('payments', {}).get('riichi_sticks', 0))
+            if rs:
+                deltas[winner_id] += rs
+        else:
+            # Ron: loser pays total to winner
+            total = int(score['points'])
+            loser = self.loser
+            if loser is not None:
+                deltas[loser] -= total
+                deltas[winner_id] += total
+            # Add riichi sticks if present (awarded to winner)
+            rs = int(score.get('riichi_sticks', score.get('payments', {}).get('riichi_sticks', 0)))
+            if rs:
+                deltas[winner_id] += rs
+        self.points = deltas
+
+    def _on_multiple_ron(self, winner_ids: List[int], discarder: Optional[int]) -> None:
+        # Finalize outcome for multiple simultaneous rons (double/triple ron)
+        if discarder is None or not winner_ids:
+            return
+        self.winners = list(winner_ids)
+        self.loser = discarder
+        self.game_over = True
+        deltas = [0, 0, 0, 0]
+        # Ensure loser context for scoring
+        self.last_discard_player = discarder
+        # Award riichi sticks only to the first winner per rule; order already set
+        for idx, w in enumerate(winner_ids):
+            score = self._score_hand(w, win_by_tsumo=False)
+            total = int(score['points'])
+            deltas[discarder] -= total
+            deltas[w] += total
+            # Only the first ron winner collects riichi sticks (if any)
+            if idx == 0:
+                rs = int(score.get('riichi_sticks', score.get('payments', {}).get('riichi_sticks', 0)))
+                if rs:
+                    deltas[w] += rs
+            # After first scoring, riichi pot will already be cleared if applicable
+        self.points = deltas
 
     def _on_exhaustive_draw(self) -> None:
         # Determine tenpai players using current hands without constructing perspectives
@@ -1431,6 +1505,8 @@ class MediumJong:
         self.winners = []
         self.loser = None
         self.game_over = True
+        # Persist points as per-player deltas
+        self.points = [payments[i] for i in range(4)]
 
     def is_game_over(self) -> bool:
         return self.game_over
@@ -1441,11 +1517,13 @@ class MediumJong:
     def get_loser(self) -> Optional[int]:
         return self.loser
 
-    def get_keiten_payments(self) -> Optional[Dict[int, int]]:
-        return None if self.keiten_payments is None else dict(self.keiten_payments)
+    def get_points(self) -> Optional[List[int]]:
+        if not self.is_game_over():
+            raise ValueError("Game is not over")
+        return list(self.points)
 
     # Scoring API
-    def score_hand(self, winner_id: int, win_by_tsumo: bool) -> Dict[str, Any]:
+    def _score_hand(self, winner_id: int, win_by_tsumo: bool) -> Dict[str, Any]:
         concealed = list(self._player_hands[winner_id])
         cs = list(self._player_called_sets[winner_id])
         fu, han, dora_han = _score_fu_and_han(

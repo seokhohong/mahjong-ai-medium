@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Text viewer for MediumJong with MediumHeuristicsPlayer.
+Text viewer for MediumJong.
 
 - Logs turns and reactions with MediumJong state extras (winds, dora, aka info)
-- Plays one round with 4 heuristic players
+- Plays one round with 4 players of your choice
 """
 
 from typing import List, Any, Dict, Optional
 import os
 import sys
+
+from core.learn import RecordingHeuristicACPlayer
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import argparse
@@ -24,6 +26,57 @@ from src.core.game import (
     Honor, Riichi,
 )
 from src.core.heuristics_player import MediumHeuristicsPlayer
+
+
+# =========================
+# USER-EDITABLE CONFIG BELOW
+# =========================
+
+"""Instantiate and return exactly four Players.
+
+Edit this function to change which agents play in the text viewer. Examples:
+
+- Four heuristic text-logging players (default):
+    return [TextViewerPlayer(i, lines) for i in range(4)]
+
+- Mix of agents (agents without TextViewer logging will still play but won't log detailed turns):
+    from src.core.learn.ac_network import ACNetwork
+    from src.core.learn.ac_player import ACPlayer
+    from core.learn.data_utils import load_gsv_scaler
+
+    # Try to load scaler from the model dataset if it exists
+    model_path = os.path.join(os.getcwd(), 'models', 'ac_ppo_best.pt')
+    scaler_path = model_path.replace('.pt', '_dataset.npz')
+    gsv_scaler = load_gsv_scaler(scaler_path)
+
+    net = ACNetwork(hidden_size=128, embedding_dim=16, temperature=0.5, gsv_scaler=gsv_scaler)
+    net.load_model(model_path)
+    return [
+        ACPlayer(0, net, temperature=0, gsv_scaler=None),
+        TextViewerPlayer(1, lines),
+        TextViewerPlayer(2, lines),
+        TextViewerPlayer(3, lines),
+    ]
+"""
+
+def build_players(lines: List[str]) -> List[Player]:
+    from src.core.learn.ac_network import ACNetwork
+    from src.core.learn.ac_player import ACPlayer
+    from core.learn.data_utils import load_gsv_scaler
+
+    # Try to load scaler from the model dataset if it exists
+    model_path = os.path.join(os.getcwd(), 'models', 'ac_ppo_best_20250818_150635.pt')
+    scaler_path = model_path.replace('.pt', '_dataset.npz')
+    gsv_scaler = load_gsv_scaler(scaler_path)
+
+    net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=128, embedding_dim=16, temperature=0.5)
+    net.load_model(model_path)
+    return [
+        ACPlayer(0, net, gsv_scaler=None, temperature=0),
+        RecordingHeuristicACPlayer(1),
+        RecordingHeuristicACPlayer(2),
+        RecordingHeuristicACPlayer(3),
+    ]
 
 
 def _fmt_hand(tiles: List[Tile]) -> str:
@@ -46,9 +99,10 @@ def _fmt_called_sets(csets: List[Any]) -> str:
     return '[' + '; '.join(parts) + ']'
 
 
-class TextViewerPlayer(MediumHeuristicsPlayer):
-    def __init__(self, player_id: int, lines: List[str]) -> None:
-        super().__init__(player_id)
+class LoggingPlayerWrapper(Player):
+    def __init__(self, inner_player: Player, lines: List[str]) -> None:
+        super().__init__(inner_player.player_id)
+        self._inner = inner_player
         self._lines = lines
 
     def _log_turn(self, gs: Any, action: Any) -> None:
@@ -78,12 +132,12 @@ class TextViewerPlayer(MediumHeuristicsPlayer):
         )
 
     def play(self, game_state: Any) -> Any:
-        action = super().play(game_state)
+        action = self._inner.play(game_state)
         self._log_turn(game_state, action)
         return action
 
     def choose_reaction(self, game_state: Any, options: Dict[str, List[List[Tile]]]) -> Any:
-        action = super().choose_reaction(game_state, options)
+        action = self._inner.choose_reaction(game_state, options)
         self._log_reaction(game_state, options, action)
         return action
 
@@ -93,16 +147,15 @@ def simulate_with_text(tile_copies: int = 4, seed: int = 0) -> List[str]:
     if seed:
         random.seed(seed)
     lines: List[str] = []
-    players = [TextViewerPlayer(i, lines) for i in range(4)]
+    base_players = build_players(lines)
+    # Wrap every provided player with logging, preserving player ids
+    players = [LoggingPlayerWrapper(p, lines) for p in base_players]
     game = MediumJong(players, tile_copies=tile_copies)
 
     # Print seating and round info once
-    try:
-        seat_str = ', '.join(["East: P0", "South: P1", "West: P2", "North: P3"])
-        dora_str = ','.join(str(t) for t in getattr(game, 'dora_indicators', [])) if hasattr(game, 'dora_indicators') else 'N/A'
-        lines.append(f"Round {game.round_wind.name} | {seat_str} | Dora[{dora_str}]")
-    except Exception:
-        pass
+    seat_str = ', '.join(["East: P0", "South: P1", "West: P2", "North: P3"])
+    dora_str = ','.join(str(t) for t in getattr(game, 'dora_indicators', [])) if hasattr(game, 'dora_indicators') else 'N/A'
+    lines.append(f"Round {game.round_wind.name} | {seat_str} | Dora[{dora_str}]")
     # Run until game over (single round in MediumJong)
     while not game.is_game_over():
         game.play_turn()

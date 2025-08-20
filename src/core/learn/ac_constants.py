@@ -26,18 +26,17 @@ FLAT_POLICY_SIZE: int = 152
 TILE_INDEX_PAD: int = 0
 TILE_INDEX_SIZE: int = 38
 
-# Training-time caps
-AC_MAX_CALLED_TILES_PER_PLAYER: int = 12
-AC_MAX_CALLS: int = 4
-AC_MAX_CALLED_SET_SIZE: int = 4
-# Called-sets serialized default shape: [player, set_index, tiles_in_set]
-CALLED_SETS_DEFAULT_SHAPE = (AC_MAX_CALLED_SET_SIZE, AC_MAX_CALLS, AC_MAX_CALLED_SET_SIZE)
-
-AC_MAX_DISCARDS_PER_PLAYER: int = 21
+from ..constants import (
+    MAX_CALLS,
+    MAX_CALLED_SET_SIZE,
+    MAX_CALLED_TILES_PER_PLAYER,
+    CALLED_SETS_DEFAULT_SHAPE,
+    MAX_DISCARDS_PER_PLAYER,
+)
 # Game-state vector length used by serialization pipeline (fallback default)
 GAME_STATE_VEC_LEN: int = 32
 # Default maximum turns for episode rollout
-MAX_TURNS: int = 200
+MAX_TURNS: int = 256
 
 
 def action_type_to_main_index(action_type: str) -> int:

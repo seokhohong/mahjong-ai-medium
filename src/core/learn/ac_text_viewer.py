@@ -119,9 +119,15 @@ def simulate_with_text(tile_copies: int = 4, seed: int = 0, ac_model: Optional[s
     # If a model path is provided, seat 0 uses ACPlayer with that model
     if ac_model:
         try:
-            net = ACNetwork()
+            from core.learn.data_utils import load_gsv_scaler
+
+            # Try to load scaler from the model dataset if it exists
+            scaler_path = ac_model.replace('.pt', '_dataset.npz')
+            gsv_scaler = load_gsv_scaler(scaler_path)
+
+            net = ACNetwork(gsv_scaler=gsv_scaler)
             net.load_model(ac_model)
-            base_players[0] = ACPlayer(0, net)
+            base_players[0] = ACPlayer(0, net, gsv_scaler=None)
             lines.append(f"Seat 0 using ACPlayer with model '{ac_model}'")
         except Exception as e:
             lines.append(f"Failed to load AC model '{ac_model}': {e}. Falling back to baseline Player.")

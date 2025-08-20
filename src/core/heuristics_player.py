@@ -122,7 +122,7 @@ class MediumHeuristicsPlayer(Player):
             return Ron()
         # Avoid recomputing derived values repeatedly
         hand = list(game_state.player_hand)
-        seat_wind = game_state.seat_winds[game_state.player_id]
+        seat_wind = game_state.seat_winds[0]
         round_wind = game_state.round_wind
         allow_calls = _has_yakuhai_anko(hand, seat_wind, round_wind) or _is_tanyao_hand(hand)
         if not allow_calls:

@@ -10,6 +10,18 @@ STANDARD_HAND_TILE_COUNT: int = 13
 DEAD_WALL_TILES: int = 14  # Riichi dead wall contains 14 tiles
 TOTAL_TILES: int = 52 + 70
 
+# Called/calls serialization caps (apply to the full game, not just AC model)
+# Training-time caps
+MAX_CALLS: int = 4
+MAX_CALLED_SET_SIZE: int = 4
+# Derive tiles-per-player cap from sets x tiles-per-set (supports up to 4 kans)
+MAX_CALLED_TILES_PER_PLAYER: int = MAX_CALLS * MAX_CALLED_SET_SIZE
+# Called-sets serialized default shape: [player, set_index, tiles_in_set]
+CALLED_SETS_DEFAULT_SHAPE = (MAX_CALLED_SET_SIZE, MAX_CALLS, MAX_CALLED_SET_SIZE)
+
+# Discard cap per player
+MAX_DISCARDS_PER_PLAYER: int = 21
+
 # Game state vector length used by feature engineering and AC network inputs.
 # Structure from feature engineering:
 # - Base scalar fields: player_id, remaining_tiles, last_discard_idx, last_discard_player,

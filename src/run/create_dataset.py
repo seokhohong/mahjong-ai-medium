@@ -15,7 +15,7 @@ import core.game
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.game import MediumJong
-from core.learn import ACNetwork, RecordingACPlayer, RecordingHeuristicACPlayer
+from core.learn import ACNetwork, RecordingACPlayer, RecordingHeuristicACPlayer, ACPlayer
 from core.learn.policy_utils import serialize_action
 from core import constants
 from tqdm import tqdm
@@ -70,15 +70,21 @@ def build_ac_dataset(
 
     net = None
     if not use_heuristic:
-        net = ACNetwork(hidden_size=hidden_size, embedding_dim=embedding_dim, temperature=temperature)
-        # Optional: load weights if provided
-        if model_path:
-            net.load_model(model_path)
+        if not model_path:
+            print("must provide model directory if not using heuristic")
+            raise ValueError()
+
+        net = ACPlayer.from_directory(model_path, temperature=temperature).network
         import torch
         net = net.to(torch.device('cpu'))
 
-    all_states: List[dict] = []
-    all_actions: List[dict] = []
+    # Accumulate per-field arrays for compact storage
+    hand_idx_list: List[np.ndarray] = []
+    disc_idx_list: List[np.ndarray] = []
+    called_idx_list: List[np.ndarray] = []
+    game_state_list: List[np.ndarray] = []
+    called_discards_list: List[np.ndarray] = []
+    flat_idx_list: List[int] = []
     all_returns: List[float] = []
     all_advantages: List[float] = []
     all_old_log_probs: List[float] = []
@@ -90,7 +96,7 @@ def build_ac_dataset(
 
     # Create players once and reuse across games; clear their buffers between episodes
     if use_heuristic:
-        players = [RecordingHeuristicACPlayer(i, temperature=temperature) for i in range(4)]
+        players = [RecordingHeuristicACPlayer(i, random_exploration=temperature) for i in range(4)]
     else:
         assert net is not None
         players = [RecordingACPlayer(i, net, temperature=temperature, zero_network_reward=bool(zero_network_reward)) for i in range(4)]
@@ -125,7 +131,7 @@ def build_ac_dataset(
                         if loser is not None:
                             total_points_from_loser = 0.0
                             for w in winners:
-                                res = game.score_hand(winner_id=w, win_by_tsumo=False)  # type: ignore[arg-type]
+                                res = game._score_hand(winner_id=w, win_by_tsumo=False)  # type: ignore[arg-type]
                                 pts = float(res.get('points', 0.0))
                                 if pid == w and pts > 0:
                                     terminal_reward += math.log(max(1e-9, pts / 1000.0))
@@ -135,7 +141,7 @@ def build_ac_dataset(
                         else:
                             # Tsumo case: exactly one winner collects from all
                             w = winners[0]
-                            res = game.score_hand(winner_id=w, win_by_tsumo=True)
+                            res = game._score_hand(winner_id=w, win_by_tsumo=True)
                             pts = float(res.get('points', 0.0))
                             payments = res.get('payments', {}) if isinstance(res, dict) else {}
                             if pid == w and pts > 0:
@@ -164,18 +170,19 @@ def build_ac_dataset(
             nstep, adv = compute_n_step_returns(rewards, n_step, gamma, values)
             for t in range(T):
                 gs = p.experience.states[t]
-                act = p.experience.actions[t]
-                # States in experience are already encode_game_perspective dicts
-                all_states.append(gs)
-                all_actions.append(serialize_action(act))
+                flat_idx = int(p.experience.actions[t])
+                # Extract raw indexed features per sample
+                hand_idx_list.append(np.asarray(gs['hand_idx'], dtype=np.int32))
+                disc_idx_list.append(np.asarray(gs['disc_idx'], dtype=np.int32))
+                called_idx_list.append(np.asarray(gs['called_idx'], dtype=np.int32))
+                game_state_list.append(np.asarray(gs['game_state'], dtype=np.float32))
+                called_discards_list.append(np.asarray(gs['called_discards'], dtype=np.int32))
+                flat_idx_list.append(flat_idx)
                 all_returns.append(float(nstep[t]))
                 all_advantages.append(float(adv[t]))
                 all_old_log_probs.append(float(p.experience.main_log_probs[t]))
                 # Store full flat policy distribution when available (RecordingACPlayer)
-                try:
-                    probs = list(p.experience.main_probs[t])
-                except Exception:
-                    probs = []
+                probs = list(p.experience.main_probs[t])
                 all_flat_policies.append(probs)
                 # No tile/chi heads in flat policy
                 all_game_ids.append(int(gi))
@@ -184,14 +191,17 @@ def build_ac_dataset(
         # Clear experience buffers for next game
         for p in players:
             if hasattr(p, 'experience') and p.experience is not None:
-                try:
-                    p.experience.clear()
-                except Exception:
-                    pass
+                p.experience.clear()
+
+
 
     return {
-        'states': np.asarray(all_states, dtype=object),
-        'actions': np.asarray(all_actions, dtype=object),
+        'hand_idx': np.asarray(hand_idx_list, dtype=object),
+        'disc_idx': np.asarray(disc_idx_list, dtype=object),
+        'called_idx': np.asarray(called_idx_list, dtype=object),
+        'game_state': np.asarray(game_state_list, dtype=object),
+        'called_discards': np.asarray(called_discards_list, dtype=object),
+        'flat_idx': np.asarray(flat_idx_list, dtype=np.int64),
         'returns': np.asarray(all_returns, dtype=np.float32),
         'advantages': np.asarray(all_advantages, dtype=np.float32),
         'old_log_probs': np.asarray(all_old_log_probs, dtype=np.float32),
@@ -201,6 +211,26 @@ def build_ac_dataset(
         'flat_policies': np.asarray(all_flat_policies, dtype=object),
     }
 
+def save_dataset(built, out_path):
+    # Save
+    np.savez(
+        out_path,
+        hand_idx=built['hand_idx'],
+        disc_idx=built['disc_idx'],
+        called_idx=built['called_idx'],
+        game_state=built['game_state'],
+        called_discards=built['called_discards'],
+        flat_idx=built['flat_idx'],
+        returns=built['returns'],
+        advantages=built['advantages'],
+        old_log_probs=built['old_log_probs'],
+        game_ids=built['game_ids'],
+        step_ids=built['step_ids'],
+        actor_ids=built['actor_ids'],
+        flat_policies=built['flat_policies'],
+    )
+
+    print(f"Saved AC dataset to {out_path}")
 
 def main():
     ap = argparse.ArgumentParser(description='Create AC experience dataset (states, actions, n-step returns)')
@@ -240,25 +270,9 @@ def main():
         ts = time.strftime('%Y%m%d_%H%M%S')
         out_path = os.path.join(out_dir, f'ac_{ts}.npz')
 
-    # Save
-    np.savez(
-        out_path,
-        states=built['states'],
-        actions=built['actions'],
-        returns=built['returns'],
-        advantages=built['advantages'],
-        old_log_probs=built['old_log_probs'],
-        game_ids=built['game_ids'],
-        step_ids=built['step_ids'],
-        actor_ids=built['actor_ids'],
-        flat_policies=built['flat_policies'],
-    )
-
-    print(f"Saved AC dataset to {out_path}")
+    save_dataset(built, out_path)
     return out_path
 
-
-    
 
 
 if __name__ == '__main__':

@@ -30,7 +30,7 @@ class ExperienceBuffer:
     """
     def __init__(self) -> None:
         self.states: List[Dict[str, Any]] = []
-        self.actions: List[Any] = []
+        self.actions: List[int] = []
         self.rewards: List[float] = []
         # Optional value baseline per step (e.g., V(s_t) from a network)
         self.values: List[float] = []
@@ -38,11 +38,11 @@ class ExperienceBuffer:
         self.main_log_probs: List[float] = []
         self.main_probs: List[List[float]] = []
 
-    def add(self, state_features: Dict[str, Any], action: Any, reward: float, value: float,
+    def add(self, state_features: Dict[str, Any], action_index: int, reward: float, value: float,
             main_logp: float,
             main_probs: Optional[List[float]] = None) -> None:
         self.states.append(state_features)
-        self.actions.append(action)
+        self.actions.append(int(action_index))
         self.rewards.append(float(reward))
         self.values.append(float(value))
         self.main_log_probs.append(float(main_logp))
@@ -68,8 +68,8 @@ class RecordingACPlayer(ACPlayer):
     they can be recomputed from each stored GamePerspective as needed.
     """
 
-    def __init__(self, player_id: int, network: Any, temperature: float = 1.0, zero_network_reward: bool = False):
-        super().__init__(player_id, network, temperature=temperature)
+    def __init__(self, player_id: int, network: Any, temperature: float = 1.0, zero_network_reward: bool = False, gsv_scaler: Any = None):
+        super().__init__(player_id, network, gsv_scaler=gsv_scaler, temperature=temperature)
         self.experience = ExperienceBuffer()
         self._terminal_reward: Optional[float] = None
         self._zero_network_reward = bool(zero_network_reward)
@@ -103,7 +103,7 @@ class RecordingACPlayer(ACPlayer):
         main_logp = float(log_policy[flat_idx]) if 0 <= flat_idx < log_policy.size else 0.0
         self.experience.add(
             encode_game_perspective(game_state),
-            move,
+            flat_idx,
             0.0,
             float(value if not self._zero_network_reward else 0.0),
             main_logp=main_logp,
@@ -118,7 +118,7 @@ class RecordingACPlayer(ACPlayer):
         main_logp = float(log_policy[flat_idx]) if 0 <= flat_idx < log_policy.size else 0.0
         self.experience.add(
             encode_game_perspective(game_state),
-            move,
+            flat_idx,
             0.0,
             float(value if not self._zero_network_reward else 0.0),
             main_logp=main_logp,
@@ -133,10 +133,11 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
     for all decisions except the terminal step, which is set via finalize_episode.
     """
 
-    def __init__(self, player_id: int, temperature: float = 0.0) -> None:
+    def __init__(self, player_id: int, random_exploration: float = 0.0, gsv_scaler: Any = None) -> None:
         super().__init__(player_id)
-        self.temperature = max(0.0, float(temperature))
+        self.random_exploration = max(0.0, float(random_exploration))
         self.experience = ExperienceBuffer()
+        # Note: gsv_scaler is not used by heuristic players but kept for API consistency
 
     def finalize_episode(self, winner_ids: List[int], loser_id: Optional[int]) -> None:
         if len(self.experience) == 0:
@@ -150,18 +151,19 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
         # Keep heuristic value baseline at 0.0 for all steps (including terminal)
 
     def play(self, game_state: GamePerspective):  # type: ignore[override]
-        # With probability = temperature, pick a random legal move (prefer discards); otherwise use heuristic strategy
+        # With probability = random_exploration, pick a random legal move (prefer discards); otherwise use heuristic strategy
         legal = game_state.legal_moves()
-        if self.temperature > 0.0 and legal and random.random() < self.temperature:
+        if self.random_exploration > 0.0 and legal and random.random() < self.random_exploration:
             discards = [m for m in legal if isinstance(m, Discard)]
             move = random.choice(discards or legal)
         else:
             # Delegate to heuristic strategy from MediumHeuristicsPlayer
             move = super().play(game_state)
+        assert game_state.is_legal(move)
         # Record encoded state with zero value/logp for heuristic policy
         self.experience.add(
             encode_game_perspective(game_state),
-            move,
+            int(flat_index_for_action(game_state, move)),
             0.0,
             0.0,
             main_logp=0.0,
@@ -170,8 +172,8 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
         return move
 
     def choose_reaction(self, game_state: GamePerspective, options: Dict[str, List[List[Tile]]]):  # type: ignore[override]
-        # With probability = temperature, pick a random legal reaction from options
-        if self.temperature > 0.0:
+        # With probability = random_exploration, pick a random legal reaction from options
+        if self.random_exploration > 0.0:
             legal_reacts: List[Reaction] = []
             if game_state.can_ron():
                 legal_reacts.append(Ron())
@@ -180,11 +182,11 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
             for tiles in options.get('chi', []):
                 legal_reacts.append(Chi(tiles))
             legal_reacts.append(PassCall())
-            if legal_reacts and random.random() < self.temperature:
+            if legal_reacts and random.random() < self.random_exploration:
                 move = random.choice(legal_reacts)
                 self.experience.add(
                     encode_game_perspective(game_state),
-                    move,
+                    int(flat_index_for_action(game_state, move)),
                     0.0,
                     0.0,
                     main_logp=0.0,
@@ -195,7 +197,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
         move = super().choose_reaction(game_state, options)
         self.experience.add(
             encode_game_perspective(game_state),
-            move,
+            int(flat_index_for_action(game_state, move)),
             0.0,
             0.0,
             main_logp=0.0,

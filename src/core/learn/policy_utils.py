@@ -12,6 +12,27 @@ from .feature_engineering import tile_to_index
 import numpy as np
 
 
+def _flat_tile_index(tile: Tile) -> int:
+    """Map a Tile to the 0..34 flat index used by action masks.
+
+    Suited aka 5s collapse to suit-specific zeros: 0m, 0p, 0s → 0, 9, 18.
+    Honors map to 28..34.
+    """
+    if tile.suit == Suit.MANZU:
+        if tile.tile_type == TileType.FIVE and getattr(tile, 'aka', False):
+            return 0
+        return int(tile.tile_type.value)
+    if tile.suit == Suit.PINZU:
+        if tile.tile_type == TileType.FIVE and getattr(tile, 'aka', False):
+            return 9
+        return 9 + int(tile.tile_type.value)
+    if tile.suit == Suit.SOUZU:
+        if tile.tile_type == TileType.FIVE and getattr(tile, 'aka', False):
+            return 18
+        return 18 + int(tile.tile_type.value)
+    return 27 + int(tile.tile_type.value)
+
+
 def flat_index_for_action(gs: GamePerspective, action: Any) -> int:
     """Map an action in a given GamePerspective to the flat policy index (length 152).
 
@@ -28,8 +49,8 @@ def flat_index_for_action(gs: GamePerspective, action: Any) -> int:
       151: pass
     """
     def tile_flat_index(t: Tile) -> int:
-        # Mirror the feature_engineering mapping (0/9/18 are aka fives; honors 28..34)
-        return int(tile_to_index(t))
+        # Mirror the game mask mapping (0/9/18 are aka fives; honors 28..34)
+        return int(_flat_tile_index(t))
 
     if isinstance(action, Discard):
         return tile_flat_index(action.tile)
@@ -67,14 +88,14 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
     if 0 <= choice <= 34:
         target = choice
         for t in gs.player_hand:
-            if int(tile_to_index(t)) == target:
+            if int(_flat_tile_index(t)) == target:
                 return Discard(t)
         return None
     # Riichi
     if 35 <= choice <= 69:
         idx = choice - 35
         for t in gs.player_hand:
-            if int(tile_to_index(t)) == idx:
+            if int(_flat_tile_index(t)) == idx:
                 move = Riichi(t)
                 if gs.is_legal(move):
                     return move
@@ -124,7 +145,7 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
     if 81 <= choice <= 115:
         idx = choice - 81
         for t in gs.player_hand:
-            if int(tile_to_index(t)) == idx:
+            if int(_flat_tile_index(t)) == idx:
                 move = KanKakan(t)
                 if gs.is_legal(move):
                     return move
@@ -133,7 +154,7 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
     if 116 <= choice <= 150:
         idx = choice - 116
         for t in gs.player_hand:
-            if int(tile_to_index(t)) == idx:
+            if int(_flat_tile_index(t)) == idx:
                 move = KanAnkan(t)
                 if gs.is_legal(move):
                     return move

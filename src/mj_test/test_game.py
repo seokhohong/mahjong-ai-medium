@@ -221,7 +221,7 @@ class TestYakuAndRiichi(unittest.TestCase):
         g.play_turn()
         self.assertTrue(g.is_game_over())
         self.assertEqual(g.get_winners(), [0])
-        score = g.score_hand(0, win_by_tsumo=True)
+        score = g._score_hand(0, win_by_tsumo=True)
         self.assertEqual(score['han'], 3)
 
     def test_riichi_lock_and_uradora(self):
@@ -287,7 +287,7 @@ class TestYakuAndRiichi(unittest.TestCase):
         self.assertTrue(g.is_game_over())
         self.assertEqual(g.get_winners(), [0])
         # Score should have exactly 1 han (menzen tsumo) with our constructed hand
-        score = g.score_hand(0, win_by_tsumo=True)
+        score = g._score_hand(0, win_by_tsumo=True)
         self.assertEqual(score['han'], 1)
 
     def test_ankan_north_enables_menzen_tsumo_only_yaku(self):
@@ -326,7 +326,7 @@ class TestYakuAndRiichi(unittest.TestCase):
         g.play_turn()
         self.assertTrue(g.is_game_over())
         # Only menzen tsumo should count as yaku
-        s = g.score_hand(0, win_by_tsumo=True)
+        s = g._score_hand(0, win_by_tsumo=True)
         self.assertEqual(s['han'], 1)
 
 
@@ -350,7 +350,7 @@ class TestScoring(unittest.TestCase):
         g.ura_dora_indicators = []
         g.play_turn()  # should tsumo
         self.assertTrue(g.is_game_over())
-        s_dealer = g.score_hand(0, win_by_tsumo=True)
+        s_dealer = g._score_hand(0, win_by_tsumo=True)
 
         # Non-dealer tsumo by player 1
         g2 = MediumJong([ForceDiscardPlayer(0, Tile(Suit.HONORS, Honor.NORTH)),
@@ -367,7 +367,11 @@ class TestScoring(unittest.TestCase):
         g2.ura_dora_indicators = []
         g2.play_turn()
         self.assertTrue(g2.is_game_over())
-        s_nd = g2.score_hand(1, win_by_tsumo=True)
+        s_nd = g2._score_hand(1, win_by_tsumo=True)
+        # Winner's points must match final game points API
+        pts_nd = g2.get_points()
+        if pts_nd is not None:
+            self.assertEqual(pts_nd[1], s_nd['points'])
 
         self.assertGreater(s_dealer['points'], s_nd['points'])
 
@@ -405,12 +409,86 @@ class TestScoring(unittest.TestCase):
         g.last_drawn_player = None
         g.play_turn()
         self.assertTrue(g.is_game_over())
-        s = g.score_hand(1, win_by_tsumo=True)
+        s = g._score_hand(1, win_by_tsumo=True)
+        pts = g.get_points()
+        if pts is not None:
+            self.assertEqual(pts[1], s['points'])
         # Expect split: dealer pays 2000, others 1000 each
         self.assertIn('from_dealer', s['payments'])
         self.assertIn('from_others', s['payments'])
         self.assertEqual(s['payments']['from_dealer'], 2000)
         self.assertEqual(s['payments']['from_others'], 1000)
+
+    def test_points_not_none_after_ron_win(self):
+        # Player 1 wins by ron from Player 0's discard; ensure points are populated
+        from test_utils import ForceDiscardPlayer
+        g = MediumJong([
+            ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE)),
+            Player(1),
+            NoReactionPlayer(2),
+            NoReactionPlayer(3),
+        ])
+        # Construct player 1 hand to ron on 3p discard
+        g._player_hands[1] = [
+            Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR),
+            Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.MANZU, TileType.FOUR), Tile(Suit.MANZU, TileType.FIVE), Tile(Suit.MANZU, TileType.SIX),
+            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
+        ]
+        # Ensure player 0 has a 3p to discard
+        g._player_hands[0][0] = Tile(Suit.PINZU, TileType.THREE)
+        # Provide a draw so play_turn can proceed deterministically
+        g.tiles = [Tile(Suit.MANZU, TileType.TWO)]
+        g.play_turn()
+        self.assertTrue(g.is_game_over())
+        self.assertEqual(g.get_winners(), [1])
+        pts = g.get_points()
+        self.assertIsNotNone(pts)
+        self.assertEqual(len(pts), 4)
+
+    def test_double_ron_points_and_riichi_sticks_first_only(self):
+        # Setup: Player 0 discards 3p; Players 1 and 2 can both ron on 3p with tanyao hands
+        from test_utils import ForceDiscardPlayer, NoReactionPlayer
+        g = MediumJong([
+            ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE)),
+            Player(1),
+            Player(2),
+            NoReactionPlayer(3),
+        ])
+        # Both players 1 and 2 wait on 3p (tanyao-completable)
+        ron_wait_hand = [
+            Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR),
+            Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.MANZU, TileType.FOUR), Tile(Suit.MANZU, TileType.FIVE), Tile(Suit.MANZU, TileType.SIX),
+            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
+        ]
+        g._player_hands[1] = list(ron_wait_hand)
+        g._player_hands[2] = list(ron_wait_hand)
+        # Ensure player 0 holds a 3p to discard
+        g._player_hands[0][0] = Tile(Suit.PINZU, TileType.THREE)
+        # Add riichi sticks to verify only first ron receives them
+        extra_points = 2000
+        g.riichi_sticks_pot = extra_points
+        g.last_discard_was_riichi = False
+        # Provide a draw so play_turn proceeds
+        g.tiles = [Tile(Suit.MANZU, TileType.TWO)]
+        g.play_turn()
+        self.assertTrue(g.is_game_over())
+        # Winners should be [1, 2] (turn order from discarder 0)
+        self.assertEqual(g.get_winners(), [1, 2])
+        pts = g.get_points()
+        self.assertIsNotNone(pts)
+        self.assertEqual(len(pts), 4)
+        # Points conservation: loser pays sum of winners
+        self.assertEqual(pts[0] - extra_points, -(pts[1] + pts[2]))
+        # Compare to per-winner scoring outputs and riichi sticks to first only
+        s1 = g._score_hand(1, win_by_tsumo=False)
+        s2 = g._score_hand(2, win_by_tsumo=False)
+        # First winner gets sticks, second does not
+        self.assertEqual(pts[1], s1['points'] + 2000)
+        self.assertEqual(pts[2], s2['points'])
 
     def test_riichi_stick_not_paid_on_immediate_ron(self):
         # P0 declares riichi and immediately deals into P1; P1 should NOT get riichi stick
@@ -448,7 +526,10 @@ class TestScoring(unittest.TestCase):
             g.step(0, Discard(Tile(Suit.PINZU, TileType.THREE)))
         g._resolve_reactions()
         self.assertTrue(g.is_game_over())
-        s = g.score_hand(1, win_by_tsumo=False)
+        s = g._score_hand(1, win_by_tsumo=False)
+        pts = g.get_points()
+        if pts is not None:
+            self.assertEqual(pts[1], s['points'])
         self.assertNotIn('riichi_sticks', s)
 
     def test_riichi_stick_lost_on_exhaustive_draw(self):
@@ -477,7 +558,7 @@ class TestScoring(unittest.TestCase):
         g.play_turn()
         g.play_turn()
         self.assertTrue(g.is_game_over())
-        pay = g.get_keiten_payments()
+        pay = g.get_points()
         # P0 should have +3000 from three noten players, minus 1000 riichi stick -> +2000
         self.assertEqual(pay[0], 2000)
 
@@ -502,7 +583,7 @@ class TestScoring(unittest.TestCase):
         # Disable dora/aka randomness
         g.dora_indicators = []
         g.ura_dora_indicators = []
-        s = g.score_hand(0, win_by_tsumo=False)
+        s = g._score_hand(0, win_by_tsumo=False)
         self.assertGreaterEqual(s['han'], 2)
 
     def test_sanshoku_closed_and_open(self):
@@ -523,7 +604,7 @@ class TestScoring(unittest.TestCase):
         g.ura_dora_indicators = []
         g.play_turn()
         self.assertTrue(g.is_game_over())
-        s_closed = g.score_hand(0, win_by_tsumo=True)
+        s_closed = g._score_hand(0, win_by_tsumo=True)
         # Expect at least sanshoku 2 han for closed; allow additional han such as menzen tsumo
         self.assertGreaterEqual(s_closed['han'], 2)
 
@@ -548,7 +629,7 @@ class TestScoring(unittest.TestCase):
         g2.ura_dora_indicators = []
         g2.play_turn()
         self.assertTrue(g2.is_game_over())
-        s_open = g2.score_hand(0, win_by_tsumo=True)
+        s_open = g2._score_hand(0, win_by_tsumo=True)
         # Expect at least sanshoku 1 han for open; allow additional han
         self.assertGreaterEqual(s_open['han'], 1)
 
@@ -574,7 +655,7 @@ class TestScoring(unittest.TestCase):
         g.ura_dora_indicators = []
         g.play_turn()
         self.assertTrue(g.is_game_over())
-        s_closed = g.score_hand(0, win_by_tsumo=True)
+        s_closed = g._score_hand(0, win_by_tsumo=True)
         # Expect at least ittsu (2 closed) + menzen tsumo (1) = >=3 han; allow more if present
         self.assertGreaterEqual(s_closed['han'], 3)
 
@@ -601,7 +682,7 @@ class TestScoring(unittest.TestCase):
         g2.ura_dora_indicators = []
         g2.play_turn()
         self.assertTrue(g2.is_game_over())
-        s_open = g2.score_hand(0, win_by_tsumo=True)
+        s_open = g2._score_hand(0, win_by_tsumo=True)
         # Expect at least ittsu open = 1 han (may be higher)
         self.assertGreaterEqual(s_open['han'], 1)
 
@@ -624,7 +705,10 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(g.get_winners(), [1])
         self.assertEqual(g.get_loser(), 0)
         # Score should apply mangan cap for non-dealer ron: 8000 from dealer
-        s = g.score_hand(1, win_by_tsumo=False)
+        s = g._score_hand(1, win_by_tsumo=False)
+        pts = g.get_points()
+        if pts is not None:
+            self.assertEqual(pts[1], s['points'])
         self.assertEqual(s['points'], 8000)
         self.assertEqual(s['from'], 0)
 
@@ -697,7 +781,7 @@ class TestScoring(unittest.TestCase):
         g.play_turn()
         # Ensure game ends by tsumo and scoring reflects exactly 4 han: riichi(1) + ippatsu(1) + menzen(1) + uradora(1)
         self.assertTrue(g.is_game_over())
-        s = g.score_hand(0, win_by_tsumo=True)
+        s = g._score_hand(0, win_by_tsumo=True)
         self.assertEqual(s['han'], 4)
 
     def _make_tenpai_hand(self):
@@ -730,7 +814,7 @@ class TestScoring(unittest.TestCase):
         g.tiles = []
         g.play_turn()
         self.assertTrue(g.is_game_over())
-        pay = g.get_keiten_payments()
+        pay = g.get_points()
         self.assertEqual(pay[0], 3000)
         self.assertEqual(pay[1], -1000)
         self.assertEqual(pay[2], -1000)
@@ -744,7 +828,7 @@ class TestScoring(unittest.TestCase):
         g._player_hands[3] = self._make_noten_hand()
         g.tiles = []
         g.play_turn()
-        pay = g.get_keiten_payments()
+        pay = g.get_points()
         self.assertEqual(pay[0], 1500)
         self.assertEqual(pay[1], 1500)
         self.assertEqual(pay[2], -1500)
@@ -758,7 +842,7 @@ class TestScoring(unittest.TestCase):
         g._player_hands[3] = self._make_noten_hand()
         g.tiles = []
         g.play_turn()
-        pay = g.get_keiten_payments()
+        pay = g.get_points()
         self.assertEqual(pay[0], 1000)
         self.assertEqual(pay[1], 1000)
         self.assertEqual(pay[2], 1000)
@@ -773,7 +857,7 @@ class TestScoring(unittest.TestCase):
         g._player_hands[3] = self._make_noten_hand()
         g.tiles = []
         g.play_turn()
-        pay = g.get_keiten_payments()
+        pay = g.get_points()
         self.assertEqual(pay[0], 0)
         self.assertEqual(pay[1], 0)
         self.assertEqual(pay[2], 0)
@@ -788,7 +872,7 @@ class TestScoring(unittest.TestCase):
         g2._player_hands[3] = th
         g2.tiles = []
         g2.play_turn()
-        pay2 = g2.get_keiten_payments()
+        pay2 = g2.get_points()
         self.assertEqual(pay2[0], 0)
         self.assertEqual(pay2[1], 0)
         self.assertEqual(pay2[2], 0)

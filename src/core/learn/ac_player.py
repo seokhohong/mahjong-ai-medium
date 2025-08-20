@@ -43,6 +43,33 @@ class ACPlayer(Player):
 		self.temperature = max(1e-6, float(temperature))
 		self.gsv_scaler = gsv_scaler
 
+	@classmethod
+	def default(
+		cls,
+		player_id: int = 0,
+		*,
+		temperature: float = 1.0,
+		hidden_size: int = 128,
+		embedding_dim: int = 16,
+		network_temperature: float = 0.05,
+		gsv_scaler: StandardScaler | None = None,
+	) -> Self:
+		"""Factory for a sensible default `ACPlayer`.
+
+		Creates (or accepts) a `StandardScaler`, builds an `ACNetwork` with
+		configurable model sizes, and returns a ready-to-use `ACPlayer` that
+		uses `temperature` for action selection.
+		"""
+		if gsv_scaler is None:
+			gsv_scaler = StandardScaler()
+		network = ACNetwork(
+			gsv_scaler=gsv_scaler,
+			hidden_size=hidden_size,
+			embedding_dim=embedding_dim,
+			temperature=network_temperature,
+		)
+		return cls(player_id=player_id, network=network, gsv_scaler=gsv_scaler, temperature=temperature)
+
 	def _mask_to_indices(self, mask: np.ndarray) -> List[int]:
 		return [i for i, ok in enumerate(mask) if ok]
 

@@ -24,7 +24,22 @@ from .constants import (
     SANSOKU_CLOSED_HAN,
     IIPEIKOU_HAN,
     ITTSU_OPEN_HAN,
-    ITTSU_CLOSED_HAN, STANDARD_HAND_TILE_COUNT,
+    ITTSU_CLOSED_HAN,
+    BASE_POINTS_EXPONENT_OFFSET,
+    RIICHI_HAN,
+    MENZEN_TSUMO_HAN,
+    IPPATSU_HAN,
+    MANGAN_HAN_THRESHOLD,
+    MANGAN_DEALER_TSUMO_PAYMENT_EACH,
+    MANGAN_NON_DEALER_TSUMO_DEALER_PAYMENT,
+    MANGAN_NON_DEALER_TSUMO_OTHERS_PAYMENT,
+    MANGAN_DEALER_RON_POINTS,
+    MANGAN_NON_DEALER_RON_POINTS,
+    DEALER_TSUMO_TOTAL_MULTIPLIER,
+    NON_DEALER_TSUMO_DEALER_MULTIPLIER,
+    NON_DEALER_TSUMO_OTHERS_MULTIPLIER,
+    DEALER_RON_MULTIPLIER,
+    NON_DEALER_RON_MULTIPLIER,
 )
 
 
@@ -536,10 +551,10 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
 
     # Riichi
     if riichi_declared:
-        han += 1
+        han += RIICHI_HAN
     # Menzen (menzen tsumo): closed hand tsumo
     if win_by_tsumo and not _is_open_hand(called_sets):
-        han += 1
+        han += MENZEN_TSUMO_HAN
 
     # Dora (including aka)
     dora_han = _calc_dora_han(concealed_tiles, called_sets, dora_indicators)
@@ -1099,6 +1114,22 @@ class MediumJong:
             for _ in range(STANDARD_HAND_TILE_COUNT):
                 self._player_hands[pid].append(self.tiles.pop())
 
+        # Helper methods for riichi/ippatsu state management
+
+    def _cancel_ippatsu_all(self) -> None:
+        """Cancel ippatsu eligibility for all players."""
+        for pid in range(4):
+            self.riichi_ippatsu_active[pid] = False
+
+    def _cancel_ippatsu_for(self, player_id: int) -> None:
+        """Cancel ippatsu eligibility for a specific player."""
+        self.riichi_ippatsu_active[player_id] = False
+
+    def _on_any_call_side_effects(self) -> None:
+        """Common side effects when any call (chi/pon/daiminkan) happens."""
+        self._cancel_ippatsu_all()
+        self.last_discard_was_riichi = False
+
     class IllegalMoveException(Exception):
         pass
 
@@ -1195,7 +1226,7 @@ class MediumJong:
             self.last_discard_player = actor_id
             # Discard after riichi cancels ippatsu for this player
             if self.riichi_declared.get(actor_id, False):
-                self.riichi_ippatsu_active[actor_id] = False
+                self._cancel_ippatsu_for(actor_id)
             self.last_discard_was_riichi = False
             self._next_move_is_action = False
         if isinstance(move, KanKakan):
@@ -1212,8 +1243,7 @@ class MediumJong:
                     cs.source_position = None
                     break
             # Any kan cancels ippatsu for all players
-            for pid in range(4):
-                self.riichi_ippatsu_active[pid] = False
+            self._cancel_ippatsu_all()
             self._add_kan_dora()
             self._rinshan_draw()
             # Continue action within the same overall turn after Kan
@@ -1232,8 +1262,7 @@ class MediumJong:
                 CalledSet(tiles=[Tile(move.tile.suit, move.tile.tile_type) for _ in range(4)], call_type='kan_ankan',
                           called_tile=None, caller_position=actor_id, source_position=None))
             # Any kan cancels ippatsu for all players
-            for pid in range(4):
-                self.riichi_ippatsu_active[pid] = False
+            self._cancel_ippatsu_all()
             self._add_kan_dora()
             self._rinshan_draw()
             # Continue action within the same overall turn after Kan
@@ -1245,9 +1274,7 @@ class MediumJong:
             self._on_win(actor_id, win_by_tsumo=False)
         if isinstance(move, Pon):
             # Any call cancels ippatsu
-            for pid in range(4):
-                self.riichi_ippatsu_active[pid] = False
-            self.last_discard_was_riichi = False
+            self._on_any_call_side_effects()
             last = self.last_discarded_tile
             # Mark the discarder index as called
             discarder = self.last_discard_player
@@ -1270,9 +1297,7 @@ class MediumJong:
             self._action()
         if isinstance(move, Chi):
             # Any call cancels ippatsu
-            for pid in range(4):
-                self.riichi_ippatsu_active[pid] = False
-            self.last_discard_was_riichi = False
+            self._on_any_call_side_effects()
             last = self.last_discarded_tile
             # Mark the discarder index as called
             discarder = self.last_discard_player
@@ -1299,9 +1324,7 @@ class MediumJong:
             self._action()
         if isinstance(move, KanDaimin):
             # Any call cancels ippatsu
-            for pid in range(4):
-                self.riichi_ippatsu_active[pid] = False
-            self.last_discard_was_riichi = False
+            self._on_any_call_side_effects()
             last = self.last_discarded_tile
             # Mark the discarder index as called
             discarder = self.last_discard_player
@@ -1540,28 +1563,28 @@ class MediumJong:
         )
         # Ippatsu: +1 han if riichi declared, ippatsu active, and win occurs on next draw before any call or discard
         if self.riichi_declared[winner_id] and self.riichi_ippatsu_active.get(winner_id, False):
-            han += 1
+            han += IPPATSU_HAN
             # Consumed on win
             self.riichi_ippatsu_active[winner_id] = False
 
         # Base points
-        base_points = fu * (2 ** (2 + han))
+        base_points = fu * (2 ** (BASE_POINTS_EXPONENT_OFFSET + han))
         # Apply simple mangan cap for limit hands (≥5 han)
         dealer = (winner_id == DEALER_ID_START)
-        if han >= 5:
+        if han >= MANGAN_HAN_THRESHOLD:
             if win_by_tsumo:
                 if dealer:
                     # Dealer tsumo mangan: 2000 each from three players
-                    total = 2000 * 3
+                    total = MANGAN_DEALER_TSUMO_PAYMENT_EACH * 3
                     payments = {'total_from_others': total}
                     return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': True, 'payments': payments}
                 else:
                     # Non-dealer tsumo mangan: dealer 2000, others 1000 each
-                    payments = {'from_dealer': 2000, 'from_others': 1000, 'total_from_all': 2000 + 2 * 1000}
+                    payments = {'from_dealer': MANGAN_NON_DEALER_TSUMO_DEALER_PAYMENT, 'from_others': MANGAN_NON_DEALER_TSUMO_OTHERS_PAYMENT, 'total_from_all': MANGAN_NON_DEALER_TSUMO_DEALER_PAYMENT + 2 * MANGAN_NON_DEALER_TSUMO_OTHERS_PAYMENT}
                     return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': payments['total_from_all'], 'tsumo': True, 'payments': payments}
             else:
                 # Ron mangan
-                total = 12000 if dealer else 8000
+                total = MANGAN_DEALER_RON_POINTS if dealer else MANGAN_NON_DEALER_RON_POINTS
                 return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': False, 'from': self.loser}
 
         # Simplified rounding for non-limit hands
@@ -1570,7 +1593,7 @@ class MediumJong:
 
         if win_by_tsumo:
             if dealer:
-                total = round_up_100(base_points * 6)
+                total = round_up_100(base_points * DEALER_TSUMO_TOTAL_MULTIPLIER)
                 payments = {'total_from_others': total}
                 # Winner collects riichi sticks pot on win
                 if self.riichi_sticks_pot > 0:
@@ -1578,8 +1601,8 @@ class MediumJong:
                     self.riichi_sticks_pot = 0
             else:
                 # Non-dealer split: dealer pays 2x, others 1x
-                dealer_pay = round_up_100(base_points * 2)
-                non_dealer_pay = round_up_100(base_points)
+                dealer_pay = round_up_100(base_points * NON_DEALER_TSUMO_DEALER_MULTIPLIER)
+                non_dealer_pay = round_up_100(base_points * NON_DEALER_TSUMO_OTHERS_MULTIPLIER)
                 total = dealer_pay + 2 * non_dealer_pay
                 payments = {'from_dealer': dealer_pay, 'from_others': non_dealer_pay, 'total_from_all': total}
                 if self.riichi_sticks_pot > 0:
@@ -1589,9 +1612,9 @@ class MediumJong:
         else:
             # Ron
             if dealer:
-                total = round_up_100(base_points * 6)
+                total = round_up_100(base_points * DEALER_RON_MULTIPLIER)
             else:
-                total = round_up_100(base_points * 4)
+                total = round_up_100(base_points * NON_DEALER_RON_MULTIPLIER)
             payments: Dict[str, Any] = {'from': self.loser}
             # Riichi sticks are awarded on ron only if the winning tile is not the riichi declaration discard
             if self.riichi_sticks_pot > 0 and not self.last_discard_was_riichi:

@@ -163,7 +163,8 @@ class TestTrainEndToEnd(unittest.TestCase):
 
         # Train to memorize
         dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        net = ACNetwork(gsv_scaler=StandardScaler(), hidden_size=64, embedding_dim=8).to(dev)
+        player = ACPlayer.default()
+        net = player.network
         model = net.torch_module
         model.eval()
         hand, calls, disc, gsv, flat_idx = _build_tensors_from_states_actions(net, all_states, all_actions, dev)

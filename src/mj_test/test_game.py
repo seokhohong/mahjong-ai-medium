@@ -779,10 +779,17 @@ class TestScoring(unittest.TestCase):
 
         # Back to player 0; draw winning 6s and tsumo
         g.play_turn()
-        # Ensure game ends by tsumo and scoring reflects exactly 4 han: riichi(1) + ippatsu(1) + menzen(1) + uradora(1)
+        # Ensure game ends by tsumo and final points reflect dealer tsumo with riichi + ippatsu + menzen + 1 uradora
         self.assertTrue(g.is_game_over())
-        s = g._score_hand(0, win_by_tsumo=True)
-        self.assertEqual(s['han'], 4)
+        pts = g.get_points()
+        # Base points: fu=30, han=4 -> base=30*2^(2+4)=30*64=1920; dealer tsumo total=round_up_100(1920*6)=11600
+        # Riichi stick pot adds +1000 to winner
+        self.assertIsNotNone(pts)
+        self.assertEqual(len(pts), 4)
+        self.assertEqual(pts[0], 12600)
+        self.assertEqual(pts[1], -3866)
+        self.assertEqual(pts[2], -3866)
+        self.assertEqual(pts[3], -3866)
 
     def _make_tenpai_hand(self):
         # 13 tiles: needs 6s to complete 456s; closed, standard hand

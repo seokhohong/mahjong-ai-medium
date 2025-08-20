@@ -39,15 +39,8 @@ Edit this function to change which agents compete. Examples:
 def build_players() -> List[Player]:
 	from core.learn.data_utils import load_gsv_scaler
 
-	# Try to load scaler from the model dataset if it exists
-	model_path = os.path.join(os.getcwd(), 'models', 'ac_ppo_best_20250818_150635.pt')
-	scaler_path = model_path.replace('.pt', '_dataset.npz')  # Assume dataset has same name
-	gsv_scaler = load_gsv_scaler(scaler_path)
-
-	net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=128, embedding_dim=16, temperature=0.5)
-	net.load_model(model_path)
 	return [
-        ACPlayer(0, net, gsv_scaler=None, temperature=0),
+        ACPlayer.from_directory("models/ac_ppo_best_20250818_150635", player_id=0, temperature=0),
 		RecordingHeuristicACPlayer(1),
 		RecordingHeuristicACPlayer(2),
 		RecordingHeuristicACPlayer(3),
@@ -78,8 +71,6 @@ def play_matches(players: List[Player], games: int, *, shuffle_each_game: bool =
 		# Map back to original indices
 		inv = {ordered_players[i].player_id: i for i in range(4)}
 		final_points = game.get_points()
-		if final_points is None:
-			print("what")
 		for i in range(4):
 			per_player_scores[order[i]].append(float(final_points[i]))
 

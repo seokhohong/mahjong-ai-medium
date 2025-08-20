@@ -596,6 +596,35 @@ class GamePerspective:
         self.round_wind = round_wind
         self.riichi_declared = dict(riichi_declared)
 
+    def __repr__(self) -> str:
+        def _fmt_hand(tiles: List[Tile]) -> str:
+            sorted_tiles = sorted(tiles, key=lambda t: (t.suit.value, int(t.tile_type.value) if t.suit != Suit.HONORS else int(t.tile_type.value)))
+            return '[' + ', '.join(str(t) for t in sorted_tiles) + ']'
+
+        def _fmt_called_sets(csets: List[CalledSet]) -> str:
+            if not csets:
+                return '[]'
+            parts: List[str] = []
+            for cs in csets:
+                tiles = getattr(cs, 'tiles', [])
+                call_type = getattr(cs, 'call_type', '?')
+                sorted_tiles = sorted(tiles, key=lambda t: (t.suit.value, int(t.tile_type.value) if t.suit != Suit.HONORS else int(t.tile_type.value)))
+                parts.append(f"{call_type}:[" + ', '.join(str(t) for t in sorted_tiles) + "]")
+            return '[' + '; '.join(parts) + ']'
+
+        newly = self.newly_drawn_tile
+        newly_s = str(newly) if newly is not None else 'None'
+        last = self.last_discarded_tile
+        last_s = str(last) if last is not None else 'None'
+        last_from = 'None' if self.last_discard_player is None else f"P{self.last_discard_player}"
+        my_called = _fmt_called_sets(self.called_sets.get(0, []))
+        state_s = 'Action' if self.state is Action else 'Reaction'
+        can_call_s = '1' if self.can_call else '0'
+        return (
+            f"GP[{state_s}] Hand {_fmt_hand(self.player_hand)} | Called {my_called} | "
+            f"Draw {newly_s} | Last {last_s} from {last_from} | CanCall {can_call_s} | Round {self.round_wind.name}"
+        )
+
     def _concealed_tiles(self) -> List[Tile]:
         return list(self.player_hand)
 

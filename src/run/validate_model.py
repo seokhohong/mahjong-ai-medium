@@ -25,7 +25,7 @@ from core.learn.feature_engineering import decode_game_perspective
 from core.learn.policy_utils import flat_index_for_action
 
 
-def load_dataset(data_path: str, net: ACNetwork) -> Dict[str, Any]:
+def load_dataset(data_path: str) -> Dict[str, Any]:
     """Load and preprocess dataset similar to ACDataset."""
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Dataset not found: {data_path}")
@@ -37,6 +37,7 @@ def load_dataset(data_path: str, net: ACNetwork) -> Dict[str, Any]:
     disc_arr = data['disc_idx']
     called_arr = data['called_idx']
     gsv_arr = data['game_state']
+    called_discards_arr = data['called_discards']
     flat_idx = data['flat_idx']
 
     N = len(hand_arr)
@@ -53,6 +54,7 @@ def load_dataset(data_path: str, net: ACNetwork) -> Dict[str, Any]:
             'disc_idx': np.asarray(disc_arr[i], dtype=np.int32),
             'called_idx': np.asarray(called_arr[i], dtype=np.int32),
             'game_state': np.asarray(gsv_arr[i], dtype=np.float32),
+            'called_discards': np.asarray(called_discards_arr[i], dtype=np.int32),
         }
         states.append(state_dict)
         actions.append(int(flat_idx[i]))
@@ -67,31 +69,10 @@ def validate_model(model_path: str, data_path: str, accuracy_threshold: float, m
     device = torch.device('cpu')
     print(f"Using device: {device}")
 
-    net = ACNetwork(StandardScaler(), hidden_size=128, embedding_dim=16).to(device)
-
-    # Load model
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found: {model_path}")
-
-    # Load StandardScaler from dataset
-    gsv_scaler = load_gsv_scaler(data_path)
-
-    # Initialize network on CPU for faster per-sample evaluation
-    device = torch.device('cpu')
-    print(f"Using device: {device}")
-
-    # Create ACNetwork with scaler
-    net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=128, embedding_dim=16).to(device)
-
-    # Load model
-    print(f"Loading model from: {model_path}")
-    net.load_model(model_path, load_entire_module=False)
-
-    # Create ACPlayer with temperature=1 to match test validation behavior
-    ac_player = ACPlayer(0, net, gsv_scaler=None, temperature=1.0)
+    ac_player = ACPlayer.from_directory(model_path, temperature=1.0)
 
     # Load dataset
-    dataset = load_dataset(data_path, net)
+    dataset = load_dataset(data_path)
     states = dataset['states']
     actions = dataset['actions']
 

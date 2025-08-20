@@ -40,7 +40,7 @@ def build_players() -> List[Player]:
 	from core.learn.data_utils import load_gsv_scaler
 
 	return [
-        ACPlayer.from_directory("models/ac_ppo_best_20250818_150635", player_id=0, temperature=0),
+        ACPlayer.from_directory("models/ac_ppo_20250820_021412", player_id=0, temperature=0),
 		RecordingHeuristicACPlayer(1),
 		RecordingHeuristicACPlayer(2),
 		RecordingHeuristicACPlayer(3),

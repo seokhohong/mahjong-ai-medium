@@ -54,14 +54,13 @@ def compute_n_step_returns(
 def build_ac_dataset(
     games: int,
     seed: int | None = None,
-    hidden_size: int = 128,
-    embedding_dim: int = 16,
     temperature: float = 1.0,
     zero_network_reward: bool = False,
     n_step: int = 3,
     gamma: float = 0.99,
     use_heuristic: bool = False,
     model_path: str | None = None,
+    negative_reward_weight: float = 1.0,
 ) -> dict:
     if seed is not None:
         import random
@@ -118,51 +117,16 @@ def build_ac_dataset(
             if T == 0:
                 continue
             rewards = list(p.experience.rewards)
-            # Compute final per-player rewards as log(score) payoff at episode end
+            # Compute terminal reward directly from final per-player deltas via get_points()
             if T > 0:
-                terminal_reward = 0.0
-                try:
-                    import math
-                    # Draw: no winners
-                    if not winners:
-                        terminal_reward = 0.0
-                    else:
-                        # Ron case: one or more winners, single loser pays each winner's points
-                        if loser is not None:
-                            total_points_from_loser = 0.0
-                            for w in winners:
-                                res = game._score_hand(winner_id=w, win_by_tsumo=False)  # type: ignore[arg-type]
-                                pts = float(res.get('points', 0.0))
-                                if pid == w and pts > 0:
-                                    terminal_reward += math.log(max(1e-9, pts / 1000.0))
-                                total_points_from_loser += pts
-                            if pid == int(loser) and total_points_from_loser > 0:
-                                terminal_reward -= math.log(max(1e-9, total_points_from_loser / 1000.0))
-                        else:
-                            # Tsumo case: exactly one winner collects from all
-                            w = winners[0]
-                            res = game._score_hand(winner_id=w, win_by_tsumo=True)
-                            pts = float(res.get('points', 0.0))
-                            payments = res.get('payments', {}) if isinstance(res, dict) else {}
-                            if pid == w and pts > 0:
-                                terminal_reward = math.log(max(1e-9, pts / 1000.0))
-                            else:
-                                # Identify loser shares
-                                if int(w) == 0:
-                                    # Dealer tsumo: three opponents split equally
-                                    total_from_others = float(payments.get('total_from_others', 0.0))
-                                    if pid != w and total_from_others > 0:
-                                        share = (total_from_others / 3.0) / 1000.0
-                                        terminal_reward = -math.log(max(1e-9, share))
-                                else:
-                                    # Non-dealer tsumo: dealer pays from_dealer; others pay from_others
-                                    from_dealer = float(payments.get('from_dealer', 0.0))
-                                    from_others = float(payments.get('from_others', 0.0))
-                                    if pid == 0 and from_dealer > 0:
-                                        terminal_reward = -math.log(max(1e-9, from_dealer / 1000.0))
-                                    elif pid != w and pid != 0 and from_others > 0:
-                                        terminal_reward = -math.log(max(1e-9, from_others / 1000.0))
-                except Exception:
+                import math
+                pts = game.get_points()
+                my_delta = float(pts[pid])
+                if my_delta > 0:
+                    terminal_reward = math.log(max(1e-9, my_delta / 1000.0))
+                elif my_delta < 0:
+                    terminal_reward = -negative_reward_weight * math.log(max(1e-9, (-my_delta) / 1000.0))
+                else:
                     terminal_reward = 0.0
                 rewards[-1] = float(terminal_reward)
             # Use stored values from the experience buffer
@@ -236,12 +200,11 @@ def main():
     ap = argparse.ArgumentParser(description='Create AC experience dataset (states, actions, n-step returns)')
     ap.add_argument('--games', type=int, default=10, help='Number of games to simulate')
     ap.add_argument('--seed', type=int, default=None, help='Random seed')
-    ap.add_argument('--hidden_size', type=int, default=128)
-    ap.add_argument('--embedding_dim', type=int, default=16)
     ap.add_argument('--temperature', type=float, default=0.1)
     ap.add_argument('--zero_network_reward', action='store_true', help='Zero out network value as immediate reward')
     ap.add_argument('--n_step', type=int, default=3, help='N for n-step returns')
     ap.add_argument('--gamma', type=float, default=0.99, help='Discount factor in (0,1]')
+    ap.add_argument('--negative_reward_weight', type=float, default=1.0, help='Multiplier applied to negative terminal rewards (set 0 to ignore losses)')
     ap.add_argument('--out', type=str, default=None, help='Output .npz path (placed under training_data/)')
     ap.add_argument('--use_heuristic', action='store_true', help='Use RecordingHeuristicACPlayer (generation 0)')
     ap.add_argument('--model', type=str, default=None, help='Path to AC network .pt to load')
@@ -250,14 +213,13 @@ def main():
     built = build_ac_dataset(
         games=args.games,
         seed=args.seed,
-        hidden_size=args.hidden_size,
-        embedding_dim=args.embedding_dim,
         temperature=args.temperature,
         zero_network_reward=bool(args.zero_network_reward),
         n_step=args.n_step,
         gamma=args.gamma,
         use_heuristic=bool(args.use_heuristic),
         model_path=args.model,
+        negative_reward_weight=float(args.negative_reward_weight),
     )
 
     # Prepare output file relative to the current working directory

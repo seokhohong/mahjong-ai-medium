@@ -23,7 +23,7 @@ from sklearn.preprocessing import StandardScaler  # type: ignore
 
 # not using called discards yet
 class ACDataset(Dataset):
-    def __init__(self, npz_path: str, net: ACNetwork):
+    def __init__(self, npz_path: str, net: ACNetwork, *, negative_reward_weight: float = 1.0):
         data = np.load(npz_path, allow_pickle=True)
         # New compact format fields
         hand_arr = data['hand_idx']
@@ -31,9 +31,21 @@ class ACDataset(Dataset):
         called_arr = data['called_idx']
         gsv_arr = data['game_state']
         self.flat_idx = data['flat_idx']
-        self.returns = data['returns'].astype(np.float32)
-        self.advantages = data['advantages'].astype(np.float32)
+        # Load returns/advantages and apply optional negative reward weight transform
+        returns = data['returns'].astype(np.float32)
+        advantages = data['advantages'].astype(np.float32)
+        nrw = float(max(0.0, negative_reward_weight))
+        if nrw != 1.0:
+            # Scale only negative returns; positives unchanged
+            neg_mask = returns < 0
+            returns[neg_mask] = returns[neg_mask] * nrw
+            advantages[neg_mask] = advantages[neg_mask] * nrw
+        self.returns = returns
+        self.advantages = advantages
         self.old_log_probs = data['old_log_probs'].astype(np.float32)
+
+        # fit the standard scaler so we can properly use extract_features
+        net.fit_scaler(gsv_arr)
 
         # Pre-extract indexed states and transform to embedded sequences once
         hand_list = []
@@ -42,7 +54,7 @@ class ACDataset(Dataset):
         gsv_list = []
         N = len(hand_arr)
         for i in range(N):
-            h, c, d, g = net._extract_features_from_indexed(
+            h, c, d, g = net.extract_features_from_indexed(
                 np.asarray(hand_arr[i], dtype=np.int32),
                 np.asarray(disc_arr[i], dtype=np.int32),
                 np.asarray(called_arr[i], dtype=np.int32),
@@ -55,16 +67,7 @@ class ACDataset(Dataset):
         self.hand = np.asarray(hand_list, dtype=np.float32)
         self.calls = np.asarray(calls_list, dtype=np.float32)
         self.disc = np.asarray(disc_list, dtype=np.float32)
-        # Ensure StandardScaler sees a consistent feature size matching AC constants
-        from core.learn.ac_constants import GAME_STATE_VEC_LEN as AC_GSV_LEN  # type: ignore
-        gsv_arr = np.asarray(gsv_list, dtype=np.float32)
-        if gsv_arr.ndim == 1:
-            gsv_arr = gsv_arr[None, :]
-        if gsv_arr.size > 0:
-            pad_width = int(AC_GSV_LEN) - gsv_arr.shape[1]
-            if pad_width > 0:
-                gsv_arr = np.pad(gsv_arr, ((0, 0), (0, pad_width)), mode='constant')
-        self.gsv = net.gsv_scaler.fit_transform(gsv_arr) if gsv_arr.size > 0 else gsv_arr
+        self.gsv = np.asarray(gsv_list, dtype=np.float32)
 
     def __len__(self) -> int:
         return self.hand.shape[0]
@@ -165,6 +168,7 @@ def train_ppo(
     entropy_coeff: float = 0.01,
     device: str | None = None,
     patience: int = 0,
+    min_delta: float = 1e-4,
     val_split: float = 0.1,
     init_model: str | None = None,
     warm_up_acc: float = 0.0,
@@ -172,25 +176,32 @@ def train_ppo(
     *,
     hidden_size: int = 128,
     embedding_dim: int = 16,
+    negative_reward_weight: float = 1.0,
 ) -> str:
     dev = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
 
-    # Initialize AC network first so we can use its feature extraction table and standard scaler for preprocessing
-    net = ACNetwork(gsv_scaler=None, hidden_size=hidden_size, embedding_dim=embedding_dim, temperature=0.05)
-    net = net.to(dev)
     if init_model:
         try:
             player = ACPlayer.from_directory(init_model)
             net = player.network
+
+            # reset standard scaler since we're retraining it
+            net._gsv_scaler = StandardScaler()
+
             print(f"Loaded initial weights from {init_model}")
         except Exception as e:
-            print(f"Warning: failed to load init model '{init_model}': {e}")
+            raise ValueError(f"Warning: failed to load init model '{init_model}': {e}")
     else:
+        gsv_scaler = StandardScaler()
+        # Initialize AC network first so we can use its feature extraction table and standard scaler for preprocessing
+        net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=hidden_size, embedding_dim=embedding_dim, temperature=0.05)
+        net = net.to(dev)
         # Ensure the scaler we persist is the exact one used by the network during preprocessing
-        player = ACPlayer(player_id=0, gsv_scaler=net.gsv_scaler, network=net)
+        player = ACPlayer(player_id=0, gsv_scaler=gsv_scaler, network=net)
+
     model = net.torch_module
-    ds = ACDataset(dataset_path, net)
+    ds = ACDataset(dataset_path, net, negative_reward_weight=negative_reward_weight)
     # Build train/validation split
     n = len(ds)
     k = int(max(0, min(n, round(float(val_split) * n))))
@@ -278,10 +289,15 @@ def train_ppo(
                 total_loss += float(loss.item()) * bsz
                 pol_loss_acc += float(policy_loss.item()) * bsz
                 val_loss_acc += float(value_loss.item()) * bsz
+                # Compute training accuracy in eval mode for parity with validation accuracy
                 with torch.no_grad():
+                    was_training = model.training
+                    model.eval()
                     pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
                     pred = torch.argmax(pp, dim=1)
                     correct += int((pred == flat_idx).sum().item())
+                    if was_training:
+                        model.train()
                 progress.set_postfix(loss=f"{float(loss.item()):.4f}", pol=f"{float(policy_loss.item()):.4f}", val=f"{float(value_loss.item()):.4f}")
 
             # Calculate train accuracy
@@ -406,7 +422,10 @@ def train_ppo(
                         model, hand, calls, disc, gsv,
                         flat_idx,
                         old_log_probs,
-                        advantages, returns
+                        advantages, returns,
+                        epsilon=epsilon,
+                        value_coeff=value_coeff,
+                        entropy_coeff=entropy_coeff,
                     )
 
                     val_total += float(total_v.item()) * bsz
@@ -427,7 +446,7 @@ def train_ppo(
 
         # Early stopping on total loss (only when validation split is used)
         if dl_val is not None:
-            if v_avg < best_loss - 1e-6:
+            if v_avg < best_loss - float(min_delta):
                 best_loss = v_avg
                 epochs_no_improve = 0
                 # Save best checkpoint
@@ -443,8 +462,8 @@ def train_ppo(
 
             else:
                 epochs_no_improve += 1
-                if patience > 0 and epochs_no_improve >= patience:
-                    print(f"Early stopping triggered (patience={patience})")
+                if 0 < patience <= epochs_no_improve:
+                    print(f"Early stopping triggered (patience={patience}, min_delta={min_delta})")
                     break
 
     # Save trained weights and scaler
@@ -459,14 +478,12 @@ def train_ppo(
     model_path = os.path.join(model_dir, 'model.pt')
     net.save_model(model_path, save_entire_module=False)
 
-    # Save scaler if available
-    if player.gsv_scaler is not None:
-        scaler_path = os.path.join(model_dir, 'scaler.pkl')
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(player.gsv_scaler, f)
-        print(f"Saved StandardScaler to {scaler_path}")
-    else:
-        print("Warning: No StandardScaler available to save")
+    # Save scaler
+    assert player.gsv_scaler.mean_[0] > 2 # sanity check that the scaler is fitted correctly
+    scaler_path = os.path.join(model_dir, 'scaler.pkl')
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(player.gsv_scaler, f)
+    print(f"Saved StandardScaler to {scaler_path}")
 
     print(f"Saved PPO model and scaler to {model_dir}")
     return model_path
@@ -482,11 +499,13 @@ def main():
     ap.add_argument('--value_coeff', type=float, default=0.5)
     ap.add_argument('--entropy_coeff', type=float, default=0.01)
     ap.add_argument('--patience', type=int, default=0, help='Early stopping patience (0 disables)')
+    ap.add_argument('--min_delta', type=float, default=1e-4, help='Minimum improvement in val loss to reset patience')
     ap.add_argument('--init', type=str, default=None, help='Path to initial AC model weights/module to load')
     ap.add_argument('--warm_up_acc', type=float, default=0.0, help='Accuracy threshold to reach with behavior cloning before switching to PPO (0 disables)')
     ap.add_argument('--warm_up_max_epochs', type=int, default=50, help='Maximum warm-up epochs before switching even if threshold not reached')
     ap.add_argument('--hidden_size', type=int, default=128, help='Hidden size for ACNetwork')
     ap.add_argument('--embedding_dim', type=int, default=16, help='Embedding dimension for ACNetwork')
+    ap.add_argument('--negative_reward_weight', type=float, default=1.0, help='Scale factor applied to negative returns/advantages after loading dataset (>=0). 1.0 means no change')
     args = ap.parse_args()
 
     train_ppo(
@@ -498,11 +517,13 @@ def main():
         value_coeff=args.value_coeff,
         entropy_coeff=args.entropy_coeff,
         patience=args.patience,
+        min_delta=float(args.min_delta),
         init_model=args.init,
         warm_up_acc=args.warm_up_acc,
         warm_up_max_epochs=args.warm_up_max_epochs,
         hidden_size=args.hidden_size,
-        embedding_dim=args.embedding_dim
+        embedding_dim=args.embedding_dim,
+        negative_reward_weight=float(max(0.0, args.negative_reward_weight)),
     )
 
 

@@ -38,11 +38,11 @@ class ACNetwork:
         self.embedding_dim = embedding_dim
         self.temperature = float(max(0.0, temperature))
         if gsv_scaler is None:
-            print("Warning, loading ACNetwork with null StandardScaler")
-            self.gsv_scaler = StandardScaler()
+            print("Warning, instantiating ACNetwork with null StandardScaler")
+            self._gsv_scaler = StandardScaler()
         else:
             # Respect provided scaler (may already be fit from dataset)
-            self.gsv_scaler = gsv_scaler
+            self._gsv_scaler = gsv_scaler
 
         from ..constants import TOTAL_TILES
         from .ac_constants import GAME_STATE_VEC_LEN as GSV
@@ -128,7 +128,25 @@ class ACNetwork:
     def _get_tile_index(self, tile: Tile) -> int:
         return (tile.tile_type.value - 1) * 2 + (0 if tile.suit == Suit.PINZU else 1)
 
-    def _extract_features_from_indexed(self, hand_idx: np.ndarray, disc_idx: np.ndarray, called_idx: np.ndarray, game_state_vec: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _is_fit(self):
+        return hasattr(self._gsv_scaler, 'scale_')
+
+    def fit_scaler(self, game_state_arr):
+        assert not self._is_fit(), "gsv_scaler has already been fitted; refusing to refit in ACNetwork"
+        # Ensure StandardScaler sees a consistent feature size matching AC constants
+        from core.learn.ac_constants import GAME_STATE_VEC_LEN as AC_GSV_LEN  # type: ignore
+        gsv_arr = np.asarray(game_state_arr, dtype=np.float32)
+        assert gsv_arr.shape[0] > 0
+        if gsv_arr.ndim == 1:
+            gsv_arr = gsv_arr[None, :]
+        pad_width = int(AC_GSV_LEN) - gsv_arr.shape[1]
+        if pad_width > 0:
+            gsv_arr = np.pad(gsv_arr, ((0, 0), (0, pad_width)), mode='constant')
+        self._gsv_scaler.fit(gsv_arr)
+
+
+    def extract_features_from_indexed(self, hand_idx: np.ndarray, disc_idx: np.ndarray, called_idx: np.ndarray, game_state_vec: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        assert self._is_fit, "StandardScaler is not fit"
         from .ac_constants import GAME_STATE_VEC_LEN as GSV
         # Hand embeddings (index < 0 is padding and will be zeroed). We assume inputs are already fixed-size.
         hand_idx_safe = np.asarray(hand_idx, dtype=np.int32)
@@ -165,9 +183,7 @@ class ACNetwork:
         gs = np.asarray(game_state_vec, dtype=np.float32)
         if gs.shape[0] < GSV:
             gs = np.pad(gs, (0, GSV - gs.shape[0]))
-        # Apply StandardScaler only if it has been fitted; otherwise, return raw padded vector
-        if hasattr(self.gsv_scaler, 'scale_'):
-            gs = self.gsv_scaler.transform([gs])[0]
+        gs = self._gsv_scaler.transform([gs])[0]
         return hand_seq.astype(np.float32), calls_seq.astype(np.float32), disc_seq.astype(np.float32), gs.astype(np.float32)
 
     def evaluate(self, game_state: GamePerspective) -> Tuple[Dict[str, np.ndarray], float]:
@@ -180,7 +196,7 @@ class ACNetwork:
         disc_idx = feat['disc_idx']            # (4, max_discards)
         game_state_vec = feat['game_state']    # (GSV',)
 
-        h, c, d, g = self._extract_features_from_indexed(hand_idx, disc_idx, called_idx, game_state_vec)
+        h, c, d, g = self.extract_features_from_indexed(hand_idx, disc_idx, called_idx, game_state_vec)
 
         with torch.no_grad():
             pp, val = self._net(

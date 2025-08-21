@@ -1,5 +1,8 @@
 import random
 import math
+import os
+import pickle
+from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Dict, Any, Union, Tuple
@@ -90,9 +93,12 @@ class Tile:
         if self.suit == Suit.HONORS:
             mapping = {
                 Honor.EAST: 'E', Honor.SOUTH: 'S', Honor.WEST: 'W', Honor.NORTH: 'N',
-                Honor.WHITE: 'P', Honor.GREEN: 'G', Honor.RED: 'R',
+                Honor.WHITE: 'Wh', Honor.GREEN: 'G', Honor.RED: 'R',
             }
             return mapping[self.tile_type]  # type: ignore[index]
+        # Represent aka (red-dora) five as 0{suite} per common shorthand, e.g., "0p"
+        if self.aka and self.suit in (Suit.MANZU, Suit.PINZU, Suit.SOUZU) and self.tile_type == TileType.FIVE:
+            return f"0{self.suit.value}"
         return f"{int(self.tile_type.value)}{self.suit.value}"
 
     def __eq__(self, other: object) -> bool:
@@ -101,6 +107,126 @@ class Tile:
     def __hash__(self) -> int:
         return hash((self.suit, self.tile_type))
 
+
+# Structured outcome types for a completed hand
+class OutcomeType(Enum):
+    RON = 'Ron'
+    TSUMO = 'Tsumo'
+    TENPAI = 'Tenpai'
+    NOTEN = 'Noten'
+    DEAL_IN = 'DealIn'
+
+
+@dataclass
+class PlayerOutcome:
+    player_id: int
+    outcome_type: Optional[OutcomeType]
+    won: bool
+    lost: bool
+    tenpai: bool
+    noten: bool
+    points_delta: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'player_id': int(self.player_id),
+            'outcome_type': None if self.outcome_type is None else str(self.outcome_type.value),
+            'won': bool(self.won),
+            'lost': bool(self.lost),
+            'tenpai': bool(self.tenpai),
+            'noten': bool(self.noten),
+            'points_delta': int(self.points_delta),
+        }
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> 'PlayerOutcome':
+        ot_raw = data.get('outcome_type')
+        ot: Optional[OutcomeType]
+        if ot_raw is None:
+            ot = None
+        else:
+            # Map string value back to enum
+            mapping = {
+                'Ron': OutcomeType.RON,
+                'Tsumo': OutcomeType.TSUMO,
+                'Tenpai': OutcomeType.TENPAI,
+                'Noten': OutcomeType.NOTEN,
+                'DealIn': OutcomeType.DEAL_IN,
+            }
+            ot = mapping.get(str(ot_raw))
+        return PlayerOutcome(
+            player_id=int(data['player_id']),
+            outcome_type=ot,
+            won=bool(data['won']),
+            lost=bool(data['lost']),
+            tenpai=bool(data['tenpai']),
+            noten=bool(data['noten']),
+            points_delta=int(data['points_delta']),
+        )
+
+
+@dataclass
+class GameOutcome:
+    # Per-player results keyed by absolute player id 0..3
+    players: Dict[int, PlayerOutcome]
+    winners: List[int]
+    loser: Optional[int]
+    is_draw: bool
+
+    def serialize(self) -> Dict[str, Any]:
+        # Serialize to a JSON/npz-friendly dict
+        return {
+            'is_draw': bool(self.is_draw),
+            'winners': [int(w) for w in self.winners],
+            'loser': None if self.loser is None else int(self.loser),
+            'players': [self.players[i].to_dict() for i in range(4)],
+        }
+
+    @staticmethod
+    def deserialize(data: Dict[str, Any]) -> 'GameOutcome':
+        players_list = data.get('players', [])
+        players: Dict[int, PlayerOutcome] = {}
+        for p_dict in players_list:
+            po = PlayerOutcome.from_dict(p_dict)
+            players[po.player_id] = po
+        # Ensure all four players exist if possible by filling defaults
+        for pid in range(4):
+            if pid not in players:
+                players[pid] = PlayerOutcome(
+                    player_id=pid,
+                    outcome_type=None,
+                    won=False,
+                    lost=False,
+                    tenpai=False,
+                    noten=False,
+                    points_delta=0,
+                )
+        return GameOutcome(
+            players=players,
+            winners=[int(w) for w in data.get('winners', [])],
+            loser=(None if data.get('loser', None) is None else int(data['loser'])),
+            is_draw=bool(data.get('is_draw', False)),
+        )
+
+    def outcome_type(self, player_id: int) -> Optional[OutcomeType]:
+        po = self.players.get(player_id)
+        if po is None:
+            return None
+        return po.outcome_type
+
+    def __repr__(self) -> str:
+        header = f"GameOutcome(draw={self.is_draw}, winners={self.winners}, loser={self.loser})"
+        lines: List[str] = [header]
+        for pid in range(4):
+            po = self.players.get(pid)
+            if po is None:
+                lines.append(f"  P{pid}: <missing>")
+                continue
+            otype = '-' if po.outcome_type is None else po.outcome_type.value
+            lines.append(
+                f"  P{pid}: type={otype}, won={po.won}, lost={po.lost}, tenpai={po.tenpai}, noten={po.noten}, points={po.points_delta}"
+            )
+        return "\n".join(lines)
 
 # Actions and reactions
 @dataclass
@@ -556,14 +682,56 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
     if win_by_tsumo and not _is_open_hand(called_sets):
         han += MENZEN_TSUMO_HAN
 
-    # Dora (including aka)
+    # Dora (including aka) contribute to total han returned here; also return dora_han separately
     dora_han = _calc_dora_han(concealed_tiles, called_sets, dora_indicators)
     if riichi_declared:
         dora_han += _calc_dora_han(concealed_tiles, called_sets, ura_indicators)
-    # Count red-5 (aka) as dora
-    han += dora_han + _count_aka_han(all_tiles)
+    # Count red-5 (aka) as dora as well
+    aka_han = _count_aka_han(all_tiles)
+    han += dora_han + aka_han
 
     return fu, han, dora_han
+
+
+def tile_flat_index(tile: Tile) -> int:
+    """Map a Tile to a compact 0..36 index for action masks (37 slots).
+    Per-suit blocks:
+    - Manzu: 0..9  (0m for aka five, 1m..9m -> 1..9)
+    - Pinzu: 10..19 (0p -> 10, 1p..9p -> 11..19)
+    - Souzu: 20..29 (0s -> 20, 1s..9s -> 21..29)
+    - Honors: 30..36 (E,S,W,N,Wh,G,R)
+    """
+    if tile.suit == Suit.MANZU:
+        if tile.tile_type == TileType.FIVE and tile.aka:
+            return 0
+        return int(tile.tile_type.value)
+    if tile.suit == Suit.PINZU:
+        if tile.tile_type == TileType.FIVE and tile.aka:
+            return 10
+        return 10 + int(tile.tile_type.value)
+    if tile.suit == Suit.SOUZU:
+        if tile.tile_type == TileType.FIVE and tile.aka:
+            return 20
+        return 20 + int(tile.tile_type.value)
+    # Honors 30..36
+    return 29 + int(tile.tile_type.value)
+
+
+def _chi_variant_index(last_discarded_tile: Optional[Tile], tiles: List[Tile]) -> int:
+    # 0: [d-2, d-1], 1: [d-1, d+1], 2: [d+1, d+2]; -1 otherwise
+    if last_discarded_tile is None or len(tiles) < 2:
+        return -1
+    if last_discarded_tile.suit == Suit.HONORS:
+        return -1
+    d = int(last_discarded_tile.tile_type.value)
+    ranks = sorted(int(t.tile_type.value) for t in tiles)
+    if ranks == [d - 2, d - 1]:
+        return 0
+    if ranks == [d - 1, d + 1]:
+        return 1
+    if ranks == [d + 1, d + 2]:
+        return 2
+    return -1
 
 
 class GamePerspective:
@@ -746,69 +914,33 @@ class GamePerspective:
                 return True
         return False
 
-    def _tile_flat_index(self, tile: Tile) -> int:
-        """Map a Tile to a compact 0..34 index for action masks.
-        Suited aka 5s are mapped to 0m/0p/0s as 0, 9, 18 respectively.
-        Honors are 28..34 (E,S,W,N,P,G,R).
-        """
-        if tile.suit == Suit.MANZU:
-            if tile.tile_type == TileType.FIVE and tile.aka:
-                return 0
-            return int(tile.tile_type.value)
-        if tile.suit == Suit.PINZU:
-            if tile.tile_type == TileType.FIVE and tile.aka:
-                return 9
-            return 9 + int(tile.tile_type.value)
-        if tile.suit == Suit.SOUZU:
-            if tile.tile_type == TileType.FIVE and tile.aka:
-                return 18
-            return 18 + int(tile.tile_type.value)
-        # Honors 28..34
-        return 27 + int(tile.tile_type.value)
-
-    def _chi_variant_index(self, last_discarded_tile: Optional[Tile], tiles: List[Tile]) -> int:
-        # 0: [d-2, d-1], 1: [d-1, d+1], 2: [d+1, d+2]; -1 otherwise
-        if last_discarded_tile is None or len(tiles) < 2:
-            return -1
-        if last_discarded_tile.suit == Suit.HONORS:
-            return -1
-        d = int(last_discarded_tile.tile_type.value)
-        ranks = sorted(int(t.tile_type.value) for t in tiles)
-        if ranks == [d - 2, d - 1]:
-            return 0
-        if ranks == [d - 1, d + 1]:
-            return 1
-        if ranks == [d + 1, d + 2]:
-            return 2
-        return -1
-
     def legal_flat_mask(self) -> List[int]:
         """Return a flat 0/1 mask indicating legal actions in a fixed action space.
 
-        Layout (length 152):
-        - 0..34: Discard by tile index (0..34)
-        - 35..69: Riichi by discard tile index (0..34)
-        - 70: Tsumo
-        - 71: Ron
-        - 72..77: Chi variants without aka [low, mid, high] then with aka [low, mid, high]
-        - 78..79: Pon [no-aka, with-aka]
-        - 80: Kan (daiminkan) on last discard
-        - 81..115: Kan Kakan by tile index (0..34)
-        - 116..150: Kan Ankan by tile index (0..34)
-        - 151: Pass (only meaningful in reaction state)
+        Layout (length 160):
+        - 0..36: Discard by tile index (0..36)
+        - 37..73: Riichi by discard tile index (0..36)
+        - 74: Tsumo
+        - 75: Ron
+        - 76..81: Chi variants without aka [low, mid, high] then with aka [low, mid, high]
+        - 82..83: Pon [no-aka, with-aka]
+        - 84: Kan (daiminkan) on last discard
+        - 85..121: Kan Kakan by tile index (0..36)
+        - 122..158: Kan Ankan by tile index (0..36)
+        - 159: Pass (only meaningful in reaction state)
         """
-        TOTAL = 152
+        TOTAL = 160
         OFF_DISCARD = 0
-        OFF_RIICHI = 35
-        OFF_TSUMO = 70
-        OFF_RON = 71
-        OFF_CHI = 72            # 0..2 no-aka, 3..5 with-aka
-        OFF_PON_NOAKA = 78
-        OFF_PON_AKA = 79
-        OFF_KAN_DAIMIN = 80
-        OFF_KAKAN = 81
-        OFF_ANKAN = 116
-        OFF_PASS = 151
+        OFF_RIICHI = 37
+        OFF_TSUMO = 74
+        OFF_RON = 75
+        OFF_CHI = 76            # 0..2 no-aka, 3..5 with-aka
+        OFF_PON_NOAKA = 82
+        OFF_PON_AKA = 83
+        OFF_KAN_DAIMIN = 84
+        OFF_KAKAN = 85
+        OFF_ANKAN = 122
+        OFF_PASS = 159
 
         mask = [0] * TOTAL
 
@@ -822,7 +954,7 @@ class GamePerspective:
         # Discards
         seen: set = set()
         for t in self.player_hand:
-            idx = self._tile_flat_index(t)
+            idx = tile_flat_index(t)
             if idx in seen:
                 continue
             seen.add(idx)
@@ -832,14 +964,14 @@ class GamePerspective:
         # Riichi (parameterized by discard tile)
         for m in self.legal_moves():
             if isinstance(m, Riichi):
-                idx = self._tile_flat_index(m.tile)
+                idx = tile_flat_index(m.tile)
                 mask[OFF_RIICHI + idx] = 1
 
         # Kakan/Ankan opportunities
         seen_kakan: set = set()
         seen_ankan: set = set()
         for t in self.player_hand:
-            idx = self._tile_flat_index(t)
+            idx = tile_flat_index(t)
             if idx not in seen_kakan and self.is_legal(KanKakan(t)):
                 mask[OFF_KAKAN + idx] = 1
                 seen_kakan.add(idx)
@@ -852,7 +984,7 @@ class GamePerspective:
             opts = self.get_call_options()
             # Chi variants
             for pair in opts.get('chi', []):
-                v = self._chi_variant_index(self.last_discarded_tile, pair)
+                v = _chi_variant_index(self.last_discarded_tile, pair)
                 if 0 <= v <= 2:
                     # Aka if any of the three tiles is aka
                     aka = any(t.aka for t in (pair + [self.last_discarded_tile]))
@@ -875,7 +1007,7 @@ class GamePerspective:
         return mask
 
     def legal_flat_mask_np(self):
-        """Return the legal actions mask as a numpy 1D array of 0/1 with length 152.
+        """Return the legal actions mask as a numpy 1D array of 0/1 with length 160.
 
         This mirrors legal_flat_mask but returns an np.ndarray for downstream models.
         """
@@ -1104,6 +1236,10 @@ class MediumJong:
         self.keiten_payments: Optional[Dict[int, int]] = None
         # Per-player point deltas at end of game (win/tsumo/ron or exhaustive draw)
         self.points: Optional[List[int]] = None
+        # Cumulative per-player point deltas from start of game, including riichi stick payments
+        self.cumulative_points: List[int] = [0, 0, 0, 0]
+        # Stored structured outcome after hand ends
+        self.game_outcome: Optional[GameOutcome] = None
 
         # Build wall and dead wall
         self.tiles: List[Tile] = []
@@ -1242,6 +1378,8 @@ class MediumJong:
             self.riichi_declared[actor_id] = True
             self.riichi_ippatsu_active[actor_id] = True
             self.riichi_sticks_pot += 1000
+            # Account riichi stick payment immediately in cumulative points
+            self.cumulative_points[actor_id] -= 1000
             self._player_hands[actor_id].remove(move.tile)
             self.player_discards[actor_id].append(move.tile)
             self.last_discarded_tile = move.tile
@@ -1381,6 +1519,23 @@ class MediumJong:
     # useful if we want to say, discard and then return before the other 3 players have a chance to react
     def step(self, actor_id: int, move: Union[Action, Reaction]):
         if not self.is_legal(actor_id, move):
+            gp = self.get_game_perspective(actor_id)
+            print(gp, move)
+            # Attempt to dump debug info to a pickle file
+            try:
+                os.makedirs("illegal_moves", exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                fname = os.path.join("illegal_moves", f"illegal_{ts}.pkl")
+                with open(fname, "wb") as f:
+                    pickle.dump({
+                        "actor_id": actor_id,
+                        "perspective": gp,
+                        "move": move,
+                        "game": self,
+                    }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                print(f"[MediumJong] Illegal move dump written to {fname}")
+            except Exception as e:
+                print(f"[MediumJong] Failed to write illegal move dump: {e}")
             raise MediumJong.IllegalMoveException("Illegal move")
 
         # Actions by current player
@@ -1494,6 +1649,11 @@ class MediumJong:
             if rs:
                 deltas[winner_id] += rs
         self.points = deltas
+        # Accumulate outcome into cumulative points (riichi stick awards already included in deltas)
+        for pid in range(4):
+            self.cumulative_points[pid] += deltas[pid]
+        # Build and store structured outcome
+        self._store_game_outcome()
 
     def _on_multiple_ron(self, winner_ids: List[int], discarder: Optional[int]) -> None:
         # Finalize outcome for multiple simultaneous rons (double/triple ron)
@@ -1518,6 +1678,9 @@ class MediumJong:
                     deltas[w] += rs
             # After first scoring, riichi pot will already be cleared if applicable
         self.points = deltas
+        for pid in range(4):
+            self.cumulative_points[pid] += deltas[pid]
+        self._store_game_outcome()
 
     def _on_exhaustive_draw(self) -> None:
         # Determine tenpai players using current hands without constructing perspectives
@@ -1549,30 +1712,110 @@ class MediumJong:
         else:
             # 0 or 4: no payments
             pass
-        # Subtract riichi sticks from any players who declared riichi this hand (sticks go to next win, not at draw)
-        for pid in range(4):
-            if self.riichi_declared.get(pid, False):
-                payments[pid] -= 1000
+        # Riichi stick payments are accounted at declaration time in cumulative_points; do not subtract here
         self.keiten_payments = payments
         self.winners = []
         self.loser = None
         self.game_over = True
         # Persist points as per-player deltas
         self.points = [payments[i] for i in range(4)]
+        for pid in range(4):
+            self.cumulative_points[pid] += self.points[pid]
+        self._store_game_outcome()
 
     def is_game_over(self) -> bool:
         return self.game_over
 
     def get_winners(self) -> List[int]:
+        if not self.game_over:
+            raise ValueError("Game is not over")
+        if self.game_outcome is not None:
+            return list(self.game_outcome.winners)
         return list(self.winners)
 
     def get_loser(self) -> Optional[int]:
+        if not self.game_over:
+            raise ValueError("Game is not over")
+        if self.game_outcome is not None:
+            return self.game_outcome.loser
         return self.loser
 
     def get_points(self) -> Optional[List[int]]:
         if not self.is_game_over():
             raise ValueError("Game is not over")
-        return list(self.points)
+        # Return per-hand deltas (not cumulative) to represent this hand's outcome
+        assert self.game_outcome is not None
+        return [int(self.game_outcome.players[i].points_delta) for i in range(4)]
+
+    def _store_game_outcome(self) -> None:
+        # Compute once and store a structured outcome
+        try:
+            self.game_outcome = self._build_game_outcome()
+        except Exception:
+            # In case of unforeseen errors, keep outcome unset to avoid crashing callers
+            self.game_outcome = None
+
+    def _build_game_outcome(self) -> 'GameOutcome':
+        # Internal constructor for GameOutcome from current finalized state
+        # Use cumulative_points to reflect total delta from start to end of hand, including riichi stick losses
+        hand_points = list(self.cumulative_points)
+        is_draw = len(self.winners) == 0 and self.loser is None
+        players: Dict[int, PlayerOutcome] = {}
+        if is_draw:
+            # Determine tenpai from current hands to be robust even when 0 or 4 tenpai
+            tenpai_flags: Dict[int, bool] = {}
+            for pid in range(4):
+                tenpai_flags[pid] = hand_is_tenpai(self._player_hands[pid])
+            for pid in range(4):
+                is_tenpai = bool(tenpai_flags.get(pid, False))
+                players[pid] = PlayerOutcome(
+                    player_id=pid,
+                    outcome_type=OutcomeType.TENPAI if is_tenpai else OutcomeType.NOTEN,
+                    won=False,
+                    lost=False,
+                    tenpai=is_tenpai,
+                    noten=not is_tenpai,
+                    points_delta=int(hand_points[pid]),
+                )
+            return GameOutcome(players=players, winners=list(self.winners), loser=self.loser, is_draw=True)
+
+        # Win occurred (tsumo or ron); support multi-ron
+        ron = False
+        tsumo = False
+        if self.winners:
+            # If loser is None, it's tsumo; otherwise ron
+            ron = self.loser is not None
+            tsumo = not ron
+        for pid in range(4):
+            won = pid in self.winners
+            lost = False
+            otype: Optional[OutcomeType] = None
+            if won:
+                otype = OutcomeType.RON if ron else OutcomeType.TSUMO
+            else:
+                if ron and self.loser == pid:
+                    lost = True
+                    otype = OutcomeType.DEAL_IN  # discarder lost on ron
+                elif tsumo:
+                    # All non-winners paid on tsumo
+                    lost = True
+            players[pid] = PlayerOutcome(
+                player_id=pid,
+                outcome_type=otype,
+                won=won,
+                lost=lost,
+                tenpai=False,
+                noten=False if otype is None else (otype == OutcomeType.NOTEN),
+                points_delta=int(hand_points[pid]),
+            )
+        return GameOutcome(players=players, winners=list(self.winners), loser=self.loser, is_draw=False)
+
+    def get_game_outcome(self) -> 'GameOutcome':
+        if not self.game_over:
+            raise ValueError("Game is not over")
+        if self.game_outcome is None:
+            self.game_outcome = self._build_game_outcome()
+        return self.game_outcome
 
     # Scoring API
     def _score_hand(self, winner_id: int, win_by_tsumo: bool) -> Dict[str, Any]:
@@ -1590,13 +1833,13 @@ class MediumJong:
             dora_indicators=self.dora_indicators,
             ura_indicators=self.ura_dora_indicators if self.riichi_declared[winner_id] else [],
         )
-        # Ippatsu: +1 han if riichi declared, ippatsu active, and win occurs on next draw before any call or discard
+        # Ippatsu: +1 han (yaku) if riichi declared, ippatsu active, and win occurs on next draw before any call or discard
         if self.riichi_declared[winner_id] and self.riichi_ippatsu_active.get(winner_id, False):
             han += IPPATSU_HAN
             # Consumed on win
             self.riichi_ippatsu_active[winner_id] = False
 
-        # Base points
+        # Base points use total han already contained in `han` (includes dora/aka per _score_fu_and_han)
         base_points = fu * (2 ** (BASE_POINTS_EXPONENT_OFFSET + han))
         # Apply simple mangan cap for limit hands (≥5 han)
         dealer = (winner_id == DEALER_ID_START)

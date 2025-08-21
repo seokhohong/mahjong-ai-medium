@@ -1,8 +1,10 @@
 import unittest
 import os
 
+from core.game import Player, MediumJong
 from core.learn.ac_constants import MAX_TURNS
 from core.tenpai import hand_is_tenpai_with_calls
+from mj_test import test_utils
 
 
 # Test helpers
@@ -157,46 +159,65 @@ class TestCreateDataset(unittest.TestCase):
                 total += 1
         self.assertGreater(total, 0)
 
-    def test_positive_reward_implies_reached_tenpai(self):
-        # Build a small dataset and verify: any player with positive terminal reward hit tenpai at some point
-        import numpy as np
-        from run.create_dataset import build_ac_dataset
-        from core.learn.policy_utils import build_move_from_flat
 
-        data = build_ac_dataset(
-            games=5,
-            seed=42,
+    def test_verify_rewards(self):
+        # Use the dataset builder to compute rewards and export metadata identifying draws.
+        from run.create_dataset import build_ac_dataset
+        built = build_ac_dataset(
+            games=20,
+            seed=321,
             use_heuristic=True,
             temperature=0.0,
-            n_step=3,
-            gamma=0.99,
+            n_step=1,
+            gamma=1.0,
         )
+        # Identify draw games via metadata
+        outcomes = built['game_outcomes_obj']
+        gids = built['game_ids']
+        returns = built['returns']
+        actors = built['actor_ids']
+        # For each draw game, verify per-player reward sign matches tenpai/noten status
+        draw_games = set(int(i) for i, o in enumerate(outcomes) if bool(o['is_draw']))
+        eps = 1e-9
+        for gid in draw_games:
+            outcome = outcomes[gid]
+            # Find last step index per actor for this game id
+            last_idx_by_actor = {}
+            for idx in range(len(gids)):
+                if int(gids[idx]) == gid:
+                    a = int(actors[idx])
+                    last_idx_by_actor[a] = idx
+            # Check reward sign per actor vs tenpai
+            for pid in range(4):
+                if pid not in last_idx_by_actor:
+                    continue
+                idx = last_idx_by_actor[pid]
+                reward = float(returns[idx])
+                is_tenpai = bool(outcome['players'][pid]['tenpai']) if outcome.get('players') else False
+                if is_tenpai:
+                    self.assertGreaterEqual(reward, 0.0 - eps)
+                else:
+                    self.assertLessEqual(reward, 0.0 + eps)
 
-        game_ids = data['game_ids']
-        actor_ids = data['actor_ids']
-        step_ids = data['step_ids']
-        returns = data['returns']
-        actions = data['flat_idx']
-
-        # Group indices by (game_id, actor_id)
-        groups = _groups_by_game_and_actor(game_ids, actor_ids)
-
-        for (gid, pid), idxs in groups.items():
-            # Identify last step index for this (game, player)
-            last_idx = max(idxs, key=lambda j: int(step_ids[j]))
-            terminal_return = float(returns[last_idx])
-            if terminal_return <= 0:
+        # For each non-draw game, verify that any winner (ron or tsumo) has non-negative terminal reward
+        win_games = set(int(i) for i, o in enumerate(outcomes) if not bool(o['is_draw']))
+        for gid in win_games:
+            outcome = outcomes[gid]
+            winners = [int(w) for w in outcome.get('winners', [])]
+            if not winners:
                 continue
-            # For positive terminal return, ensure player was tenpai at least once during the episode
-            reached_tenpai = False
-            for j in idxs:
-                gp = _decode_gp_from_row(data, j)
-                move = build_move_from_flat(gp, int(actions[j]))
-                concealed, called_sets = _post_action_concealed_and_calls(gp, move)
-                if hand_is_tenpai_with_calls(concealed, called_sets):
-                    reached_tenpai = True
-                    break
-            self.assertTrue(reached_tenpai, msg=f"Player {pid} in game {gid} had positive reward but was never in tenpai")
+            # Last step index per actor for this game id
+            last_idx_by_actor = {}
+            for idx in range(len(gids)):
+                if int(gids[idx]) == gid:
+                    a = int(actors[idx])
+                    last_idx_by_actor[a] = idx
+            for pid in winners:
+                if pid not in last_idx_by_actor:
+                    continue
+                idx = last_idx_by_actor[pid]
+                reward = float(returns[idx])
+                self.assertGreaterEqual(reward, 0.0 - eps)
 
 
 if __name__ == '__main__':

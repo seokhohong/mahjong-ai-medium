@@ -83,6 +83,8 @@ class TestFeatureEngineering(unittest.TestCase):
     def test_perspective_rotation_invariance(self):
         # P0 will discard a specific tile; after the turn completes, from P1's perspective
         # the last discard should appear as player index 3 (left of P1), not index 1.
+        import random
+        random.seed(234)
         target = Tile(Suit.PINZU, TileType.THREE)
         g = MediumJong([ForceDiscardPlayer(0, target), Player(1), Player(2), Player(3)])
         # Ensure P0 has the target in hand; if not, play until it appears or game ends

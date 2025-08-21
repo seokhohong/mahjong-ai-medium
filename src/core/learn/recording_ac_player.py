@@ -41,6 +41,9 @@ class ExperienceBuffer:
     def add(self, state_features: Dict[str, Any], action_index: int, reward: float, value: float,
             main_logp: float,
             main_probs: Optional[List[float]] = None) -> None:
+        if action_index < 0:
+            print("ERROR: Illegal move in Experience Buffer", action_index)
+            return
         self.states.append(state_features)
         self.actions.append(int(action_index))
         self.rewards.append(float(reward))
@@ -79,21 +82,15 @@ class RecordingACPlayer(ACPlayer):
     def set_final_reward(self, reward: float) -> None:
         self._terminal_reward = float(reward)
 
-    def finalize_episode(self, winner_ids: List[int], loser_id: Optional[int]) -> None:
-        """Assign terminal reward to the last recorded step based on actual outcome.
+    def finalize_episode(self, terminal_value: float) -> None:
+        """Assign a provided terminal reward value to the last recorded step.
 
-        This should be called once after the game ends (including draw/keiten). It overwrites
-        the last step's stored reward with +1 for winners, -1 for the single loser (if any),
-        or 0 otherwise.
+        The value should be computed externally (e.g., from points delta or
+        other outcome-based heuristic) and passed in.
         """
         if len(self.experience) == 0:
             return
-        terminal = 0.0
-        if self.player_id in (winner_ids or []):
-            terminal = 1.0
-        elif loser_id is not None and int(loser_id) == int(self.player_id):
-            terminal = -1.0
-        self.experience.rewards[-1] = float(terminal)
+        self.experience.rewards[-1] = float(terminal_value)
 
     # Record decisions along with value estimates from the network
     def play(self, game_state: GamePerspective):  # type: ignore[override]
@@ -139,15 +136,10 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
         self.experience = ExperienceBuffer()
         # Note: gsv_scaler is not used by heuristic players but kept for API consistency
 
-    def finalize_episode(self, winner_ids: List[int], loser_id: Optional[int]) -> None:
+    def finalize_episode(self, terminal_value: float) -> None:
         if len(self.experience) == 0:
             return
-        terminal = 0.0
-        if self.player_id in (winner_ids or []):
-            terminal = 1.0
-        elif loser_id is not None and int(loser_id) == int(self.player_id):
-            terminal = -1.0
-        self.experience.rewards[-1] = float(terminal)
+        self.experience.rewards[-1] = float(terminal_value)
         # Keep heuristic value baseline at 0.0 for all steps (including terminal)
 
     def play(self, game_state: GamePerspective):  # type: ignore[override]

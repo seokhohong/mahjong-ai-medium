@@ -9,7 +9,9 @@ from sklearn.preprocessing import StandardScaler
 
 from core.game import MediumJong, Player
 from core.learn import ACPlayer, ACNetwork
+from core.learn.ac_constants import GAME_STATE_VEC_LEN
 from core.learn.policy_utils import build_move_from_flat, flat_index_for_action
+from core.learn.data_utils import build_state_from_npz_row
 from core.learn.feature_engineering import encode_game_perspective, MAX_HAND_LEN
 from core.learn.recording_ac_player import ExperienceBuffer, RecordingHeuristicACPlayer
 from run.create_dataset import save_dataset
@@ -61,7 +63,7 @@ def _build_tensors_from_states_actions(net, states, actions, dev):
     # Convert indexed features to tensors via network's featurizer
     hand_list, calls_list, disc_list, gsv_list = [], [], [], []
     for st in states:
-        h, c, d, gsv = net._extract_features_from_indexed(
+        h, c, d, gsv = net.extract_features_from_indexed(
             np.asarray(st['hand_idx'], dtype=np.int32),
             np.asarray(st['disc_idx'], dtype=np.int32),
             np.asarray(st['called_idx'], dtype=np.int32),
@@ -167,6 +169,7 @@ class TestTrainEndToEnd(unittest.TestCase):
         net = player.network
         model = net.torch_module
         model.eval()
+        net.fit_scaler(np.array([state["game_state"] for state in all_states]))
         hand, calls, disc, gsv, flat_idx = _build_tensors_from_states_actions(net, all_states, all_actions, dev)
         _train_bc_to_perfect(model, hand, calls, disc, gsv, flat_idx, max_steps=400)
         # After training, assert the model argmax matches the training actions for every sample
@@ -203,8 +206,6 @@ class TestTrainEndToEnd(unittest.TestCase):
             dataset_dict = build_ac_dataset(
                 games=1,  # Small dataset for quick testing
                 seed=42,
-                hidden_size=32,  # Network size isn't relevant
-                embedding_dim=8,
                 temperature=0,
                 use_heuristic=True
             )
@@ -222,7 +223,7 @@ class TestTrainEndToEnd(unittest.TestCase):
                 lr=1e-4,
                 val_split=0,
                 warm_up_acc=0.4,  # not sure why it can't copy, maybe just learn up to 40%
-                warm_up_max_epochs=100
+                warm_up_max_epochs=150
             )
 
             # After warm-up to ~40% accuracy, load ACPlayer from the saved directory
@@ -235,13 +236,7 @@ class TestTrainEndToEnd(unittest.TestCase):
             with np.load(dataset_path, allow_pickle=True) as data:
                 N = int(len(data['flat_idx']))
                 for i in range(N):
-                    st = {
-                        'hand_idx': data['hand_idx'][i],
-                        'disc_idx': data['disc_idx'][i],
-                        'called_idx': data['called_idx'][i],
-                        'game_state': data['game_state'][i],
-                        'called_discards': data['called_discards'][i],
-                    }
+                    st = build_state_from_npz_row(data, i)
                     gp = decode_game_perspective(st)
                     move, _, _ = player.compute_play(gp)
                     pred_idx = flat_index_for_action(gp, move)
@@ -278,7 +273,7 @@ class TestTrainEndToEnd(unittest.TestCase):
             # Save the same scaler used by the network
             scaler_path = os.path.join(tmp_dir, 'scaler.pkl')
             with open(scaler_path, 'wb') as f:
-                pickle.dump(network.gsv_scaler, f)
+                pickle.dump(network._gsv_scaler, f)
 
             # Test loading from directory
             loaded_player = ACPlayer.from_directory(tmp_dir, player_id=1, temperature=0.5)
@@ -290,6 +285,79 @@ class TestTrainEndToEnd(unittest.TestCase):
             self.assertIsNotNone(loaded_player.gsv_scaler)
 
             print("✅ ACPlayer.from_directory test completed successfully!")
+
+
+    def test_temperature(self):
+        # Use the same untrained ACPlayer at two temperatures. Outputs should be mostly consistent but not identical.
+        import numpy as np
+        from core.learn.ac_player import ACPlayer
+        from core.game import MediumJong
+        from core.learn.recording_ac_player import RecordingHeuristicACPlayer
+
+        # Determinism
+        random.seed(123)
+        np.random.seed(123)
+
+        # Build a default, untrained AC network/player
+        base_player = ACPlayer.default(player_id=0, temperature=0.1)
+
+        # dummy fit for this test
+        base_player.network.fit_scaler(np.ones((10, GAME_STATE_VEC_LEN)))
+
+        # Clone two players that share the same network but different temperatures
+        cold_player = ACPlayer(0, base_player.network, gsv_scaler=base_player.gsv_scaler, temperature=0.05)
+        warm_player = ACPlayer(0, base_player.network, gsv_scaler=base_player.gsv_scaler, temperature=1.0)
+
+        # Same opponents for both runs
+        opps = [RecordingHeuristicACPlayer(1, random_exploration=0.0), RecordingHeuristicACPlayer(2, random_exploration=0.0), RecordingHeuristicACPlayer(3, random_exploration=0.0)]
+
+        # Run with cold temperature
+        g1 = MediumJong([cold_player] + opps)
+        moves_cold = []
+        steps = 0
+        while not g1.is_game_over() and steps < 200:
+            gp = g1.get_game_perspective(g1.current_player_idx)
+            if g1.current_player_idx == 0:
+                mv = cold_player.play(gp)
+                # Record fully-parameterized action as flat index
+                moves_cold.append(flat_index_for_action(gp, mv))
+            g1.play_turn()
+            steps += 1
+
+        # Re-seed and run with warm temperature
+        random.seed(123)
+        np.random.seed(123)
+        g2 = MediumJong([warm_player] + opps)
+        moves_warm = []
+        steps = 0
+        while not g2.is_game_over() and steps < 200:
+            gp = g2.get_game_perspective(g2.current_player_idx)
+            if g2.current_player_idx == 0:
+                mv = warm_player.play(gp)
+                moves_warm.append(flat_index_for_action(gp, mv))
+            g2.play_turn()
+            steps += 1
+
+        # Basic sanity
+        self.assertGreater(len(moves_cold), 0)
+        self.assertGreater(len(moves_warm), 0)
+
+        # Compare distributions over a larger number of samples
+        import collections
+        cold_counts = collections.Counter(moves_cold)
+        warm_counts = collections.Counter(moves_warm)
+        # Normalize to probability distributions over observed actions
+        def to_dist(counter):
+            total = sum(counter.values())
+            return {k: v / float(total) for k, v in counter.items() if total > 0}
+        p_cold = to_dist(cold_counts)
+        p_warm = to_dist(warm_counts)
+        # Compute L1 distance over the union of actions
+        actions = set(p_cold.keys()) | set(p_warm.keys())
+        l1 = sum(abs(p_cold.get(a, 0.0) - p_warm.get(a, 0.0)) for a in actions)
+        # Expect a noticeable difference in distributions when temperature differs substantially
+        self.assertGreater(l1, 0.05)
+
 
 def cleanup_old_models():
     """Clean up any leftover model files from previous test runs."""

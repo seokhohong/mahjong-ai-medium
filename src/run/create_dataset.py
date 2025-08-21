@@ -50,6 +50,8 @@ def compute_n_step_returns(
     advantages = [float(returns[t]) - float(values[t]) for t in range(T)]
     return returns, advantages
 
+def reward_function(points_delta):
+    return points_delta / 10000.0
 
 def build_ac_dataset(
     games: int,
@@ -60,7 +62,6 @@ def build_ac_dataset(
     gamma: float = 0.99,
     use_heuristic: bool = False,
     model_path: str | None = None,
-    negative_reward_weight: float = 1.0,
 ) -> dict:
     if seed is not None:
         import random
@@ -92,6 +93,8 @@ def build_ac_dataset(
     all_game_ids: List[int] = []
     all_step_ids: List[int] = []
     all_actor_ids: List[int] = []
+    # Per-game metadata (structured only)
+    game_outcomes_obj: List[dict] = []  # serialized GameOutcome per game
 
     # Create players once and reuse across games; clear their buffers between episodes
     if use_heuristic:
@@ -104,31 +107,21 @@ def build_ac_dataset(
         game = MediumJong(players, tile_copies=constants.TILE_COPIES_DEFAULT)
         game.play_round()
 
-        winners = list(game.get_winners()) if hasattr(game, 'get_winners') else []
-        loser = game.get_loser() if hasattr(game, 'get_loser') else None
-        # Let players update internal bookkeeping if needed
-        for p in players:
-            try:
-                p.finalize_episode(winners, loser)  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        # Structured outcome from the game
+        outcome = game.get_game_outcome()
+        game_outcomes_obj.append(outcome.serialize())
+        # Compute terminal reward from points delta and assign directly to last reward slot
+        pts = game.get_points()
+        for pid, p in enumerate(players):
+            if len(p.experience) == 0:
+                continue
+            terminal_reward = reward_function(pts[pid])
+            p.finalize_episode(float(terminal_reward))  # type: ignore[attr-defined]
         for pid, p in enumerate(players):
             T = len(p.experience)
             if T == 0:
                 continue
             rewards = list(p.experience.rewards)
-            # Compute terminal reward directly from final per-player deltas via get_points()
-            if T > 0:
-                import math
-                pts = game.get_points()
-                my_delta = float(pts[pid])
-                if my_delta > 0:
-                    terminal_reward = math.log(max(1e-9, my_delta / 1000.0))
-                elif my_delta < 0:
-                    terminal_reward = -negative_reward_weight * math.log(max(1e-9, (-my_delta) / 1000.0))
-                else:
-                    terminal_reward = 0.0
-                rewards[-1] = float(terminal_reward)
             # Use stored values from the experience buffer
             values: List[float] = [float(v) for v in p.experience.values]
             nstep, adv = compute_n_step_returns(rewards, n_step, gamma, values)
@@ -173,6 +166,8 @@ def build_ac_dataset(
         'step_ids': np.asarray(all_step_ids, dtype=np.int32),
         'actor_ids': np.asarray(all_actor_ids, dtype=np.int32),
         'flat_policies': np.asarray(all_flat_policies, dtype=object),
+        # Per-game metadata
+        'game_outcomes_obj': np.asarray(game_outcomes_obj, dtype=object),
     }
 
 def save_dataset(built, out_path):
@@ -192,6 +187,7 @@ def save_dataset(built, out_path):
         step_ids=built['step_ids'],
         actor_ids=built['actor_ids'],
         flat_policies=built['flat_policies'],
+        game_outcomes_obj=built['game_outcomes_obj'],
     )
 
     print(f"Saved AC dataset to {out_path}")
@@ -204,7 +200,6 @@ def main():
     ap.add_argument('--zero_network_reward', action='store_true', help='Zero out network value as immediate reward')
     ap.add_argument('--n_step', type=int, default=3, help='N for n-step returns')
     ap.add_argument('--gamma', type=float, default=0.99, help='Discount factor in (0,1]')
-    ap.add_argument('--negative_reward_weight', type=float, default=1.0, help='Multiplier applied to negative terminal rewards (set 0 to ignore losses)')
     ap.add_argument('--out', type=str, default=None, help='Output .npz path (placed under training_data/)')
     ap.add_argument('--use_heuristic', action='store_true', help='Use RecordingHeuristicACPlayer (generation 0)')
     ap.add_argument('--model', type=str, default=None, help='Path to AC network .pt to load')
@@ -219,7 +214,6 @@ def main():
         gamma=args.gamma,
         use_heuristic=bool(args.use_heuristic),
         model_path=args.model,
-        negative_reward_weight=float(args.negative_reward_weight),
     )
 
     # Prepare output file relative to the current working directory

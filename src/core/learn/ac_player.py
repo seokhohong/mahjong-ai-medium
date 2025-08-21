@@ -117,7 +117,21 @@ class ACPlayer(Player):
 		flat = np.asarray(policy, dtype=np.float64)
 		mask = gs.legal_flat_mask_np()
 		eff_policy = self._temper_and_mask(flat, mask)
-		move = np.argmax(eff_policy)
+		# Sample according to temperature-adjusted policy over legal actions
+		sum_prob = float(eff_policy.sum())
+		if sum_prob > 0.0:
+			# Normalize explicitly to avoid tiny drift
+			p = eff_policy / sum_prob
+			idxs = np.arange(p.size)
+			move = int(np.random.choice(idxs, p=p))
+		else:
+			# Fallback: choose argmax among legal
+			legal = np.where(mask > 0.0)[0]
+			if legal.size > 0:
+				best = legal[np.argmax(flat[legal])]
+				move = int(best)
+			else:
+				move = int(np.argmax(flat))
 		# Avoid log(0) by clipping for logging
 		log_policy = np.log(np.clip(eff_policy, 1e-12, None))
 		return build_move_from_flat(gs, int(move)), float(value), log_policy

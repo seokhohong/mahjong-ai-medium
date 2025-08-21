@@ -13,10 +13,13 @@ import numpy as np
 
 
 def _flat_tile_index(tile: Tile) -> int:
-    """Map a Tile to the 0..34 flat index used by action masks.
+    """Map a Tile to the 0..36 flat index used by action masks (37 slots).
 
-    Suited aka 5s collapse to suit-specific zeros: 0m, 0p, 0s → 0, 9, 18.
-    Honors map to 28..34.
+    Per-suit blocks:
+    - Manzu: 0..9  (0m for aka five, 1m..9m -> 1..9)
+    - Pinzu: 10..19 (0p -> 10, 1p..9p -> 11..19)
+    - Souzu: 20..29 (0s -> 20, 1s..9s -> 21..29)
+    - Honors: 30..36
     """
     if tile.suit == Suit.MANZU:
         if tile.tile_type == TileType.FIVE and getattr(tile, 'aka', False):
@@ -24,29 +27,29 @@ def _flat_tile_index(tile: Tile) -> int:
         return int(tile.tile_type.value)
     if tile.suit == Suit.PINZU:
         if tile.tile_type == TileType.FIVE and getattr(tile, 'aka', False):
-            return 9
-        return 9 + int(tile.tile_type.value)
+            return 10
+        return 10 + int(tile.tile_type.value)
     if tile.suit == Suit.SOUZU:
         if tile.tile_type == TileType.FIVE and getattr(tile, 'aka', False):
-            return 18
-        return 18 + int(tile.tile_type.value)
-    return 27 + int(tile.tile_type.value)
+            return 20
+        return 20 + int(tile.tile_type.value)
+    return 29 + int(tile.tile_type.value)
 
 
 def flat_index_for_action(gs: GamePerspective, action: Any) -> int:
-    """Map an action in a given GamePerspective to the flat policy index (length 152).
+    """Map an action in a given GamePerspective to the flat policy index (length 160).
 
     Layout:
-      0..34: discard
-      35..69: riichi (by discard tile)
-      70: tsumo
-      71: ron
-      72..77: chi no-aka (0..2), chi with-aka (3..5)
-      78..79: pon [no-aka, with-aka]
-      80: daiminkan
-      81..115: kakan (by tile)
-      116..150: ankan (by tile)
-      151: pass
+      0..36: discard
+      37..73: riichi (by discard tile)
+      74: tsumo
+      75: ron
+      76..81: chi no-aka (0..2), chi with-aka (3..5)
+      82..83: pon [no-aka, with-aka]
+      84: daiminkan
+      85..121: kakan (by tile)
+      122..158: ankan (by tile)
+      159: pass
     """
     def tile_flat_index(t: Tile) -> int:
         # Mirror the game mask mapping (0/9/18 are aka fives; honors 28..34)
@@ -55,45 +58,45 @@ def flat_index_for_action(gs: GamePerspective, action: Any) -> int:
     if isinstance(action, Discard):
         return tile_flat_index(action.tile)
     if isinstance(action, Riichi):
-        return 35 + tile_flat_index(action.tile)
+        return 37 + tile_flat_index(action.tile)
     if isinstance(action, Tsumo):
-        return 70
+        return 74
     if isinstance(action, Ron):
-        return 71
+        return 75
     if isinstance(action, Chi):
         last = gs.last_discarded_tile
         v = chi_variant_index(last, action.tiles)
         if v is None or v < 0:
             return -1
         aka = any(t.aka for t in (action.tiles + ([last] if last else [])))
-        return 72 + v + (3 if aka else 0)
+        return 76 + v + (3 if aka else 0)
     if isinstance(action, Pon):
         last = gs.last_discarded_tile
         aka = any(t.aka for t in (action.tiles + ([last] if last else [])))
-        return 79 if aka else 78
+        return 83 if aka else 82
     if isinstance(action, KanDaimin):
-        return 80
+        return 84
     if isinstance(action, KanKakan):
-        return 81 + tile_flat_index(action.tile)
+        return 85 + tile_flat_index(action.tile)
     if isinstance(action, KanAnkan):
-        return 116 + tile_flat_index(action.tile)
+        return 122 + tile_flat_index(action.tile)
     if isinstance(action, PassCall):
-        return 151
+        return 159
     return -1
 
 
 def build_move_from_flat(gs: GamePerspective, choice: int):
     """Construct a concrete move from a flat policy index using the perspective."""
     # Discard
-    if 0 <= choice <= 34:
+    if 0 <= choice <= 36:
         target = choice
         for t in gs.player_hand:
             if int(_flat_tile_index(t)) == target:
                 return Discard(t)
         return None
     # Riichi
-    if 35 <= choice <= 69:
-        idx = choice - 35
+    if 37 <= choice <= 73:
+        idx = choice - 37
         for t in gs.player_hand:
             if int(_flat_tile_index(t)) == idx:
                 move = Riichi(t)
@@ -101,13 +104,13 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
                     return move
         return None
     # Tsumo / Ron
-    if choice == 70:
+    if choice == 74:
         return Tsumo()
-    if choice == 71:
+    if choice == 75:
         return Ron()
     # Chi
-    if 72 <= choice <= 77:
-        base = choice - 72
+    if 76 <= choice <= 81:
+        base = choice - 76
         with_aka = base >= 3
         variant = base - 3 if with_aka else base
         opts = gs.get_call_options().get('chi', [])
@@ -122,8 +125,8 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
                         return move
         return None
     # Pon
-    if 78 <= choice <= 79:
-        with_aka = (choice == 79)
+    if 82 <= choice <= 83:
+        with_aka = (choice == 83)
         opts = gs.get_call_options().get('pon', [])
         last = gs.last_discarded_tile
         for pair in opts:
@@ -134,7 +137,7 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
                     return move
         return None
     # Daiminkan
-    if choice == 80:
+    if choice == 84:
         opts = gs.get_call_options().get('kan_daimin', [])
         if opts:
             move = KanDaimin(opts[0])
@@ -142,8 +145,8 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
                 return move
         return None
     # Kakan
-    if 81 <= choice <= 115:
-        idx = choice - 81
+    if 85 <= choice <= 121:
+        idx = choice - 85
         for t in gs.player_hand:
             if int(_flat_tile_index(t)) == idx:
                 move = KanKakan(t)
@@ -151,8 +154,8 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
                     return move
         return None
     # Ankan
-    if 116 <= choice <= 150:
-        idx = choice - 116
+    if 122 <= choice <= 158:
+        idx = choice - 122
         for t in gs.player_hand:
             if int(_flat_tile_index(t)) == idx:
                 move = KanAnkan(t)
@@ -160,7 +163,7 @@ def build_move_from_flat(gs: GamePerspective, choice: int):
                     return move
         return None
     # Pass
-    if choice == 151:
+    if choice == 159:
         return PassCall()
     return None
 

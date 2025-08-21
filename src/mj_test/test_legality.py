@@ -9,7 +9,8 @@ from test_utils import ForceActionPlayer, ForceDiscardPlayer, NoReactionPlayer
 
 from core.game import (
     MediumJong, Player, Tile, TileType, Suit, Honor,
-    Discard, Tsumo, Ron, Pon, Chi, CalledSet, PassCall, Riichi
+    Discard, Tsumo, Ron, Pon, Chi, CalledSet, PassCall, Riichi,
+    KanKakan
 )
 
 
@@ -194,6 +195,53 @@ class TestMediumLegality(unittest.TestCase):
         self.assertEqual(g.current_player_idx, 0)
         self.assertEqual(len(g.legal_moves(0)), 1)
 
+    def test_postriichi(self):
+        """After riichi and three uneventful turns, P0 must have exactly one legal action in the flat mask.
+
+        We construct a deterministic wall so that:
+        - P0's first draw (right before declaring riichi) is non-winning
+        - P1, P2, P3 each draw and discard uneventfully
+        - P0's next draw is also non-winning
+        Thus, when it returns to P0 in action phase post-riichi, their legal mask should have only one legal move (tsumogiri).
+        """
+        g = MediumJong([ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.ONE))),
+                        NoReactionPlayer(1),
+                        NoReactionPlayer(2),
+                        NoReactionPlayer(3)])
+
+        # Closed tenpai hand for P0; exact composition not critical beyond allowing riichi
+        p0 = [
+            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
+            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
+            Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
+            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+        ]
+        g._player_hands[0] = p0
+        g.current_player_idx = 0
+        g.last_discarded_tile = None
+
+        # Deterministic wall: ensure P0's first and next draws are non-winning, and others draw harmless tiles
+        first_draw = Tile(Suit.MANZU, TileType.ONE)
+        next_draw = Tile(Suit.MANZU, TileType.NINE)
+        g.tiles = [next_draw, Tile(Suit.PINZU, TileType.ONE), Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.MANZU, TileType.TWO), first_draw]
+
+        # P0 plays turn and should declare riichi (forced via ForceActionPlayer)
+        g.play_turn()
+        self.assertTrue(g.riichi_declared[0])
+        self.assertEqual(g.current_player_idx, 1)
+
+        # Three uneventful turns for players 1..3
+        for _ in range(3):
+            g.play_turn()
+
+        g._draw_tile()
+        # Back to P0 action phase; compute legal flat mask
+        self.assertEqual(g.current_player_idx, 0)
+        gp = g.get_game_perspective(0)
+        mask = gp.legal_flat_mask()
+        self.assertEqual(sum(mask), 1)
+
 
     def test_riichi_multiple_discard_options_in_tenpai(self):
         # Construct a hand where discarding 2m or 8m both keep tenpai
@@ -243,6 +291,60 @@ class TestMediumLegality(unittest.TestCase):
         g.step(1, Discard(Tile(Suit.PINZU, TileType.THREE)))
         # Player 0 is furiten, so ron must be illegal
         self.assertFalse(g.is_legal(0, Ron()))
+
+    def test_kakan_legal_with_existing_pon_and_fourth_tile(self):
+        # Player 1 has a pon of 5s and holds the fourth 5s in hand -> kakan is legal during their action
+        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        # Give player 1 a pon called set of 5s
+        pon_5s = CalledSet(
+            tiles=[Tile(Suit.SOUZU, TileType.FIVE)] * 3,
+            call_type='pon',
+            called_tile=Tile(Suit.SOUZU, TileType.FIVE),
+            caller_position=1,
+            source_position=0,
+        )
+        g._player_called_sets[1] = [pon_5s]
+        # Ensure player 1 also has the fourth 5s in hand
+        g._player_hands[1][0] = Tile(Suit.SOUZU, TileType.FIVE)
+        # Make it player 1's action turn
+        g.current_player_idx = 1
+        g.last_discarded_tile = None
+        g.last_discard_player = None
+        # Kakan should be legal for 5s
+        self.assertTrue(g.is_legal(1, KanKakan(Tile(Suit.SOUZU, TileType.FIVE))))
+
+    def test_kakan_illegal_without_existing_pon(self):
+        # Player 1 does not have a pon of 5s -> kakan illegal even if they have three 5s concealed
+        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        # Give player 1 three concealed 5s but no called sets
+        g._player_called_sets[1] = []
+        g._player_hands[1][:3] = [Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE)]
+        # Make it player 1's action turn
+        g.current_player_idx = 1
+        g.last_discarded_tile = None
+        g.last_discard_player = None
+        # Kakan should be illegal since there's no existing pon
+        self.assertFalse(g.is_legal(1, KanKakan(Tile(Suit.SOUZU, TileType.FIVE))))
+
+    def test_kakan_illegal_with_pon_but_missing_fourth_tile(self):
+        # Player 1 has a pon of 5s but does NOT hold the fourth 5s -> kakan illegal
+        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        pon_5s = CalledSet(
+            tiles=[Tile(Suit.SOUZU, TileType.FIVE)] * 3,
+            call_type='pon',
+            called_tile=Tile(Suit.SOUZU, TileType.FIVE),
+            caller_position=1,
+            source_position=0,
+        )
+        g._player_called_sets[1] = [pon_5s]
+        # Ensure player 1's hand does not contain another 5s
+        g._player_hands[1] = [t for t in g._player_hands[1] if not (t.suit == Suit.SOUZU and t.tile_type == TileType.FIVE)]
+        # Make it player 1's action turn
+        g.current_player_idx = 1
+        g.last_discarded_tile = None
+        g.last_discard_player = None
+        # Kakan should be illegal without the fourth copy in hand
+        self.assertFalse(g.is_legal(1, KanKakan(Tile(Suit.SOUZU, TileType.FIVE))))
 
 
 

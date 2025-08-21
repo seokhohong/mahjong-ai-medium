@@ -19,8 +19,6 @@ def _run_build(params: Dict[str, Any]) -> None:
 	build_ac_dataset(
 		games=int(params["games"]),
 		seed=params.get("seed"),
-		hidden_size=int(params["hidden_size"]),
-		embedding_dim=int(params["embedding_dim"]),
 		temperature=float(params["temperature"]),
 		zero_network_reward=bool(params["zero_network_reward"]),
 		n_step=int(params["n_step"]),
@@ -35,8 +33,6 @@ def main() -> int:
 	# create_dataset knobs
 	ap.add_argument("--games", type=int, default=5)
 	ap.add_argument("--seed", type=int, default=123)
-	ap.add_argument("--hidden_size", type=int, default=128)
-	ap.add_argument("--embedding_dim", type=int, default=16)
 	ap.add_argument("--temperature", type=float, default=0.1)
 	ap.add_argument("--zero_network_reward", action="store_true")
 	ap.add_argument("--n_step", type=int, default=3)

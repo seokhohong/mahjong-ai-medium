@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.learn.ac_network import ACNetwork
 from core.learn.ac_player import ACPlayer
-from core.learn.data_utils import load_gsv_scaler
+from core.learn.data_utils import load_gsv_scaler, build_state_from_arrays
 from core.learn.feature_engineering import decode_game_perspective
 from core.learn.policy_utils import flat_index_for_action
 
@@ -48,14 +48,13 @@ def load_dataset(data_path: str) -> Dict[str, Any]:
     actions = []
 
     for i in range(N):
-        # Create state dictionary in the format expected by decode_game_perspective
-        state_dict = {
-            'hand_idx': np.asarray(hand_arr[i], dtype=np.int32),
-            'disc_idx': np.asarray(disc_arr[i], dtype=np.int32),
-            'called_idx': np.asarray(called_arr[i], dtype=np.int32),
-            'game_state': np.asarray(gsv_arr[i], dtype=np.float32),
-            'called_discards': np.asarray(called_discards_arr[i], dtype=np.int32),
-        }
+        state_dict = build_state_from_arrays(
+            hand_arr[i],
+            disc_arr[i],
+            called_arr[i],
+            gsv_arr[i],
+            called_discards_arr[i],
+        )
         states.append(state_dict)
         actions.append(int(flat_idx[i]))
 

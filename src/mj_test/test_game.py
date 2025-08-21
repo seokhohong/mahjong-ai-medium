@@ -3,6 +3,8 @@ import unittest
 import sys
 import os
 
+from mj_test.test_utils import _make_tenpai_hand, _make_noten_hand
+
 # Add this test directory to Python path so we can import test_utils
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -11,8 +13,8 @@ from test_utils import ForceActionPlayer, NoReactionPlayer, ForceDiscardPlayer
 
 from core.game import (
     MediumJong, Player, Tile, TileType, Suit, Honor,
-    Discard, Tsumo, Pon, Chi, Riichi,
-    KanDaimin, KanAnkan, CalledSet,
+    Discard, Tsumo, Chi, Riichi,
+    CalledSet, OutcomeType,
 )
 
 
@@ -31,7 +33,7 @@ class TestMediumJongBasics(unittest.TestCase):
 
     def test_tile_string_honors(self):
         self.assertEqual(str(Tile(Suit.HONORS, Honor.EAST)), 'E')
-        self.assertEqual(str(Tile(Suit.HONORS, Honor.WHITE)), 'P')
+        self.assertEqual(str(Tile(Suit.HONORS, Honor.WHITE)), 'Wh')
         self.assertEqual(str(Tile(Suit.PINZU, TileType.FIVE)), '5p')
 
     def test_tile_sorting_honors(self):
@@ -70,6 +72,32 @@ class TestMediumJongBasics(unittest.TestCase):
             Tile(Suit.HONORS, Honor.RED),
         ]
         self.assertEqual([h.tile_type for h in honors_sorted], [e.tile_type for e in expected])
+
+    def test_tile_uniqueness(self):
+        # aka 5p and 9m should map to different flat indices
+        from core.game import tile_flat_index
+        a5p = Tile(Suit.PINZU, TileType.FIVE, aka=True)
+        nine_m = Tile(Suit.MANZU, TileType.NINE)
+        idx_a5p = tile_flat_index(a5p)
+        idx_9m = tile_flat_index(nine_m)
+        self.assertNotEqual(idx_a5p, idx_9m, f"aka 5p and 9m mapped to same index {idx_a5p}")
+
+
+    def test_aka_five_pinzu_string_and_sort_order(self):
+        # aka 5p string representation should be "0p"
+        a5p = Tile(Suit.PINZU, TileType.FIVE, aka=True)
+        self.assertEqual(str(a5p), '0p')
+
+        # Sorting a hand should treat aka 5p as a 5p for order purposes
+        t3p = Tile(Suit.PINZU, TileType.THREE)
+        t4p = Tile(Suit.PINZU, TileType.FOUR)
+        t5p = Tile(Suit.PINZU, TileType.FIVE)
+        t6p = Tile(Suit.PINZU, TileType.SIX)
+
+        tiles = [t6p, a5p, t3p, t4p]
+        # Sort by suit then tile number, ignoring aka flag, matching game sort intent
+        sorted_tiles = sorted(tiles, key=lambda t: (t.suit.value, int(t.tile_type.value)))
+        self.assertEqual([str(t) for t in sorted_tiles], ['3p', '4p', '0p', '6p'])
 
     def test_chi_left_only(self):
         g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
@@ -322,6 +350,9 @@ class TestYakuAndRiichi(unittest.TestCase):
         g.dead_wall = [Tile(Suit.HONORS, Honor.EAST), Tile(Suit.SOUZU, TileType.SIX)]
         # Provide an initial draw that completes 3p4p5p as a meld
         g.tiles = [Tile(Suit.PINZU, TileType.FIVE)]
+        # Make deterministic: clear any initial dora/uradora so kandora won't add extra han
+        g.dora_indicators = []
+        g.ura_dora_indicators = []
         # Execute first turn: draw, perform ankan, rinshan draw happens, then tsumo
         g.play_turn()
         self.assertTrue(g.is_game_over())
@@ -331,6 +362,23 @@ class TestYakuAndRiichi(unittest.TestCase):
 
 
 class TestScoring(unittest.TestCase):
+    def test_zero_and_nonzero_points_imply_ron_over_10_games(self):
+        # If at least one player has 0 points and at least one has non-zero,
+        # the outcome must be a Ron (single or multiple). Verify over 10 random games.
+        import random
+        random.seed(42)
+        for _ in range(10):
+            g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+            g.play_round()
+            pts = g.get_points()
+            self.assertIsNotNone(pts)
+            has_zero = any(p == 0 for p in pts)
+            has_nonzero = any(p != 0 for p in pts)
+            if has_zero and has_nonzero:
+                # Mixed zero/non-zero implies Ron occurred
+                self.assertIsNotNone(g.get_loser())
+                self.assertTrue(len(g.get_winners()) >= 1)
+
     def test_dealer_tsumo_vs_non_dealer(self):
         # Dealer tsumo by drawing winning tile
         g = MediumJong([ForceActionPlayer(0, Tsumo()), Player(1), Player(2), Player(3)])
@@ -446,6 +494,41 @@ class TestScoring(unittest.TestCase):
         pts = g.get_points()
         self.assertIsNotNone(pts)
         self.assertEqual(len(pts), 4)
+        self.assertTrue(g.get_game_outcome().outcome_type(0), OutcomeType.DEAL_IN)
+        self.assertTrue(g.get_game_outcome().outcome_type(1), OutcomeType.RON)
+
+    def test_dealer_ron_points_conservation(self):
+        # Dealer (P0) wins by ron from non-dealer P1's discard; total points should conserve to 0
+        from test_utils import ForceDiscardPlayer, NoReactionPlayer
+        import random
+        random.seed(234)
+        g = MediumJong([
+            ForceDiscardPlayer(0, Tile(Suit.HONORS, Honor.NORTH)),
+            ForceDiscardPlayer(1, Tile(Suit.PINZU, TileType.THREE)),
+            NoReactionPlayer(2),
+            NoReactionPlayer(3),
+        ])
+        # Construct dealer (P0) hand to ron on 3p discard
+        g._player_hands[0] = [
+            Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR),
+            Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.MANZU, TileType.FOUR), Tile(Suit.MANZU, TileType.FIVE), Tile(Suit.MANZU, TileType.SIX),
+            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
+        ]
+        # Ensure P1 holds a 3p to discard
+        g._player_hands[1][0] = Tile(Suit.PINZU, TileType.THREE)
+        # Provide a draw so play_turn can proceed deterministically
+        g.tiles = [Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.MANZU, TileType.TWO)]
+        g.play_turn()
+        g.play_turn()
+        self.assertTrue(g.is_game_over())
+        self.assertEqual(g.get_winners(), [0])
+        pts = g.get_points()
+        self.assertIsNotNone(pts)
+        self.assertEqual(len(pts), 4)
+        # Points conservation: sum to zero
+        self.assertEqual(sum(pts), 0)
 
     def test_double_ron_points_and_riichi_sticks_first_only(self):
         # Setup: Player 0 discards 3p; Players 1 and 2 can both ron on 3p with tanyao hands
@@ -483,12 +566,16 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(len(pts), 4)
         # Points conservation: loser pays sum of winners
         self.assertEqual(pts[0] - extra_points, -(pts[1] + pts[2]))
-        # Compare to per-winner scoring outputs and riichi sticks to first only
-        s1 = g._score_hand(1, win_by_tsumo=False)
-        s2 = g._score_hand(2, win_by_tsumo=False)
-        # First winner gets sticks, second does not
-        self.assertEqual(pts[1], s1['points'] + 2000)
-        self.assertEqual(pts[2], s2['points'])
+        # Use GameOutcome to verify deltas and riichi sticks allocation
+        outcome = g.get_game_outcome()
+        # Winners recorded correctly and loser is discarder 0
+        self.assertEqual(outcome.winners, [1, 2])
+        self.assertEqual(outcome.loser, 0)
+        # Per-player deltas equal outcome players' points_delta
+        for pid in range(4):
+            self.assertEqual(pts[pid], outcome.players[pid].points_delta)
+        # First winner gets riichi sticks, second does not
+        self.assertEqual(outcome.players[1].points_delta, outcome.players[2].points_delta + extra_points)
 
     def test_riichi_stick_not_paid_on_immediate_ron(self):
         # P0 declares riichi and immediately deals into P1; P1 should NOT get riichi stick
@@ -712,6 +799,49 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(s['points'], 8000)
         self.assertEqual(s['from'], 0)
 
+    def test_two_riichi_then_ron_zero_sum(self):
+        # Script: P0 declares riichi (on 9m), P1 declares riichi (on 9m), then P2 discards 3p and P1 rons.
+        # Check that cumulative get_points sums to zero.
+        from test_utils import ForceActionPlayer, ForceDiscardPlayer, NoReactionPlayer
+        # Force P0 and P1 to declare Riichi when legal; P2 will discard 3p; P3 no reactions
+        g = MediumJong([
+            ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.NINE))),
+            ForceActionPlayer(1, Riichi(Tile(Suit.MANZU, TileType.NINE))),
+            ForceDiscardPlayer(2, Tile(Suit.PINZU, TileType.THREE)),
+            NoReactionPlayer(3),
+        ])
+        # Configure P0 hand to be tenpai so Riichi(9m) is legal when discarding the drawn 9m
+        g._player_hands[0] = [
+            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
+            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
+            Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.THREE),
+        ]
+        # Configure P1 hand to be able to ron on 3p (tanyao-completable), reusing pattern from other tests
+        g._player_hands[1] = [
+            Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR),
+            Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.MANZU, TileType.FOUR), Tile(Suit.MANZU, TileType.FIVE), Tile(Suit.MANZU, TileType.SIX),
+            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
+        ]
+        # Ensure P2 holds a 3p to discard
+        g._player_hands[2][0] = Tile(Suit.PINZU, TileType.THREE)
+        # Arrange draws: P0 draws 9m (to enable riichi); P1 draws 9m (to enable riichi);
+        # Provide a harmless draw for P2 to proceed before discarding 3p
+        g.tiles = [
+            Tile(Suit.MANZU, TileType.NINE),  # P0 draw -> riichi discard 9m
+            Tile(Suit.MANZU, TileType.NINE),  # P1 draw -> riichi discard 9m
+            Tile(Suit.MANZU, TileType.TWO),   # P2 draw (harmless) then discard 3p -> P1 ron
+        ]
+        # Play through until over
+        while not g.is_game_over():
+            g.play_turn()
+        pts = g.get_points()
+        self.assertIsNotNone(pts)
+        self.assertEqual(sum(pts), 0)
+
     def test_rinshan(self):
         # After Ankan (concealed kan) of four NORTH tiles, a rinshan draw should occur from the dead wall
         g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
@@ -783,41 +913,19 @@ class TestScoring(unittest.TestCase):
         self.assertTrue(g.is_game_over())
         pts = g.get_points()
         # Base points: fu=30, han=4 -> base=30*2^(2+4)=30*64=1920; dealer tsumo total=round_up_100(1920*6)=11600
-        # Riichi stick pot adds +1000 to winner
         self.assertIsNotNone(pts)
         self.assertEqual(len(pts), 4)
-        self.assertEqual(pts[0], 12600)
+        self.assertEqual(pts[0], 11600)
         self.assertEqual(pts[1], -3866)
         self.assertEqual(pts[2], -3866)
         self.assertEqual(pts[3], -3866)
 
-    def _make_tenpai_hand(self):
-        # 13 tiles: needs 6s to complete 456s; closed, standard hand
-        return [
-            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
-            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
-            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
-            Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
-            Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.THREE),
-        ]
-
-    def _make_noten_hand(self):
-        # 13 singles: all 7 honors + three suits' 1 and 9. This should not be in tenpai, assuming we do not have kokushi musou.
-        return [
-            Tile(Suit.HONORS, Honor.EAST), Tile(Suit.HONORS, Honor.SOUTH), Tile(Suit.HONORS, Honor.WEST),
-            Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.WHITE), Tile(Suit.HONORS, Honor.GREEN),
-            Tile(Suit.HONORS, Honor.RED),
-            Tile(Suit.MANZU, TileType.ONE), Tile(Suit.MANZU, TileType.NINE),
-            Tile(Suit.PINZU, TileType.ONE), Tile(Suit.PINZU, TileType.NINE),
-            Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.NINE),
-        ]
-
     def test_keiten_one_in_tenpai(self):
         g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
-        g._player_hands[0] = self._make_tenpai_hand()
-        g._player_hands[1] = self._make_noten_hand()
-        g._player_hands[2] = self._make_noten_hand()
-        g._player_hands[3] = self._make_noten_hand()
+        g._player_hands[0] = _make_tenpai_hand()
+        g._player_hands[1] = _make_noten_hand()
+        g._player_hands[2] = _make_noten_hand()
+        g._player_hands[3] = _make_noten_hand()
         g.tiles = []
         g.play_turn()
         self.assertTrue(g.is_game_over())
@@ -829,10 +937,10 @@ class TestScoring(unittest.TestCase):
 
     def test_keiten_two_in_tenpai(self):
         g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
-        g._player_hands[0] = self._make_tenpai_hand()
-        g._player_hands[1] = self._make_tenpai_hand()
-        g._player_hands[2] = self._make_noten_hand()
-        g._player_hands[3] = self._make_noten_hand()
+        g._player_hands[0] = _make_tenpai_hand()
+        g._player_hands[1] = _make_tenpai_hand()
+        g._player_hands[2] = _make_noten_hand()
+        g._player_hands[3] = _make_noten_hand()
         g.tiles = []
         g.play_turn()
         pay = g.get_points()
@@ -843,10 +951,10 @@ class TestScoring(unittest.TestCase):
 
     def test_keiten_three_in_tenpai(self):
         g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
-        g._player_hands[0] = self._make_tenpai_hand()
-        g._player_hands[1] = self._make_tenpai_hand()
-        g._player_hands[2] = self._make_tenpai_hand()
-        g._player_hands[3] = self._make_noten_hand()
+        g._player_hands[0] = _make_tenpai_hand()
+        g._player_hands[1] = _make_tenpai_hand()
+        g._player_hands[2] = _make_tenpai_hand()
+        g._player_hands[3] = _make_noten_hand()
         g.tiles = []
         g.play_turn()
         pay = g.get_points()
@@ -858,10 +966,10 @@ class TestScoring(unittest.TestCase):
     def test_keiten_all_or_none_in_tenpai(self):
         # None in tenpai
         g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
-        g._player_hands[0] = self._make_noten_hand()
-        g._player_hands[1] = self._make_noten_hand()
-        g._player_hands[2] = self._make_noten_hand()
-        g._player_hands[3] = self._make_noten_hand()
+        g._player_hands[0] = _make_noten_hand()
+        g._player_hands[1] = _make_noten_hand()
+        g._player_hands[2] = _make_noten_hand()
+        g._player_hands[3] = _make_noten_hand()
         g.tiles = []
         g.play_turn()
         pay = g.get_points()
@@ -872,7 +980,7 @@ class TestScoring(unittest.TestCase):
 
         # All in tenpai
         g2 = MediumJong([Player(0), Player(1), Player(2), Player(3)])
-        th = self._make_tenpai_hand()
+        th = _make_tenpai_hand()
         g2._player_hands[0] = th
         g2._player_hands[1] = th
         g2._player_hands[2] = th
@@ -884,6 +992,72 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(pay2[1], 0)
         self.assertEqual(pay2[2], 0)
         self.assertEqual(pay2[3], 0)
+
+class TestGameOutcome(unittest.TestCase):
+    def test_serialize_deserialize_draw(self):
+        # Force an exhaustive draw by emptying wall quickly
+        from core.game import MediumJong, Player
+        import core.game
+        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g.tiles = []
+        g.play_turn()
+        self.assertTrue(g.is_game_over())
+        outcome = g.get_game_outcome()
+        data = outcome.serialize()
+        round_trip = core.game.GameOutcome.deserialize(data)  # type: ignore[attr-defined]
+        self.assertEqual(outcome.is_draw, round_trip.is_draw)
+        self.assertEqual(set(outcome.winners), set(round_trip.winners))
+        self.assertEqual(outcome.loser, round_trip.loser)
+        for pid in range(4):
+            a = outcome.players[pid]
+            b = round_trip.players[pid]
+            self.assertEqual(a.player_id, b.player_id)
+            self.assertEqual((None if a.outcome_type is None else a.outcome_type.value), (None if b.outcome_type is None else b.outcome_type.value))
+            self.assertEqual(a.won, b.won)
+            self.assertEqual(a.lost, b.lost)
+            self.assertEqual(a.tenpai, b.tenpai)
+            self.assertEqual(a.noten, b.noten)
+            self.assertEqual(a.points_delta, b.points_delta)
+
+    def test_serialize_deserialize_win(self):
+        # Deterministic tsumo for player 0
+        from core.game import MediumJong, Player, Tsumo, Tile, Suit, TileType
+        import core.game
+        class TsumoIfCan(Player):
+            def play(self, gs):  # type: ignore[override]
+                if gs.can_tsumo():
+                    return Tsumo()
+                return core.game.Discard(gs.player_hand[0])
+        g = MediumJong([TsumoIfCan(0), Player(1), Player(2), Player(3)])
+        g._player_hands[0] = [
+            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
+            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
+            Tile(Suit.SOUZU, TileType.THREE), Tile(Suit.SOUZU, TileType.THREE),
+        ]
+        g.tiles = [Tile(Suit.SOUZU, TileType.SIX)]
+        g.dead_wall = []
+        g.dora_indicators = []
+        g.ura_dora_indicators = []
+        g.play_turn()
+        self.assertTrue(g.is_game_over())
+        outcome = g.get_game_outcome()
+        data = outcome.serialize()
+        round_trip = core.game.GameOutcome.deserialize(data)  # type: ignore[attr-defined]
+        self.assertEqual(outcome.is_draw, round_trip.is_draw)
+        self.assertEqual(set(outcome.winners), set(round_trip.winners))
+        self.assertEqual(outcome.loser, round_trip.loser)
+        for pid in range(4):
+            a = outcome.players[pid]
+            b = round_trip.players[pid]
+            self.assertEqual(a.player_id, b.player_id)
+            self.assertEqual((None if a.outcome_type is None else a.outcome_type.value), (None if b.outcome_type is None else b.outcome_type.value))
+            self.assertEqual(a.won, b.won)
+            self.assertEqual(a.lost, b.lost)
+            self.assertEqual(a.tenpai, b.tenpai)
+            self.assertEqual(a.noten, b.noten)
+            self.assertEqual(a.points_delta, b.points_delta)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -11,7 +11,8 @@ from core.heuristics_player import MediumHeuristicsPlayer
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.game import MediumJong, Player, GamePerspective, Reaction, Tile  # type: ignore
+from core.game import MediumJong, Player, GamePerspective, Reaction  # type: ignore
+from core.tile import Tile
 from core.learn.ac_player import ACPlayer  # type: ignore
 
 

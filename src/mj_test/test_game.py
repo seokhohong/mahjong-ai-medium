@@ -12,10 +12,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_utils import ForceActionPlayer, NoReactionPlayer, ForceDiscardPlayer
 
 from core.game import (
-    MediumJong, Player, Tile, TileType, Suit, Honor,
+    MediumJong, Player,
     Discard, Tsumo, Chi, Riichi,
     CalledSet, OutcomeType,
 )
+from core.tile import Tile, TileType, Suit, Honor
 
 
 class TestMediumJongBasics(unittest.TestCase):
@@ -75,7 +76,7 @@ class TestMediumJongBasics(unittest.TestCase):
 
     def test_tile_uniqueness(self):
         # aka 5p and 9m should map to different flat indices
-        from core.game import tile_flat_index
+        from core.tile import tile_flat_index
         a5p = Tile(Suit.PINZU, TileType.FIVE, aka=True)
         nine_m = Tile(Suit.MANZU, TileType.NINE)
         idx_a5p = tile_flat_index(a5p)
@@ -1054,7 +1055,8 @@ class TestGameOutcome(unittest.TestCase):
 
     def test_serialize_deserialize_win(self):
         # Deterministic tsumo for player 0
-        from core.game import MediumJong, Player, Tsumo, Tile, Suit, TileType
+        from core.game import MediumJong, Player, Tsumo
+        from core.tile import Tile, Suit, TileType
         import core.game
         class TsumoIfCan(Player):
             def play(self, gs):  # type: ignore[override]

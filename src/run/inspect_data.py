@@ -7,7 +7,8 @@ import numpy as np
 from core.learn.feature_engineering import decode_game_perspective
 from core.learn.policy_utils import build_move_from_flat
 from core.learn.data_utils import build_state_from_npz_row, make_npz_state_row_getter
-from core.game import Suit, GameOutcome
+from core.game import GameOutcome
+from core.tile import Suit
 
 
 def inspect_data(states: List[Dict[str, Any]], actions: List[int], *, include_winds: bool = True, actor_id: int | None = None) -> List[str]:

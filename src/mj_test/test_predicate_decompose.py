@@ -6,7 +6,8 @@ import os
 # Add the src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.game import _decompose_standard_with_pred, Tile, TileType, Suit, Honor
+from core.game import _decompose_standard_with_pred
+from core.tile import Tile, TileType, Suit, Honor
 
 
 class TestDecomposeWithPred(unittest.TestCase):

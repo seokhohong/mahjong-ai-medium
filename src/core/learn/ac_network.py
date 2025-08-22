@@ -11,9 +11,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..game import GamePerspective, Tile, TileType, Suit
+from core.constants import NUM_PLAYERS
 from .feature_engineering import encode_game_perspective
 from .ac_constants import (
-    NUM_PLAYERS as AC_NUM_PLAYERS,
     FLAT_POLICY_SIZE,
     TILE_INDEX_SIZE,
     MAX_CALLS,
@@ -46,8 +46,8 @@ class ACNetwork:
 
         from ..constants import TOTAL_TILES
         from .ac_constants import GAME_STATE_VEC_LEN as GSV
-        dealt = 13 * int(AC_NUM_PLAYERS)
-        self._max_discards_per_player = max(1, (int(TOTAL_TILES) - dealt) // int(AC_NUM_PLAYERS))
+        dealt = 13 * int(NUM_PLAYERS)
+        self._max_discards_per_player = max(1, (int(TOTAL_TILES) - dealt) // int(NUM_PLAYERS))
         self._max_called_sets = int(MAX_CALLS)
         self._max_tiles_per_called_set = int(MAX_CALLED_SET_SIZE)
 
@@ -57,7 +57,7 @@ class ACNetwork:
             def __init__(self, outer: 'ACNetwork') -> None:
                 super().__init__()
                 self.outer = outer
-                num_p = int(AC_NUM_PLAYERS)
+                num_p = int(NUM_PLAYERS)
                 # Convolutional towers
                 self.hand_conv = nn.Sequential(
                     nn.Conv1d(outer.embedding_dim, conv_ch1, kernel_size=3, padding=1),

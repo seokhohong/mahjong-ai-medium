@@ -10,7 +10,8 @@ import os
 # Add this test directory to Python path to import helpers
 sys.path.insert(0, os.path.dirname(__file__))
 
-from core.game import MediumJong, Player, Tile, TileType, Discard, Tsumo, Ron, Suit, Pon, Chi, CalledSet
+from core.game import MediumJong, Player, Discard, Tsumo, Ron, Pon, Chi, CalledSet
+from core.tile import Tile, TileType, Suit
 from test_utils import ForceDiscardPlayer
 
 

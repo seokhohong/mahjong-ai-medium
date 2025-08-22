@@ -45,6 +45,18 @@ from .constants import (
     NON_DEALER_RON_MULTIPLIER,
 )
 
+# Tile enums, dataclass, and helpers moved to dedicated module
+from .tile import (
+    Suit,
+    TileType,
+    Honor,
+    Tile,
+    tile_flat_index,
+    _dora_next,
+    _tile_sort_key,
+    make_tile,
+)
+
 
 # MediumJong: Expanded Riichi-like implementation
 # - Suits: Manzu (m), Pinzu (p), Souzu (s) and Honors (winds/dragons)
@@ -54,58 +66,6 @@ from .constants import (
 # - Riichi declaration; after riichi, only Win/Kan allowed; uradora on riichi win
 
 
-class Suit(Enum):
-    MANZU = 'm'
-    PINZU = 'p'
-    SOUZU = 's'
-    HONORS = 'z'
-
-
-class TileType(Enum):
-    ONE = 1
-    TWO = 2
-    THREE = 3
-    FOUR = 4
-    FIVE = 5
-    SIX = 6
-    SEVEN = 7
-    EIGHT = 8
-    NINE = 9
-
-
-class Honor(Enum):
-    EAST = 1
-    SOUTH = 2
-    WEST = 3
-    NORTH = 4
-    WHITE = 5  # haku
-    GREEN = 6  # hatsu
-    RED = 7    # chun
-
-
-@dataclass
-class Tile:
-    suit: Suit
-    tile_type: Union[TileType, Honor]
-    aka: bool = False  # red-dora five indicator for suited 5s
-
-    def __str__(self) -> str:
-        if self.suit == Suit.HONORS:
-            mapping = {
-                Honor.EAST: 'E', Honor.SOUTH: 'S', Honor.WEST: 'W', Honor.NORTH: 'N',
-                Honor.WHITE: 'Wh', Honor.GREEN: 'G', Honor.RED: 'R',
-            }
-            return mapping[self.tile_type]  # type: ignore[index]
-        # Represent aka (red-dora) five as 0{suite} per common shorthand, e.g., "0p"
-        if self.aka and self.suit in (Suit.MANZU, Suit.PINZU, Suit.SOUZU) and self.tile_type == TileType.FIVE:
-            return f"0{self.suit.value}"
-        return f"{int(self.tile_type.value)}{self.suit.value}"
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, Tile) and self.suit == other.suit and self.tile_type == other.tile_type
-
-    def __hash__(self) -> int:
-        return hash((self.suit, self.tile_type))
 
 
 # Structured outcome types for a completed hand
@@ -332,8 +292,7 @@ def _decompose_standard_with_pred(tiles: List[Tile], pred_meld, pred_pair) -> bo
                 counts[t.suit][int(t.tile_type.value)] += 1
         return counts, honors
 
-    def make_tile(suit: Suit, val: int) -> Tile:
-        return Tile(suit, TileType(val)) if suit != Suit.HONORS else Tile(Suit.HONORS, Honor(val))
+    # use imported make_tile
 
     for i in range(len(tiles) - 1):
         a, b = tiles[i], tiles[i + 1]

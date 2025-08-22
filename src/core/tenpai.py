@@ -1,6 +1,7 @@
 from typing import List, Dict, Tuple, Set, Any
 from .constants import SUIT_ORDER
-from .game import Suit, TileType, Honor, Tile, CalledSet, Riichi
+from .tile import Suit, TileType, Honor, Tile
+from .game import CalledSet, Riichi
 
 # Cache for meld checking results
 _meld_cache: Dict[Tuple[Tuple[int, ...], int], bool] = {}

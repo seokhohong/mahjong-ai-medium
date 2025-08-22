@@ -29,7 +29,8 @@ def _decode_gp_from_row(data, row_idx):
 
 
 def _post_action_concealed_and_calls(gp, move):
-    from core.game import Discard, Riichi, Chi, Pon, KanDaimin, KanAnkan, KanKakan, CalledSet, Tile
+    from core.game import Discard, Riichi, Chi, Pon, KanDaimin, KanAnkan, KanKakan, CalledSet
+    from core.tile import Tile
     concealed = list(gp.player_hand)
     called_sets = list(gp.called_sets.get(0, []))
     last = gp._reactable_tile

@@ -9,7 +9,8 @@ from core.constants import (
     MAX_CALLED_SET_SIZE as MAX_TILES_PER_CALLED_SET,
     MAX_DISCARDS_PER_PLAYER, NUM_PLAYERS,
 )
-from core.game import GamePerspective, Tile, Suit, TileType, Honor, CalledSet
+from core.game import GamePerspective, CalledSet
+from core.tile import Tile, Suit, TileType, Honor
 
 
 # Fixed sizes for vectorization (aligned with game rules)

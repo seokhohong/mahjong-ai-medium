@@ -9,7 +9,8 @@ from typing import List, Any
 # Ensure src on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.game import MediumJong, Player, Suit, Tile  # type: ignore
+from core.game import MediumJong, Player  # type: ignore
+from core.tile import Suit, Tile
 from core.learn.ac_player import ACPlayer  # type: ignore
 from core.learn.recording_ac_player import RecordingHeuristicACPlayer  # type: ignore
 

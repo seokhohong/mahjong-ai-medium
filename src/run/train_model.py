@@ -183,7 +183,8 @@ def train_ppo(
     hidden_size: int = 128,
     embedding_dim: int = 16,
     negative_reward_weight: float = 1.0,
-    kl_threshold: float = 0.008
+    kl_threshold: float | None = 0.008,
+    patience: int = 0,
 ) -> str:
     dev = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
@@ -368,6 +369,10 @@ def train_ppo(
     epochs_no_improve = 0
     # Store previous epoch's validation policy probabilities to compute KL(prev || curr)
     prev_val_policy_probs: torch.Tensor | None = None
+    # Track consecutive epochs where KL(prev||curr) <= threshold (when enabled)
+    kl_below_count: int = 0
+    # Latest computed validation KL (prev||curr) average for logging/ES
+    v_avg_kl_prev_curr: float | None = None
     for epoch in range(epochs):
         total_loss = 0.0
         total_examples = 0
@@ -483,10 +488,16 @@ def train_ppo(
 
         # Early stopping
         if dl_val is not None:
-            # Prefer KL-based early stopping if threshold is provided and KL is available (epoch >= 1)
+            # KL-based early stopping with patience: require KL(prev||curr) <= threshold for `patience` consecutive epochs
             if kl_threshold is not None and v_avg_kl_prev_curr is not None:
                 if v_avg_kl_prev_curr <= float(kl_threshold):
-                    print(f"Early stopping triggered: KL(prev||curr) {v_avg_kl_prev_curr:.6f} <= threshold {float(kl_threshold):.6f}")
+                    kl_below_count += 1
+                else:
+                    kl_below_count = 0
+                if patience and kl_below_count >= int(max(1, patience)):
+                    print(
+                        f"Early stopping triggered: KL(prev||curr) <= {float(kl_threshold):.6f} for {kl_below_count} consecutive epoch(s) (patience={int(patience)})"
+                    )
                     break
 
     # Save trained weights and scaler
@@ -520,8 +531,8 @@ def main():
     ap.add_argument('--epsilon', type=float, default=0.2)
     ap.add_argument('--value_coeff', type=float, default=0.5)
     ap.add_argument('--entropy_coeff', type=float, default=0.01)
-    ap.add_argument('--patience', type=int, default=0, help='Early stopping patience (used only if --kl_threshold is not set)')
-    ap.add_argument('--min_delta', type=float, default=1e-4, help='Minimum improvement in val loss to reset patience (used only if --kl_threshold is not set)')
+    ap.add_argument('--patience', type=int, default=0, help='Early stopping patience (number of consecutive epochs validation KL(prev||curr) must be <= --kl_threshold to stop; 0 disables)')
+    ap.add_argument('--min_delta', type=float, default=1e-4, help='(Legacy/unused) Reserved for potential val-loss patience; currently ignored when using KL-based early stopping')
     ap.add_argument('--kl_threshold', type=float, default=None, help='Early stop when KL(prev||curr) on validation <= this threshold (epoch >= 1)')
     ap.add_argument('--init', type=str, default=None, help='Path to initial AC model weights/module to load')
     ap.add_argument('--warm_up_acc', type=float, default=0.0, help='Accuracy threshold to reach with behavior cloning before switching to PPO (0 disables)')
@@ -547,6 +558,7 @@ def main():
         embedding_dim=args.embedding_dim,
         negative_reward_weight=float(max(0.0, args.negative_reward_weight)),
         kl_threshold=args.kl_threshold,
+        patience=args.patience,
     )
 
 

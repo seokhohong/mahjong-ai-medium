@@ -1,6 +1,7 @@
 from typing import Dict, List
 
-from core.game import Discard, Player, Tile, GamePerspective, Reaction, Action, PassCall, Suit, TileType, Honor
+from core.game import Discard, Player, GamePerspective, Reaction, Action, PassCall
+from core.tile import Tile, Suit, TileType, Honor
 
 
 class ForceDiscardPlayer(Player):

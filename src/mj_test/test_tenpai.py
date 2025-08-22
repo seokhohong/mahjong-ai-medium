@@ -10,7 +10,8 @@ import os
 # Add the src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.game import Tile, TileType, Suit, Honor, hand_is_tenpai, hand_is_tenpai_for_tiles, CalledSet
+from core.game import hand_is_tenpai, hand_is_tenpai_for_tiles, CalledSet
+from core.tile import Tile, TileType, Suit, Honor
 from core.tenpai import can_complete_standard_with_calls, clear_hand_caches, waits_for_tiles
 from core.tenpai import hand_is_tenpai_with_calls  # type: ignore
 

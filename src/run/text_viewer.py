@@ -67,10 +67,10 @@ class LoggingPlayer(Player):
         hand_s = '[' + ', '.join(_fmt_tile(t) for t in sorted(gs.player_hand, key=lambda t: (t.suit.value, int(t.tile_type.value)))) + ']'
         called_s = {pid: _fmt_called_sets(gs.called_sets.get(pid, [])) for pid in range(4)}
         disc_s = {pid: '[' + ', '.join(_fmt_tile(t) for t in gs.player_discards.get(pid, [])) + ']' for pid in range(4)}
-        last_discard = _fmt_tile(gs.last_discarded_tile) if gs.last_discarded_tile is not None else 'None'
+        last_discard = _fmt_tile(gs._reactable_tile) if gs._reactable_tile is not None else 'None'
         riichi_flag = int(getattr(gs, 'riichi_declared', {}).get(actor, False))
         print(f"P{abs_pid} (loc {actor}) | RW:{gs.round_wind.name} | SW[" + ', '.join(gs.seat_winds[j].name for j in range(4)) + f"] | Riichi:{riichi_flag} | Hand {hand_s}")
-        print(f"    LastDiscard:{last_discard} by {gs.last_discard_player} | CanCall:{int(bool(gs.can_call))} | CanRon:{int(gs.can_ron())} | CanTsumo:{int(gs.can_tsumo())}")
+        print(f"    LastDiscard:{last_discard} by {gs._owner_of_reactable_tile} | CanCall:{int(bool(gs.can_call))} | CanRon:{int(gs.can_ron())} | CanTsumo:{int(gs.can_tsumo())}")
         print(f"    Called:{called_s}")
         print(f"    Discards:{disc_s}")
         print(f"    Action:{type(move).__name__}: {move}")
@@ -81,7 +81,7 @@ class LoggingPlayer(Player):
         # Pretty print reaction decision
         actor = 0
         abs_pid = self.inner.player_id
-        last_discard = _fmt_tile(gs.last_discarded_tile) if gs.last_discarded_tile is not None else 'None'
+        last_discard = _fmt_tile(gs._reactable_tile) if gs._reactable_tile is not None else 'None'
         # Format options succinctly
         def _fmt_opts():
             try:
@@ -100,7 +100,7 @@ class LoggingPlayer(Player):
                 return ', '.join(parts) if parts else 'None'
             except Exception:
                 return 'None'
-        print(f"P{abs_pid} (loc {actor}) | ReactionState | LastDiscard:{last_discard} by {gs.last_discard_player} | Options: {_fmt_opts()}")
+        print(f"P{abs_pid} (loc {actor}) | ReactionState | LastDiscard:{last_discard} by {gs._owner_of_reactable_tile} | Options: {_fmt_opts()}")
         print(f"    Reaction:{type(move).__name__}: {move}")
         return move
 

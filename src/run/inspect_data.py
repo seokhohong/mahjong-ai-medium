@@ -146,13 +146,10 @@ def main() -> int:
         print(f"Game {gi} (id={gid}) | steps={len(idxs)}")
         # Print winds once for the game using the first state's perspective
         if idxs:
-            try:
-                first_state = get_state_row(idxs[0])
-                gp0 = decode_game_perspective(first_state)
-                winds_line = "RW:" + gp0.round_wind.name + " | SW:[" + ', '.join(gp0.seat_winds[j].name for j in range(4)) + "]"
-                print(winds_line)
-            except Exception:
-                pass
+            first_state = get_state_row(idxs[0])
+            gp0 = decode_game_perspective(first_state)
+            winds_line = "RW:" + gp0.round_wind.name + " | SW:[" + ', '.join(gp0.seat_winds[j].name for j in range(4)) + "]"
+            print(winds_line)
         print("-" * 80)
         for i in idxs:
             st = get_state_row(i)
@@ -166,15 +163,12 @@ def main() -> int:
             # Probability of chosen action from stored old_log_probs
             prob_s = ""
             if old_log_probs is not None:
-                try:
-                    p = float(np.exp(float(old_log_probs[i])))
-                    prob_s = f" | prob={p:.4f}"
-                except Exception:
-                    prob_s = ""
+                p = float(np.exp(float(old_log_probs[i])))
+                prob_s = f" | prob={p:.4f}"
             if adv is not None:
-                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | advantage={adv:+.3f} | prob={prob_s}")
+                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | advantage={adv:+.3f} | {prob_s}")
             else:
-                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | prob={prob_s}")
+                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | {prob_s}")
             for line in lines:
                 print(line)
         # After all steps, print the GameOutcome if present

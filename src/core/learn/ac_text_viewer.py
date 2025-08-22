@@ -83,14 +83,14 @@ class TextViewerPlayer(Player):
 
     def _log_reaction(self, gs: Any, options: Dict[str, List[List[Tile]]], action: Any) -> None:
         try:
-            last = gs.last_discarded_tile
+            last = gs._reactable_tile
             last_s = str(last) if last is not None else 'None'
             pon_ct = len(options.get('pon', [])) if options else 0
             chi_ct = len(options.get('chi', [])) if options else 0
             action_s = type(action).__name__
             my_called = _fmt_called_sets(gs.called_sets.get(gs.player_id, []))
             self._lines.append(
-                f"Reaction: P{self.player_id} on {last_s} from P{gs.last_discard_player} | Called {my_called} | opts pon={pon_ct} chi={chi_ct} | Chosen {action_s}"
+                f"Reaction: P{self.player_id} on {last_s} from P{gs._owner_of_reactable_tile} | Called {my_called} | opts pon={pon_ct} chi={chi_ct} | Chosen {action_s}"
             )
         except Exception:
             pass

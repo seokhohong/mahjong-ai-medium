@@ -7,8 +7,6 @@ MAIN_HEAD_ORDER = ['chi', 'pon', 'ron', 'tsumo', 'discard', 'pass']
 # Mapping from action type string to main head index
 MAIN_HEAD_INDEX = {name: idx for idx, name in enumerate(MAIN_HEAD_ORDER)}
 
-# Generic MediumJong constants for AC components
-NUM_PLAYERS: int = 4
 # Flat policy space sizing matches policy_utils/build_move_from_flat and GamePerspective.legal_flat_mask
 # Layout (length 160):
 # 0..36:  Discard by tile index

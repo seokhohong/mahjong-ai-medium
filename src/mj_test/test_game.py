@@ -130,6 +130,49 @@ class TestMediumJongBasics(unittest.TestCase):
         g.play_turn()
         self.assertTrue(len(g._player_called_sets[2]) > 0)
 
+    def test_chain_pon_calls(self):
+        # Chain pon scenario:
+        # P0 discards 3p -> P1 pon; P1 discards 4s -> P2 pon.
+        p0 = ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE))
+        p1 = ForceDiscardPlayer(1, Tile(Suit.SOUZU, TileType.FOUR))  # after pon, discard 4s
+        p2 = Player(2)  # default reaction prefers pon if available
+        p3 = NoReactionPlayer(3)
+        g = MediumJong([p0, p1, p2, p3])
+
+        # Ensure P0 has a 3p to discard
+        g._player_hands[0][0] = Tile(Suit.PINZU, TileType.THREE)
+        # P1 can pon 3p (two in hand) and also has a 4s to discard
+        g._player_hands[1] = [
+            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.THREE),
+            Tile(Suit.SOUZU, TileType.FOUR)
+        ] + [t if t != Tile(Suit.PINZU, TileType.THREE) else Tile(Suit.MANZU, TileType.NINE) for t in g._player_hands[1][3:] ]
+        # P2 can pon 4s (two in hand)
+        g._player_hands[2] = [
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FOUR)
+        ] + g._player_hands[2][2:]
+
+        # Provide a small wall so the first turn proceeds deterministically
+        g.tiles = [Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE)]
+
+        # Execute one turn: should result in P1 pon on 3p, discard 4s, then P2 pon on 4s
+        g.play_turn()
+
+        # Validate P1 called sets include a pon on 3p from P0
+        p1_pons = [cs for cs in g._player_called_sets[1] if cs.call_type == 'pon']
+        self.assertTrue(any(cs.called_tile == Tile(Suit.PINZU, TileType.THREE) and cs.source_position == 0 for cs in p1_pons))
+
+        # Validate P2 called sets include a pon on 4s from P1
+        p2_pons = [cs for cs in g._player_called_sets[2] if cs.call_type == 'pon']
+        self.assertTrue(any(cs.called_tile == Tile(Suit.SOUZU, TileType.FOUR) and cs.source_position == 1 for cs in p2_pons))
+
+        # The discards that were called should be marked
+        self.assertIn(0, g.called_discards[0])  # P0's first discard (3p) was called
+        self.assertIn(0, g.called_discards[1])  # P1's first discard (4s) was called
+
+        # Turn should be after the last caller (P3) after chain pon
+        self.assertEqual(g.current_player_idx, 3)
+
+
     def test_ankan_keeps_turn_and_leads_to_one_discard(self):
         # Player 0 with 4x NORTH should Ankan on first play_turn, keep turn, then discard on second
         class KanThenDiscard(Player):
@@ -146,8 +189,8 @@ class TestMediumJongBasics(unittest.TestCase):
             Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.NORTH)
         ] + g._player_hands[0][4:]
         g.current_player_idx = 0
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         rinshan_tile = Tile(Suit.MANZU, TileType.TWO)
         g.dead_wall = [Tile(Suit.HONORS, Honor.EAST), rinshan_tile]
         # First turn: perform Ankan and discard
@@ -244,8 +287,8 @@ class TestYakuAndRiichi(unittest.TestCase):
         g.dora_indicators = []
         g.ura_dora_indicators = []
         g.current_player_idx = 0
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         g.play_turn()
         self.assertTrue(g.is_game_over())
         self.assertEqual(g.get_winners(), [0])
@@ -253,7 +296,9 @@ class TestYakuAndRiichi(unittest.TestCase):
         self.assertEqual(score['han'], 3)
 
     def test_riichi_lock_and_uradora(self):
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        import random
+        random.seed(433)
+        g = MediumJong([ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.TWO))), NoReactionPlayer(1), NoReactionPlayer(2), NoReactionPlayer(3)])
         # Put player 0 in tenpai with closed hand; ensure Riichi legal and then only discard drawn/kan/tsumo allowed
         # Tenpai example: needing 3p to complete 2-3-4p
         base = [
@@ -268,23 +313,11 @@ class TestYakuAndRiichi(unittest.TestCase):
         g.last_drawn_tile = None
         g.last_drawn_player = None
         # Draw a tile to start action
-        if not g.tiles:
-            # Ensure at least one tile exists
-            g.tiles = [Tile(Suit.MANZU, TileType.TWO)]
+        g.tiles = [Tile(Suit.MANZU, TileType.TWO)] + g.tiles
         g.play_turn()  # player 0 draws and acts (may discard). Reset for controlled test
-        g.current_player_idx = 0
-        g.last_discarded_tile = None
-        g.last_discard_player = None
-        gs = g.get_game_perspective(0)
-        # If Riichi is listed, apply it
-        lm = gs.legal_moves()
-        if any(isinstance(m, Riichi) for m in lm):
-            g.step(0, next(m for m in lm if isinstance(m, Riichi)))
-            # After Riichi, verify only discard of drawn tile (when present) or kan/tsumo
-            g._draw_tile()
-            lm2 = g.legal_moves(0)
-            dis = [m for m in lm2 if isinstance(m, Discard)]
-            self.assertLessEqual(len(dis), 1)
+        for _ in range(3):
+            g.play_turn()
+        self.assertEqual(len(g.legal_moves(0)), 1, "Forced tsumogiri")
 
     def test_menzen_tsumo_yakuless(self):
         # Closed hand with no yaku except menzen tsumo should win by tsumo
@@ -308,8 +341,8 @@ class TestYakuAndRiichi(unittest.TestCase):
         g.dora_indicators = []
         g.ura_dora_indicators = []
         g.current_player_idx = 0
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         # Player 0 draws and should tsumo
         g.play_turn()
         self.assertTrue(g.is_game_over())
@@ -451,8 +484,8 @@ class TestScoring(unittest.TestCase):
         g.dora_indicators = []
         g.ura_dora_indicators = []
         g.current_player_idx = 1
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         g.last_drawn_tile = None
         g.last_drawn_player = None
         g.play_turn()
@@ -611,7 +644,7 @@ class TestScoring(unittest.TestCase):
             g.step(0, r_moves[0])
         else:
             g.step(0, Discard(Tile(Suit.PINZU, TileType.THREE)))
-        g._resolve_reactions()
+        g._poll_reactions()
         self.assertTrue(g.is_game_over())
         s = g._score_hand(1, win_by_tsumo=False)
         pts = g.get_points()
@@ -851,8 +884,8 @@ class TestScoring(unittest.TestCase):
             Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.NORTH)
         ] + g._player_hands[0][4:]
         g.current_player_idx = 0
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         # Deterministic dead wall: set kandora indicator source and the rinshan draw tile at the end
         indicator_src = Tile(Suit.HONORS, Honor.EAST)
         rinshan_tile = Tile(Suit.SOUZU, TileType.SIX)

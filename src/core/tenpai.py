@@ -1,6 +1,6 @@
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Any
 from .constants import SUIT_ORDER
-from .game import Suit, TileType, Honor, Tile, CalledSet
+from .game import Suit, TileType, Honor, Tile, CalledSet, Riichi
 
 # Cache for meld checking results
 _meld_cache: Dict[Tuple[Tuple[int, ...], int], bool] = {}
@@ -471,3 +471,38 @@ def can_complete_standard_with_calls(concealed_tiles: List[Tile], called_sets: L
 				return True
 			counts[i] += 2
 	return False
+
+
+def legal_riichi_moves(riichi_declared, called_sets, player_hand) -> List[Riichi]:
+    """Return all legal Riichi moves by checking tenpai-after-discard directly.
+
+    Requirements per is_legal(Riichi):
+    - Action state (assumed by caller)
+    - Not already in riichi
+    - Hand is closed (no called sets)
+    - Discarding the specified tile keeps the hand in tenpai (13 tiles check)
+    """
+    # Preconditions
+    if riichi_declared.get(0, False):
+        return []
+    if called_sets.get(0, []):
+        return []
+    # Deduplicate by tile identity and test tenpai-after-discard once per kind
+    from .tenpai import hand_is_tenpai_for_tiles as _tenpai_tiles
+    hand = list(player_hand)
+    results: List[Riichi] = []
+    # Build an index of first occurrence per key for efficient removal
+    first_idx: Dict[Tuple[Any, Any], int] = {}
+    for i, t in enumerate(hand):
+        key = (t.suit, t.tile_type)
+        if key not in first_idx:
+            first_idx[key] = i
+    for key, idx in first_idx.items():
+        # Remove one tile of this key and test tenpai
+        hand_after = hand[:]  # 14 -> 13
+        hand_after.pop(idx)
+        if _tenpai_tiles(hand_after):
+            # Use representative object; aka flag doesn't affect riichi legality
+            t_rep = hand[idx]
+            results.append(Riichi(t_rep))
+    return results

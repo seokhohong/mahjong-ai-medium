@@ -32,7 +32,7 @@ def _post_action_concealed_and_calls(gp, move):
     from core.game import Discard, Riichi, Chi, Pon, KanDaimin, KanAnkan, KanKakan, CalledSet, Tile
     concealed = list(gp.player_hand)
     called_sets = list(gp.called_sets.get(0, []))
-    last = gp.last_discarded_tile
+    last = gp._reactable_tile
 
     if isinstance(move, (Discard, Riichi)):
         removed = False
@@ -54,7 +54,7 @@ def _post_action_concealed_and_calls(gp, move):
                 new_hand.append(h)
             concealed = new_hand
         seq = sorted([move.tiles[0], last, move.tiles[1]], key=lambda t: (t.suit.value, int(t.tile_type.value)))
-        called_sets.append(CalledSet(tiles=seq, call_type='chi', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp.last_discard_player))
+        called_sets.append(CalledSet(tiles=seq, call_type='chi', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp._owner_of_reactable_tile))
     elif isinstance(move, Pon) and last is not None:
         consumed = 0
         new_hand = []
@@ -64,7 +64,7 @@ def _post_action_concealed_and_calls(gp, move):
                 continue
             new_hand.append(t)
         concealed = new_hand
-        called_sets.append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(3)], call_type='pon', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp.last_discard_player))
+        called_sets.append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(3)], call_type='pon', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp._owner_of_reactable_tile))
     elif isinstance(move, KanDaimin) and last is not None:
         consumed = 0
         new_hand = []
@@ -74,7 +74,7 @@ def _post_action_concealed_and_calls(gp, move):
                 continue
             new_hand.append(t)
         concealed = new_hand
-        called_sets.append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(4)], call_type='kan_daimin', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp.last_discard_player))
+        called_sets.append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(4)], call_type='kan_daimin', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp._owner_of_reactable_tile))
     elif isinstance(move, KanAnkan):
         consumed = 0
         new_hand = []

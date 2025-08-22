@@ -63,10 +63,12 @@ def build_ac_dataset(
     use_heuristic: bool = False,
     model_path: str | None = None,
 ) -> dict:
+    import random
     if seed is not None:
-        import random
         random.seed(seed)
         np.random.seed(seed)
+    else:
+        random.seed(int(time.time()))
 
     net = None
     if not use_heuristic:

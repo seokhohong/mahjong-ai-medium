@@ -10,7 +10,7 @@ from test_utils import ForceActionPlayer, ForceDiscardPlayer, NoReactionPlayer
 from core.game import (
     MediumJong, Player, Tile, TileType, Suit, Honor,
     Discard, Tsumo, Ron, Pon, Chi, CalledSet, PassCall, Riichi,
-    KanKakan
+    KanKakan, KanAnkan
 )
 
 
@@ -47,7 +47,7 @@ class TestMediumLegality(unittest.TestCase):
         self.assertFalse(self.game.is_legal(0, Discard(candidate)))
         with self.assertRaises(MediumJong.IllegalMoveException):
             self.game.step(0, Discard(candidate))
-        self.assertIsNone(self.game.last_discarded_tile)
+        self.assertIsNone(self.game._reactable_tile)
 
     def test_legal_discard_by_current_player(self):
         tile = self.game.hand(0)[0]
@@ -162,86 +162,6 @@ class TestMediumLegality(unittest.TestCase):
         with self.assertRaises(MediumJong.IllegalGamePerspective):
             self.assertEqual(game.legal_moves(0), [])
 
-    def test_riichi_locks_discards_to_newly_drawn(self):
-        g = MediumJong([ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.ONE))),
-                        NoReactionPlayer(1),
-                        NoReactionPlayer(2),
-                        NoReactionPlayer(3)])
-        # Player 0 closed tenpai: 234m, 345p, 678m, pair 77p, wait 4-5s on 6s
-        p0 = [
-            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
-            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
-            Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
-            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
-            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
-        ]
-        g._player_hands[0] = p0
-        g.current_player_idx = 0
-        g.last_discarded_tile = None
-        # Prepare a deterministic wall: first draw for P0 (non-winning), then draws for P1..P3, then next draw for P0 (non-winning)
-        first_draw = Tile(Suit.MANZU, TileType.ONE)
-        next_draw = Tile(Suit.MANZU, TileType.NINE)
-        g.tiles = [next_draw, Tile(Suit.PINZU, TileType.ONE), Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.MANZU, TileType.TWO), first_draw]
-        # Player 0 declares riichi; if none proposed, synthesize riichi state via a discard that keeps tenpai
-        g.play_turn()
-        self.assertTrue(g.riichi_declared[0])
-        self.assertTrue(g._next_move_is_action)
-        self.assertEqual(g.current_player_idx, 1)
-
-        for _ in range(3):
-            g.play_turn()
-
-        # back to player 0, has to tsumogiri
-        self.assertEqual(g.current_player_idx, 0)
-        self.assertEqual(len(g.legal_moves(0)), 1)
-
-    def test_postriichi(self):
-        """After riichi and three uneventful turns, P0 must have exactly one legal action in the flat mask.
-
-        We construct a deterministic wall so that:
-        - P0's first draw (right before declaring riichi) is non-winning
-        - P1, P2, P3 each draw and discard uneventfully
-        - P0's next draw is also non-winning
-        Thus, when it returns to P0 in action phase post-riichi, their legal mask should have only one legal move (tsumogiri).
-        """
-        g = MediumJong([ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.ONE))),
-                        NoReactionPlayer(1),
-                        NoReactionPlayer(2),
-                        NoReactionPlayer(3)])
-
-        # Closed tenpai hand for P0; exact composition not critical beyond allowing riichi
-        p0 = [
-            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
-            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
-            Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
-            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
-            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
-        ]
-        g._player_hands[0] = p0
-        g.current_player_idx = 0
-        g.last_discarded_tile = None
-
-        # Deterministic wall: ensure P0's first and next draws are non-winning, and others draw harmless tiles
-        first_draw = Tile(Suit.MANZU, TileType.ONE)
-        next_draw = Tile(Suit.MANZU, TileType.NINE)
-        g.tiles = [next_draw, Tile(Suit.PINZU, TileType.ONE), Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.MANZU, TileType.TWO), first_draw]
-
-        # P0 plays turn and should declare riichi (forced via ForceActionPlayer)
-        g.play_turn()
-        self.assertTrue(g.riichi_declared[0])
-        self.assertEqual(g.current_player_idx, 1)
-
-        # Three uneventful turns for players 1..3
-        for _ in range(3):
-            g.play_turn()
-
-        g._draw_tile()
-        # Back to P0 action phase; compute legal flat mask
-        self.assertEqual(g.current_player_idx, 0)
-        gp = g.get_game_perspective(0)
-        mask = gp.legal_flat_mask()
-        self.assertEqual(sum(mask), 1)
-
 
     def test_riichi_multiple_discard_options_in_tenpai(self):
         # Construct a hand where discarding 2m or 8m both keep tenpai
@@ -283,8 +203,8 @@ class TestMediumLegality(unittest.TestCase):
         g.player_discards[0] = [Tile(Suit.PINZU, TileType.THREE)]
         # Player 1 discards 3p which would complete player 0's hand
         g.current_player_idx = 1
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         g._player_hands[1][0] = Tile(Suit.PINZU, TileType.THREE)
         # Ensure wall is not empty to avoid edge-case behavior at game start
         g.tiles = [Tile(Suit.HONORS, Honor.EAST)]
@@ -308,8 +228,8 @@ class TestMediumLegality(unittest.TestCase):
         g._player_hands[1][0] = Tile(Suit.SOUZU, TileType.FIVE)
         # Make it player 1's action turn
         g.current_player_idx = 1
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         # Kakan should be legal for 5s
         self.assertTrue(g.is_legal(1, KanKakan(Tile(Suit.SOUZU, TileType.FIVE))))
 
@@ -321,8 +241,8 @@ class TestMediumLegality(unittest.TestCase):
         g._player_hands[1][:3] = [Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE)]
         # Make it player 1's action turn
         g.current_player_idx = 1
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         # Kakan should be illegal since there's no existing pon
         self.assertFalse(g.is_legal(1, KanKakan(Tile(Suit.SOUZU, TileType.FIVE))))
 
@@ -341,12 +261,57 @@ class TestMediumLegality(unittest.TestCase):
         g._player_hands[1] = [t for t in g._player_hands[1] if not (t.suit == Suit.SOUZU and t.tile_type == TileType.FIVE)]
         # Make it player 1's action turn
         g.current_player_idx = 1
-        g.last_discarded_tile = None
-        g.last_discard_player = None
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
         # Kakan should be illegal without the fourth copy in hand
         self.assertFalse(g.is_legal(1, KanKakan(Tile(Suit.SOUZU, TileType.FIVE))))
 
 
+
+    def test_action_phase_includes_ankan_riichi_and_discard(self):
+        """In action phase with a closed hand containing a concealed quad,
+        legal moves should simultaneously include Ankan, Riichi, and Discard options.
+
+        This sets a deterministic state:
+        - Player 0 is to act (action state)
+        - Hand has four 5p (ankan candidate)
+        - Hand is closed (no called sets)
+        - last_drawn_tile is set so that legal_moves can surface a Riichi action object
+        We do not assert specific riichi legality by yaku/tenpai here; only that the
+        GamePerspective surfaces Riichi, Ankan, and Discard actions concurrently in this edge setup.
+        """
+        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+
+        # Build a 14-tile closed hand for P0 with a concealed quad of 5p
+        quad_5p = [Tile(Suit.PINZU, TileType.FIVE)] * 4
+        rest = [
+            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.MANZU, TileType.SIX), Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.EIGHT),
+            Tile(Suit.PINZU, TileType.SEVEN),
+        ]
+        # Ensure exactly 14 tiles
+        hand_p0 = quad_5p + rest[:10]
+        self.assertEqual(len(hand_p0), 14)
+        g._player_hands[0] = hand_p0
+        g._player_called_sets[0] = []
+
+        # Action state for player 0, with a defined last_drawn_tile so Riichi object can be formed
+        g.current_player_idx = 0
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
+        g.last_drawn_tile = hand_p0[0]
+
+        # Sanity: not already in riichi
+        g.riichi_declared[0] = False
+
+        moves = g.legal_moves(0)
+        # Expect at least one Discard option
+        self.assertTrue(any(isinstance(m, Discard) for m in moves))
+        # Expect Ankan on 5p available
+        self.assertTrue(any(isinstance(m, KanAnkan) and m.tile == Tile(Suit.PINZU, TileType.FIVE) for m in moves))
+        # Expect a Riichi action object present among legal moves list
+        self.assertTrue(any(isinstance(m, Riichi) for m in moves))
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

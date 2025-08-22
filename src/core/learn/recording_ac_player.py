@@ -6,6 +6,7 @@ import numpy as np
 import random
 from .policy_utils import flat_index_for_action
 from .feature_engineering import encode_game_perspective
+from .data_utils import DebugSnapshot
 
 from ..game import (
     Player,
@@ -40,9 +41,21 @@ class ExperienceBuffer:
 
     def add(self, state_features: Dict[str, Any], action_index: int, reward: float, value: float,
             main_logp: float,
-            main_probs: Optional[List[float]] = None) -> None:
+            main_probs: Optional[List[float]] = None,
+            raw_state: Optional[Any] = None,
+            action_obj: Optional[Any] = None) -> None:
         if action_index < 0:
-            print("ERROR: Illegal move in Experience Buffer", action_index)
+            # Persist illegal move context for debugging via centralized utility
+            DebugSnapshot.save_illegal_move(
+                action_index=int(action_index),
+                game_perspective=raw_state,
+                action_obj=action_obj,
+                encoded_state=state_features,
+                value=float(value),
+                main_logp=float(main_logp),
+                main_probs=list(main_probs) if main_probs is not None else None,
+                reason='illegal_action_index',
+            )
             return
         self.states.append(state_features)
         self.actions.append(int(action_index))
@@ -105,6 +118,8 @@ class RecordingACPlayer(ACPlayer):
             float(value if not self._zero_network_reward else 0.0),
             main_logp=main_logp,
             main_probs=np.exp(log_policy).tolist(),
+            raw_state=game_state,
+            action_obj=move,
         )
         return move
 
@@ -120,6 +135,8 @@ class RecordingACPlayer(ACPlayer):
             float(value if not self._zero_network_reward else 0.0),
             main_logp=main_logp,
             main_probs=np.exp(log_policy).tolist(),
+            raw_state=game_state,
+            action_obj=move,
         )
         return move
 
@@ -160,6 +177,8 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
             0.0,
             main_logp=0.0,
             main_probs=None,
+            raw_state=game_state,
+            action_obj=move,
         )
         return move
 

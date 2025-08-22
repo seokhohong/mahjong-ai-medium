@@ -944,64 +944,35 @@ class GamePerspective:
 
         mask = [0] * TOTAL
 
-        # Tsumo
-        if self.is_legal(Tsumo()):
-            mask[OFF_TSUMO] = 1
-        # Ron
-        if self.can_ron():
-            mask[OFF_RON] = 1
-
-        # Discards
-        seen: set = set()
-        for t in self.player_hand:
-            idx = tile_flat_index(t)
-            if idx in seen:
-                continue
-            seen.add(idx)
-            if self.is_legal(Discard(t)):
-                mask[OFF_DISCARD + idx] = 1
-
-        # Riichi (parameterized by discard tile)
+        # Build mask directly from single source of truth: legal_moves()
         for m in self.legal_moves():
-            if isinstance(m, Riichi):
+            if isinstance(m, Discard):
+                idx = tile_flat_index(m.tile)
+                mask[OFF_DISCARD + idx] = 1
+            elif isinstance(m, Riichi):
                 idx = tile_flat_index(m.tile)
                 mask[OFF_RIICHI + idx] = 1
-
-        # Kakan/Ankan opportunities
-        seen_kakan: set = set()
-        seen_ankan: set = set()
-        for t in self.player_hand:
-            idx = tile_flat_index(t)
-            if idx not in seen_kakan and self.is_legal(KanKakan(t)):
-                mask[OFF_KAKAN + idx] = 1
-                seen_kakan.add(idx)
-            if idx not in seen_ankan and self.is_legal(KanAnkan(t)):
-                mask[OFF_ANKAN + idx] = 1
-                seen_ankan.add(idx)
-
-        # Reaction options: Chi/Pon/KanDaimin/Pass
-        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player != 0:
-            opts = self.get_call_options()
-            # Chi variants
-            for pair in opts.get('chi', []):
-                v = _chi_variant_index(self.last_discarded_tile, pair)
+            elif isinstance(m, Tsumo):
+                mask[OFF_TSUMO] = 1
+            elif isinstance(m, Ron):
+                mask[OFF_RON] = 1
+            elif isinstance(m, Chi):
+                v = _chi_variant_index(self.last_discarded_tile, m.tiles)
                 if 0 <= v <= 2:
-                    # Aka if any of the three tiles is aka
-                    aka = any(t.aka for t in (pair + [self.last_discarded_tile]))
-                    offset = OFF_CHI + v + (3 if aka else 0)
-                    mask[offset] = 1
-            # Pon
-            for pon_pair in opts.get('pon', []):
-                aka = any(t.aka for t in (pon_pair + [self.last_discarded_tile]))
-                if aka:
-                    mask[OFF_PON_AKA] = 1
-                else:
-                    mask[OFF_PON_NOAKA] = 1
-            # Daiminkan
-            if opts.get('kan_daimin'):
+                    aka = any(t.aka for t in (m.tiles + ([self.last_discarded_tile] if self.last_discarded_tile else [])))
+                    mask[OFF_CHI + v + (3 if aka else 0)] = 1
+            elif isinstance(m, Pon):
+                aka = any(t.aka for t in (m.tiles + ([self.last_discarded_tile] if self.last_discarded_tile else [])))
+                mask[OFF_PON_AKA if aka else OFF_PON_NOAKA] = 1
+            elif isinstance(m, KanDaimin):
                 mask[OFF_KAN_DAIMIN] = 1
-            # Pass
-            if self.is_legal(PassCall()):
+            elif isinstance(m, KanKakan):
+                idx = tile_flat_index(m.tile)
+                mask[OFF_KAKAN + idx] = 1
+            elif isinstance(m, KanAnkan):
+                idx = tile_flat_index(m.tile)
+                mask[OFF_ANKAN + idx] = 1
+            elif isinstance(m, PassCall):
                 mask[OFF_PASS] = 1
 
         return mask
@@ -1121,34 +1092,41 @@ class GamePerspective:
                 moves.insert(0, PassCall())
             return moves
 
+    def legal_moves(self) -> List[Union[Action, Reaction]]:
+        moves: List[Union[Action, Reaction]] = []
+        riichi_locked = self.riichi_declared.get(0, False)
+        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player is not None and self.last_discard_player != 0:
+            if self.can_ron():
+                return [PassCall(), Ron()]
+            if riichi_locked:
+                # After Riichi, only Pass or Ron as reactions
+                return [PassCall()]
+            opts = self.get_call_options()
+            any_call = False
+            for ts in opts['pon']:
+                moves.append(Pon(ts)); any_call = True
+            for ts in opts['chi']:
+                moves.append(Chi(ts)); any_call = True
+            for ts in opts['kan_daimin']:
+                moves.append(KanDaimin(ts)); any_call = True
+            if any_call:
+                moves.insert(0, PassCall())
+            return moves
+
         if self.state is Action:
             if self.can_tsumo():
                 moves.append(Tsumo())
             # Riichi declaration
             if not self.riichi_declared.get(0, False) and not self.called_sets.get(0, []):
-                # Propose riichi options per discardable tile that keeps tenpai
-                seen: set = set()
-                for t in self.player_hand:
-                    key = (t.suit.value, int(t.tile_type.value))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    r = Riichi(t)
-                    if self.is_legal(r):
-                        moves.append(r)
+                # Optimized riichi candidates without per-tile is_legal calls
+                from .tenpai import legal_riichi_moves
+                moves.extend(legal_riichi_moves(self.riichi_declared, self.called_sets, self.player_hand))
             # Kakan opportunities
-            for t in self.player_hand:
-                if self.is_legal(KanKakan(t)):
-                    moves.append(KanKakan(t))
+            for t in self.are_legal_kakans():
+                moves.append(KanKakan(t))
             # Ankan opportunities (do not list duplicates)
-            seen: set = set()
-            for t in self.player_hand:
-                key = (t.suit, int(t.tile_type.value))
-                if key in seen:
-                    continue
-                seen.add(key)
-                if self.is_legal(KanAnkan(t)):
-                    moves.append(KanAnkan(t))
+            for t in self.are_legal_ankans():
+                moves.append(KanAnkan(t))
             # Discards
             if riichi_locked:
                 if self.newly_drawn_tile is not None:
@@ -1157,6 +1135,57 @@ class GamePerspective:
                 for t in self.player_hand:
                     moves.append(Discard(t))
         return moves
+
+    def are_legal_kakans(self) -> List[Tile]:
+        """Compute all kakan-capable tiles without calling is_legal repeatedly.
+
+        A kakan is legal if:
+        - We are in Action state (this method is only used there in legal_moves)
+        - The player already has a pon of that tile in `called_sets[0]`
+        - The player holds at least one more tile of the same suit/tile_type in hand
+        Riichi state allows Kan actions, so no extra restriction here.
+        """
+        cs = self.called_sets.get(0, [])
+        if not cs:
+            return []
+        # Collect pon tile keys the player has called
+        pon_keys: set = set()
+        for called in cs:
+            if getattr(called, 'call_type', None) == 'pon' and getattr(called, 'tiles', None):
+                t0 = called.tiles[0]
+                pon_keys.add((t0.suit, t0.tile_type))
+        if not pon_keys:
+            return []
+        # For each pon key, if hand contains at least one matching tile, it's a legal kakan
+        hand = self.player_hand
+        results: List[Tile] = []
+        seen_key: set = set()
+        for t in hand:
+            key = (t.suit, t.tile_type)
+            if key in pon_keys and key not in seen_key:
+                results.append(t)  # representative tile for this kakan
+                seen_key.add(key)
+        return results
+
+    def are_legal_ankans(self) -> List[Tile]:
+        """Compute all ankan-capable tiles without calling is_legal.
+
+        An ankan is legal if there are four tiles of the same suit/tile_type in hand.
+        Return one representative tile per qualifying key.
+        """
+        counts: Dict[Tuple[Suit, Any], int] = {}
+        rep: Dict[Tuple[Suit, Any], Tile] = {}
+        for t in self.player_hand:
+            key = (t.suit, t.tile_type)
+            counts[key] = counts.get(key, 0) + 1
+            # keep the first representative we see
+            if key not in rep:
+                rep[key] = t
+        results: List[Tile] = []
+        for key, cnt in counts.items():
+            if cnt >= 4:
+                results.append(rep[key])
+        return results
 
 
 class Player:
@@ -1210,8 +1239,8 @@ class MediumJong:
         self.loser: Optional[int] = None
         # whether the next step is an action or a reaction
         self._next_move_is_action = True
-        self.last_discarded_tile: Optional[Tile] = None
-        self.last_discard_player: Optional[int] = None
+        self._reactable_tile: Optional[Tile] = None
+        self._owner_of_reactable_tile: Optional[int] = None
         self.last_drawn_tile: Optional[Tile] = None
         # number of copies per tile
         self.tile_copies = tile_copies
@@ -1323,18 +1352,18 @@ class MediumJong:
         called_discards = {rot_idx(pid): list(idxs) for pid, idxs in self.called_discards.items()}
         seat_winds = {rot_idx(pid): wind for pid, wind in self.seat_winds.items()}
         riichi_declared = {rot_idx(pid): val for pid, val in self.riichi_declared.items()}
-        last_discard_player_rel = None if self.last_discard_player is None else rot_idx(self.last_discard_player)
+        last_discard_player_rel = None if self._owner_of_reactable_tile is None else rot_idx(self._owner_of_reactable_tile)
         return GamePerspective(
             player_hand=self._player_hands[player_id],
             remaining_tiles=len(self.tiles),
-            last_discarded_tile=self.last_discarded_tile,
+            last_discarded_tile=self._reactable_tile,
             last_discard_player=last_discard_player_rel,
             called_sets=called_sets,
             player_discards=player_discards,
             called_discards=called_discards,
             state=Action if self._next_move_is_action else Reaction,
             newly_drawn_tile=self.last_drawn_tile,
-            can_call=self.last_discarded_tile is not None and self.last_discard_player is not None and self.last_discard_player != player_id,
+            can_call=self._reactable_tile is not None and self._owner_of_reactable_tile is not None and self._owner_of_reactable_tile != player_id,
             seat_winds=seat_winds,
             round_wind=self.round_wind,
             riichi_declared=riichi_declared,
@@ -1382,15 +1411,15 @@ class MediumJong:
             self.cumulative_points[actor_id] -= 1000
             self._player_hands[actor_id].remove(move.tile)
             self.player_discards[actor_id].append(move.tile)
-            self.last_discarded_tile = move.tile
-            self.last_discard_player = actor_id
+            self._reactable_tile = move.tile
+            self._owner_of_reactable_tile = actor_id
             self.last_discard_was_riichi = True
             self._next_move_is_action = False
         if isinstance(move, Discard):
             self._player_hands[actor_id].remove(move.tile)
             self.player_discards[actor_id].append(move.tile)
-            self.last_discarded_tile = move.tile
-            self.last_discard_player = actor_id
+            self._reactable_tile = move.tile
+            self._owner_of_reactable_tile = actor_id
             # Discard after riichi cancels ippatsu for this player
             if self.riichi_declared.get(actor_id, False):
                 self._cancel_ippatsu_for(actor_id)
@@ -1442,9 +1471,9 @@ class MediumJong:
         if isinstance(move, Pon):
             # Any call cancels ippatsu
             self._on_any_call_side_effects()
-            last = self.last_discarded_tile
+            last = self._reactable_tile
             # Mark the discarder index as called
-            discarder = self.last_discard_player
+            discarder = self._owner_of_reactable_tile
             if discarder is not None:
                 called_idx = len(self.player_discards[discarder]) - 1
                 if called_idx >= 0:
@@ -1458,16 +1487,15 @@ class MediumJong:
                 else:
                     new_hand.append(t)
             self._player_hands[actor_id] = new_hand
-            self._player_called_sets[actor_id].append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(3)], call_type='pon', called_tile=Tile(last.suit, last.tile_type), caller_position=actor_id, source_position=self.last_discard_player))
+            self._player_called_sets[actor_id].append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(3)], call_type='pon', called_tile=Tile(last.suit, last.tile_type), caller_position=actor_id, source_position=self._owner_of_reactable_tile))
             self.current_player_idx = actor_id
-            self._next_move_is_action= True
             self._action()
         if isinstance(move, Chi):
             # Any call cancels ippatsu
             self._on_any_call_side_effects()
-            last = self.last_discarded_tile
+            last = self._reactable_tile
             # Mark the discarder index as called
-            discarder = self.last_discard_player
+            discarder = self._owner_of_reactable_tile
             if discarder is not None:
                 called_idx = len(self.player_discards[discarder]) - 1
                 if called_idx >= 0:
@@ -1483,18 +1511,18 @@ class MediumJong:
                     new_hand.append(h)
                 self._player_hands[actor_id] = new_hand
             seq = sorted([move.tiles[0], last, move.tiles[1]], key=lambda t: int(t.tile_type.value))
-            self._player_called_sets[actor_id].append(CalledSet(tiles=seq, call_type='chi', called_tile=Tile(last.suit, last.tile_type), caller_position=actor_id, source_position=self.last_discard_player))
-            self.last_discarded_tile = None
-            self.last_discard_player = None
+            self._player_called_sets[actor_id].append(CalledSet(tiles=seq, call_type='chi', called_tile=Tile(last.suit, last.tile_type), caller_position=actor_id, source_position=self._owner_of_reactable_tile))
+            self._reactable_tile = None
+            self._owner_of_reactable_tile = None
             self.current_player_idx = actor_id
             self._next_move_is_action = True
             self._action()
         if isinstance(move, KanDaimin):
             # Any call cancels ippatsu
             self._on_any_call_side_effects()
-            last = self.last_discarded_tile
+            last = self._reactable_tile
             # Mark the discarder index as called
-            discarder = self.last_discard_player
+            discarder = self._owner_of_reactable_tile
             if discarder is not None:
                 called_idx = len(self.player_discards[discarder]) - 1
                 if called_idx >= 0:
@@ -1508,32 +1536,35 @@ class MediumJong:
                 else:
                     new_hand.append(t)
             self._player_hands[actor_id] = new_hand
-            self._player_called_sets[actor_id].append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(4)], call_type='kan_daimin', called_tile=Tile(last.suit, last.tile_type), caller_position=actor_id, source_position=self.last_discard_player))
-            self.last_discarded_tile = None
-            self.last_discard_player = None
+            self._player_called_sets[actor_id].append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(4)], call_type='kan_daimin', called_tile=Tile(last.suit, last.tile_type), caller_position=actor_id, source_position=self._owner_of_reactable_tile))
+            self._reactable_tile = None
+            self._owner_of_reactable_tile = None
             self.current_player_idx = actor_id
             self._skip_draw_for_current = True
-            self._add_kan_dora()
 
     # performs exactly one action or reaction without triggering additional ones
     # useful if we want to say, discard and then return before the other 3 players have a chance to react
     def step(self, actor_id: int, move: Union[Action, Reaction]):
         if not self.is_legal(actor_id, move):
             gp = self.get_game_perspective(actor_id)
-            print(gp, move)
-            # Attempt to dump debug info to a pickle file
+            # Use centralized debug snapshot utility for illegal move exports
             try:
-                os.makedirs("illegal_moves", exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                fname = os.path.join("illegal_moves", f"illegal_{ts}.pkl")
-                with open(fname, "wb") as f:
-                    pickle.dump({
-                        "actor_id": actor_id,
-                        "perspective": gp,
-                        "move": move,
-                        "game": self,
-                    }, f, protocol=pickle.HIGHEST_PROTOCOL)
-                print(f"[MediumJong] Illegal move dump written to {fname}")
+                from .learn.data_utils import DebugSnapshot
+                path = DebugSnapshot.save_illegal_move(
+                    action_index=None,
+                    game_perspective=gp,
+                    action_obj=move,
+                    encoded_state=None,
+                    value=None,
+                    main_logp=None,
+                    main_probs=None,
+                    reason='illegal_move_in_game_step',
+                    out_dir=None,
+                )
+                if path:
+                    print(f"[MediumJong] Illegal move dump written to {path}")
+                else:
+                    print("[MediumJong] Failed to write illegal move dump")
             except Exception as e:
                 print(f"[MediumJong] Failed to write illegal move dump: {e}")
             raise MediumJong.IllegalMoveException("Illegal move")
@@ -1553,20 +1584,36 @@ class MediumJong:
 
         self._draw_tile()
         self._action()
+        # we assume all reactions are resolved here (if they weren't, we recursed)
+        self._resolve_reactions()
         self.current_player_idx = (self.current_player_idx + 1) % 4
 
+    def is_reactable(self):
+        return self._reactable_tile is not None
+
+    def reactable_tile(self):
+        return self._reactable_tile
+
+    def owner_of_reactable_tile(self):
+        return self._owner_of_reactable_tile
+
+    def _resolve_reactions(self):
+        # we already handled reactions
+        self._reactable_tile = None
+        self._next_move_is_action = True
+        self._owner_of_reactable_tile = None
+
     def _action(self) -> None:
+        # we call this here because _poll_reactions can recurse on action
+        self._resolve_reactions()
         action = self.players[self.current_player_idx].play(self.get_game_perspective(self.current_player_idx))
         self.step(self.current_player_idx, action)
         # Resolve reactions if any
-        if self.last_discarded_tile is not None:
-            self._resolve_reactions()
-            # we already handled reactions
-            self.last_discarded_tile = None
-            self._next_move_is_action = True
+        if self.is_reactable():
+            self._poll_reactions()
 
-    def _resolve_reactions(self) -> None:
-        discarder = self.last_discard_player
+    def _poll_reactions(self) -> None:
+        discarder = self._owner_of_reactable_tile
         # Gather options/choices
         choices: Dict[int, Reaction] = {}
         can_ron: Dict[int, bool] = {}
@@ -1605,7 +1652,7 @@ class MediumJong:
 
     def _on_win(self, winner_id: int, win_by_tsumo: bool) -> None:
         self.winners = [winner_id]
-        self.loser = None if win_by_tsumo else self.last_discard_player
+        self.loser = None if win_by_tsumo else self._owner_of_reactable_tile
         self.game_over = True
         # Populate per-player points for this outcome
         deltas = [0, 0, 0, 0]
@@ -1664,7 +1711,7 @@ class MediumJong:
         self.game_over = True
         deltas = [0, 0, 0, 0]
         # Ensure loser context for scoring
-        self.last_discard_player = discarder
+        self._owner_of_reactable_tile = discarder
         # Award riichi sticks only to the first winner per rule; order already set
         for idx, w in enumerate(winner_ids):
             score = self._score_hand(w, win_by_tsumo=False)

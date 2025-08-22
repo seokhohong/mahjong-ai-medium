@@ -7,7 +7,7 @@ from core import game
 from core.constants import (
     MAX_CALLS as MAX_CALLED_SETS,
     MAX_CALLED_SET_SIZE as MAX_TILES_PER_CALLED_SET,
-    MAX_DISCARDS_PER_PLAYER,
+    MAX_DISCARDS_PER_PLAYER, NUM_PLAYERS,
 )
 from core.game import GamePerspective, Tile, Suit, TileType, Honor, CalledSet
 
@@ -92,16 +92,22 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
     """
     # Hand
     hand_tiles = list(gp.player_hand)
-    # Determine if we're in the acting state
-    state_is_action = bool(getattr(gp, 'state', None) and (gp.state is type(gp).Action if hasattr(gp, 'Action') else getattr(gp.state, '__name__', '') == 'Action'))
+    # Determine if we're in the acting state (GamePerspective.state is a class from core.game)
+    state_is_action = (getattr(gp, 'state', None) is not None) and (
+        gp.state is game.Action or getattr(gp.state, '__name__', '') == 'Action'
+    )
     hand_vals: List[int] = [tile_to_index(t) for t in hand_tiles]
 
     # Always output fixed-size arrays; it is possible to have a 14-tile hand in the action state
-    hand_idx = np.concat([hand_vals, np.full((MAX_HAND_LEN + 1 - len(hand_vals),), PAD_IDX, dtype=np.int32)])
+    pad_len = (MAX_HAND_LEN + 1) - len(hand_vals)
+    if pad_len < 0:
+        hand_vals = hand_vals[:MAX_HAND_LEN + 1]
+        pad_len = 0
+    hand_idx = np.concatenate([np.asarray(hand_vals, dtype=np.int32), np.full((pad_len,), PAD_IDX, dtype=np.int32)])
 
     # Called tiles per player structured as (sets x tiles-per-set)
     called_rows: List[np.ndarray] = []
-    for pid in range(4):
+    for pid in range(NUM_PLAYERS):
         sets = gp.called_sets.get(pid, [])
         set_mats: List[np.ndarray] = []
         for si in range(MAX_CALLED_SETS):
@@ -118,7 +124,7 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
 
     # Discards per player
     disc_rows: List[np.ndarray] = []
-    for pid in range(4):
+    for pid in range(NUM_PLAYERS):
         tiles = gp.player_discards.get(pid, [])[:MAX_DISCARDS_PER_PLAYER]
         vals = [tile_to_index(t) for t in tiles]
         if len(vals) < MAX_DISCARDS_PER_PLAYER:
@@ -131,7 +137,7 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
 
     # Called discards mask per player aligned to disc_idx length
     called_discards_rows: List[np.ndarray] = []
-    for pid in range(4):
+    for pid in range(NUM_PLAYERS):
         mask = np.zeros((MAX_DISCARDS_PER_PLAYER,), dtype=np.int32)
         idxs = gp.called_discards.get(pid, []) if hasattr(gp, 'called_discards') else []
         for j in idxs:

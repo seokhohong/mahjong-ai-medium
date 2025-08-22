@@ -3,6 +3,7 @@ import pickle
 import sys
 from typing import Any
 from pathlib import Path
+import numpy as np
 
 
 def _ensure_src_importable() -> None:

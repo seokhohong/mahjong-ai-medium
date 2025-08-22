@@ -41,6 +41,8 @@ class ACDataset(Dataset):
             returns[neg_mask] = returns[neg_mask] * nrw
             advantages[neg_mask] = advantages[neg_mask] * nrw
         self.returns = returns
+        # scale advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         self.advantages = advantages
         self.old_log_probs = data['old_log_probs'].astype(np.float32)
 
@@ -135,6 +137,7 @@ def _compute_losses(
     epsilon: float = 0.2,
     value_coeff: float = 0.5,
     entropy_coeff: float = 0.01,
+    print_debug: bool = False,
 ):
     pp, val = model(hand.float(), calls.float(), disc.float(), gsv.float())
     val = val.squeeze(1)
@@ -155,6 +158,10 @@ def _compute_losses(
     value_loss = F.mse_loss(val.view_as(returns), returns)
     entropy_loss = -(pp * (pp.clamp_min(1e-8).log())).sum(dim=1).mean()
     total = policy_loss + value_coeff * value_loss + entropy_coeff * entropy_loss
+    if print_debug:
+        print(f"\nRatio stats: mean={ratio.mean():.4f}, std={ratio.std():.4f}")
+        print(f"Advantage stats: mean={advantages.mean():.6f}, std={advantages.std():.6f}")
+        print(f"Fraction clipped: {((ratio < (1 - epsilon)) | (ratio > (1 + epsilon))).float().mean():.3f}")
     return total, policy_loss, value_loss, batch_size_curr
 
 
@@ -167,7 +174,6 @@ def train_ppo(
     value_coeff: float = 0.5,
     entropy_coeff: float = 0.01,
     device: str | None = None,
-    patience: int = 0,
     min_delta: float = 1e-4,
     val_split: float = 0.1,
     init_model: str | None = None,
@@ -177,6 +183,7 @@ def train_ppo(
     hidden_size: int = 128,
     embedding_dim: int = 16,
     negative_reward_weight: float = 1.0,
+    kl_threshold: float = 0.008
 ) -> str:
     dev = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
@@ -268,7 +275,7 @@ def train_ppo(
                     returns,
                 ) = _prepare_batch_tensors(batch, dev)
 
-                loss, policy_loss, value_loss, _ = _compute_losses(
+                loss, policy_loss, value_loss, _= _compute_losses(
                     model,
                     hand, calls, disc, gsv,
                     flat_idx,
@@ -359,6 +366,8 @@ def train_ppo(
     best_loss = math.inf
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     epochs_no_improve = 0
+    # Store previous epoch's validation policy probabilities to compute KL(prev || curr)
+    prev_val_policy_probs: torch.Tensor | None = None
     for epoch in range(epochs):
         total_loss = 0.0
         total_examples = 0
@@ -366,7 +375,7 @@ def train_ppo(
         total_value_loss = 0.0
         total_policy_loss_main = 0.0
         progress = tqdm(dl, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
-        for batch in progress:
+        for bi, batch in enumerate(progress):
             tensors = _prepare_batch_tensors(batch, dev)
             (
                 hand, calls, disc, gsv,
@@ -375,6 +384,8 @@ def train_ppo(
                 advantages, returns,
             ) = tensors
 
+            # Print PPO debugging once per epoch at the last training step
+            last_step = (bi == (len(dl) - 1))
             total, policy_loss, value_loss, batch_size_curr = _compute_losses(
                 model, hand, calls, disc, gsv,
                 flat_idx,
@@ -383,6 +394,7 @@ def train_ppo(
                 epsilon=epsilon,
                 value_coeff=value_coeff,
                 entropy_coeff=entropy_coeff,
+                print_debug=last_step,
             )
 
             opt.zero_grad()
@@ -400,7 +412,7 @@ def train_ppo(
             progress.set_postfix(
                 loss=f"{float(total.item()):.4f}",
                 pol=f"{float(policy_loss.item()):.4f}",
-                val=f"{float(value_loss.item()):.4f}",
+                val=f"{float(value_loss.item()):.4f}"
             )
 
         # Evaluate on holdout set
@@ -409,6 +421,10 @@ def train_ppo(
             val_total = val_pol = val_val = 0.0
             val_pol_main = 0.0
             val_count = 0
+            # KL(prev || curr) across validation set (available from epoch >= 1)
+            val_kl_prev_curr_sum = 0.0
+            offset = 0
+            curr_probs_chunks: list[torch.Tensor] = []
             with torch.no_grad():
                 for vb in dl_val:
                     tensors = _prepare_batch_tensors(vb, dev)
@@ -432,6 +448,19 @@ def train_ppo(
                     val_pol += float(policy_loss_v.item()) * bsz
                     val_val += float(value_loss_v.item()) * bsz
                     val_pol_main += float(policy_loss_v.item()) * bsz
+                    # Collect current policy probabilities for this batch
+                    pp_curr, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                    curr_probs_chunks.append(pp_curr.detach().cpu())
+                    # If previous epoch's probs are available, compute KL(prev || curr)
+                    if prev_val_policy_probs is not None:
+                        prev_slice = prev_val_policy_probs[offset:offset+bsz, :]
+                        # Numerical stability
+                        prev_safe = prev_slice.clamp_min(1e-8)
+                        curr_safe = pp_curr.clamp_min(1e-8)
+                        # KL(prev||curr) per sample, then mean
+                        kl_batch = (prev_safe * (prev_safe.log() - curr_safe.detach().cpu().log())).sum(dim=1)
+                        val_kl_prev_curr_sum += float(kl_batch.mean().item()) * bsz
+                    offset += bsz
                     
                     val_count += bsz
             vden = max(1, val_count)
@@ -439,31 +468,25 @@ def train_ppo(
             v_avg_pol = val_pol / vden
             v_avg_val = val_val / vden
             v_avg_pol_main = val_pol_main / vden
+            # Finalize current epoch's concatenated validation probs for next epoch
+            curr_val_policy_probs = torch.cat(curr_probs_chunks, dim=0) if curr_probs_chunks else None
+            # Compute KL(prev||curr) average if prev exists; otherwise mark as None
+            v_avg_kl_prev_curr = (val_kl_prev_curr_sum / vden) if (prev_val_policy_probs is not None and vden > 0) else None
             print(
                 f"\nEpoch {epoch+1}/{epochs} [val] - total: {v_avg:.4f} | policy: {v_avg_pol:.4f} | value: {v_avg_val:.4f}"
+                + (f" | kl(prev||curr): {v_avg_kl_prev_curr:.4f}" if v_avg_kl_prev_curr is not None else " | kl(prev||curr): N/A")
             )
+            # Update previous epoch validation policy probabilities for next epoch
+            if curr_val_policy_probs is not None:
+                prev_val_policy_probs = curr_val_policy_probs
             model.train()
 
-        # Early stopping on total loss (only when validation split is used)
+        # Early stopping
         if dl_val is not None:
-            if v_avg < best_loss - float(min_delta):
-                best_loss = v_avg
-                epochs_no_improve = 0
-                # Save best checkpoint
-                out_dir = os.path.join(os.path.dirname(__file__), '..', 'models')
-                os.makedirs(out_dir, exist_ok=True)
-
-                # Create best model directory
-                best_dir = os.path.join(out_dir, f'ac_ppo_best_{timestamp}')
-                os.makedirs(best_dir, exist_ok=True)
-
-                # Save model weights (state_dict) for portability
-                net.save_model(os.path.join(best_dir, 'model.pt'), save_entire_module=False)
-
-            else:
-                epochs_no_improve += 1
-                if 0 < patience <= epochs_no_improve:
-                    print(f"Early stopping triggered (patience={patience}, min_delta={min_delta})")
+            # Prefer KL-based early stopping if threshold is provided and KL is available (epoch >= 1)
+            if kl_threshold is not None and v_avg_kl_prev_curr is not None:
+                if v_avg_kl_prev_curr <= float(kl_threshold):
+                    print(f"Early stopping triggered: KL(prev||curr) {v_avg_kl_prev_curr:.6f} <= threshold {float(kl_threshold):.6f}")
                     break
 
     # Save trained weights and scaler
@@ -483,7 +506,6 @@ def train_ppo(
     scaler_path = os.path.join(model_dir, 'scaler.pkl')
     with open(scaler_path, 'wb') as f:
         pickle.dump(player.gsv_scaler, f)
-    print(f"Saved StandardScaler to {scaler_path}")
 
     print(f"Saved PPO model and scaler to {model_dir}")
     return model_path
@@ -498,8 +520,9 @@ def main():
     ap.add_argument('--epsilon', type=float, default=0.2)
     ap.add_argument('--value_coeff', type=float, default=0.5)
     ap.add_argument('--entropy_coeff', type=float, default=0.01)
-    ap.add_argument('--patience', type=int, default=0, help='Early stopping patience (0 disables)')
-    ap.add_argument('--min_delta', type=float, default=1e-4, help='Minimum improvement in val loss to reset patience')
+    ap.add_argument('--patience', type=int, default=0, help='Early stopping patience (used only if --kl_threshold is not set)')
+    ap.add_argument('--min_delta', type=float, default=1e-4, help='Minimum improvement in val loss to reset patience (used only if --kl_threshold is not set)')
+    ap.add_argument('--kl_threshold', type=float, default=None, help='Early stop when KL(prev||curr) on validation <= this threshold (epoch >= 1)')
     ap.add_argument('--init', type=str, default=None, help='Path to initial AC model weights/module to load')
     ap.add_argument('--warm_up_acc', type=float, default=0.0, help='Accuracy threshold to reach with behavior cloning before switching to PPO (0 disables)')
     ap.add_argument('--warm_up_max_epochs', type=int, default=50, help='Maximum warm-up epochs before switching even if threshold not reached')
@@ -516,7 +539,6 @@ def main():
         epsilon=args.epsilon,
         value_coeff=args.value_coeff,
         entropy_coeff=args.entropy_coeff,
-        patience=args.patience,
         min_delta=float(args.min_delta),
         init_model=args.init,
         warm_up_acc=args.warm_up_acc,
@@ -524,6 +546,7 @@ def main():
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
         negative_reward_weight=float(max(0.0, args.negative_reward_weight)),
+        kl_threshold=args.kl_threshold,
     )
 
 

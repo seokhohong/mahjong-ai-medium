@@ -3,8 +3,10 @@ Data loading utilities for AC learning.
 """
 from __future__ import annotations
 
+import os
 import pickle
-from typing import Any, Dict, Callable
+from datetime import datetime
+from typing import Any, Dict, Callable, Optional
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
@@ -117,3 +119,61 @@ def make_npz_state_row_getter(data: Any) -> Callable[[int], Dict[str, Any]]:
         )
 
     return _get
+
+
+class DebugSnapshot:
+    """Utilities to persist debug snapshots such as illegal moves.
+
+    By default, saves to the repository's root `illegal_moves/` directory.
+    """
+
+    @staticmethod
+    def _default_out_dir() -> str:
+        # __file__ is src/core/learn/data_utils.py -> go four levels up to repo root
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')
+        )
+        return os.path.join(repo_root, 'illegal_moves')
+
+    @staticmethod
+    def save_illegal_move(
+        *,
+        action_index: Optional[int] = None,
+        game_perspective: Optional[Any] = None,
+        action_obj: Optional[Any] = None,
+        encoded_state: Optional[Dict[str, Any]] = None,
+        value: Optional[float] = None,
+        main_logp: Optional[float] = None,
+        main_probs: Optional[list] = None,
+        reason: str = 'illegal_action_index',
+        out_dir: Optional[str] = None,
+    ) -> Optional[str]:
+        """Serialize an illegal move snapshot to a .pkl file.
+
+        Returns the file path on success; None on failure.
+        """
+        try:
+            target_dir = out_dir or DebugSnapshot._default_out_dir()
+            os.makedirs(target_dir, exist_ok=True)
+
+            payload = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'reason': reason,
+                'action_index': (int(action_index) if action_index is not None else None),
+                'game_perspective': game_perspective,
+                'action_obj': action_obj,
+                'encoded_state': encoded_state,
+                'value': (float(value) if value is not None else None),
+                'main_logp': (float(main_logp) if main_logp is not None else None),
+                'main_probs': list(main_probs) if main_probs is not None else None,
+            }
+            idx_part = str(action_index) if action_index is not None else 'NA'
+            fname = f"illegal_move_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.pkl"
+            fpath = os.path.join(target_dir, fname)
+            with open(fpath, 'wb') as f:
+                pickle.dump(payload, f)
+            print(f"[DebugSnapshot] Saved illegal move to {fpath}")
+            return fpath
+        except Exception as e:
+            print("[DebugSnapshot] Failed to save illegal move:", e)
+            return None

@@ -11,7 +11,8 @@ from core.heuristics_player import MediumHeuristicsPlayer
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.game import MediumJong, Player, GamePerspective, Reaction  # type: ignore
+from core.game import MediumJong, Player, GamePerspective  # type: ignore
+from core.action import Reaction
 from core.tile import Tile
 from core.learn.ac_player import ACPlayer  # type: ignore
 
@@ -24,9 +25,9 @@ class PlayalongACPlayer(ACPlayer):
     Tracks cumulative accuracy across all decisions made so far.
     """
 
-    def __init__(self, player_id: int, *args, **kwargs) -> None:
-        super().__init__(player_id, *args, **kwargs)
-        self._baseline = MediumHeuristicsPlayer(player_id)
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._baseline = MediumHeuristicsPlayer()
         self._total_decisions: int = 0
         self._correct_decisions: int = 0
 
@@ -41,7 +42,7 @@ class PlayalongACPlayer(ACPlayer):
         if self._moves_equal(chosen_move, baseline_move):
             self._correct_decisions += 1
 
-    def _record_reaction_accuracy(self, gs: GamePerspective, options: Dict[str, List[List[Tile]]], chosen_move: Any) -> None:
+    def _record_reaction_accuracy(self, gs: GamePerspective, options: List[Reaction], chosen_move: Any) -> None:
         try:
             baseline_move = self._baseline.choose_reaction(gs, options)
         except Exception:
@@ -63,7 +64,7 @@ class PlayalongACPlayer(ACPlayer):
         self._record_accuracy(game_state, move)
         return move
 
-    def choose_reaction(self, game_state: GamePerspective, options: Dict[str, List[List[Tile]]]) -> Reaction:
+    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
         move = self.compute_play(game_state)[0]
         self._record_reaction_accuracy(game_state, options, move)
         return move
@@ -85,14 +86,14 @@ def run_playalong(num_games: int, model_dir: Optional[str], temperature: float) 
     """
     # Build our playalong AC player (from model if provided, else default)
     if model_dir:
-        base_ac: ACPlayer = ACPlayer.from_directory(model_dir, player_id=0, temperature=temperature)
-        pac = PlayalongACPlayer(player_id=0, network=base_ac.network, gsv_scaler=base_ac.gsv_scaler, temperature=temperature)
+        base_ac: ACPlayer = ACPlayer.from_directory(model_dir, temperature=temperature)
+        pac = PlayalongACPlayer(network=base_ac.network, gsv_scaler=base_ac.gsv_scaler, temperature=temperature)
     else:
-        base_ac = ACPlayer.default(player_id=0, temperature=temperature)
-        pac = PlayalongACPlayer(player_id=0, network=base_ac.network, gsv_scaler=base_ac.gsv_scaler, temperature=temperature)
+        base_ac = ACPlayer.default(temperature=temperature)
+        pac = PlayalongACPlayer(network=base_ac.network, gsv_scaler=base_ac.gsv_scaler, temperature=temperature)
 
     for _ in range(max(1, int(num_games))):
-        players: List[Player] = [pac] + [Player(i) for i in range(1, 4)]
+        players: List[Player] = [pac] + [Player() for _ in range(3)]
         game = MediumJong(players)
         game.play_round()
 

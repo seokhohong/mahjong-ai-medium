@@ -164,8 +164,8 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
     can_tsumo_flag = 1 if gp.can_tsumo() else 0
     game_state_list: List[int] = [
         int(gp.remaining_tiles),
-        int(tile_idx_or_zero(gp.last_discarded_tile)),
-        -1 if gp.last_discard_player is None else int(gp.last_discard_player),
+        int(tile_idx_or_zero(gp._reactable_tile)),
+        -1 if gp._owner_of_reactable_tile is None else int(gp._owner_of_reactable_tile),
         int(1 if gp.state is type(gp).Action else 0) if hasattr(gp, 'Action') else int(1 if gp.state.__name__ == 'Action' else 0),
         int(gp.can_call),
         int(tile_idx_or_zero(gp.newly_drawn_tile)),

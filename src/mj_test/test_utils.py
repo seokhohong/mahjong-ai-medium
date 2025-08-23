@@ -1,12 +1,13 @@
 from typing import Dict, List
 
-from core.game import Discard, Player, GamePerspective, Reaction, Action, PassCall
+from core.game import Player, GamePerspective
+from core.action import Discard, Reaction, Action, PassCall
 from core.tile import Tile, Suit, TileType, Honor
 
 
 class ForceDiscardPlayer(Player):
-    def __init__(self, pid, target: Tile):
-        super().__init__(pid)
+    def __init__(self, target: Tile):
+        super().__init__()
         self.target = target
 
     def play(self, gs):  # type: ignore[override]
@@ -16,8 +17,8 @@ class ForceDiscardPlayer(Player):
 
 
 class ForceActionPlayer(Player):
-    def __init__(self, pid, action: Action):
-        super().__init__(pid)
+    def __init__(self, action: Action):
+        super().__init__()
         self.action = action
 
     def play(self, gs):  # type: ignore[override]
@@ -26,10 +27,10 @@ class ForceActionPlayer(Player):
         return super().play(gs)
 
 class NoReactionPlayer(Player):
-    def __init__(self, pid):
-        super().__init__(pid)
+    def __init__(self):
+        super().__init__()
 
-    def choose_reaction(self, game_state: GamePerspective, options: Dict[str, List[List[Tile]]]) -> Reaction:  # type: ignore[override]
+    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:  # type: ignore[override]
         return PassCall()
 
 

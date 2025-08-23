@@ -23,7 +23,9 @@ from ..game import (
 from .ac_network import ACNetwork
 from ..game import MediumJong
 from .ac_constants import chi_variant_index
-from .policy_utils import build_move_from_flat
+from .policy_utils import (
+    build_move_from_two_head
+)
 
 
 class ACPlayer(Player):
@@ -37,9 +39,9 @@ class ACPlayer(Player):
     No decision needs both a tile and a chi-range simultaneously.
     """
 
-    def __init__(self, player_id: int, network: Any, gsv_scaler: StandardScaler | None = None,
+    def __init__(self, network: Any, gsv_scaler: StandardScaler | None = None,
                  temperature: float = 1.0):
-        super().__init__(player_id)
+        super().__init__()
         self.network = network
         self.temperature = max(1e-6, float(temperature))
         self.gsv_scaler = gsv_scaler
@@ -47,7 +49,6 @@ class ACPlayer(Player):
     @classmethod
     def default(
         cls,
-        player_id: int = 0,
         *,
         temperature: float = 1.0,
         hidden_size: int = 128,
@@ -69,7 +70,7 @@ class ACPlayer(Player):
             embedding_dim=embedding_dim,
             temperature=network_temperature,
         )
-        return cls(player_id=player_id, network=network, gsv_scaler=gsv_scaler, temperature=temperature)
+        return cls(network=network, gsv_scaler=gsv_scaler, temperature=temperature)
 
     def _mask_to_indices(self, mask: np.ndarray) -> List[int]:
         return [i for i, ok in enumerate(mask) if ok]
@@ -111,42 +112,51 @@ class ACPlayer(Player):
         return eff
 
 
-    # --- Core selection ---
-    def compute_play(self, gs: GamePerspective) -> Tuple[Any, float, np.ndarray]:
-        """Evaluate once and return (move, value, log_policy) over 25 actions."""
-        policy, value = self.network.evaluate(gs)
-        flat = np.asarray(policy, dtype=np.float64)
-        mask = gs.legal_flat_mask_np()
-        eff_policy = self._temper_and_mask(flat, mask)
-        # Sample according to temperature-adjusted policy over legal actions
-        sum_prob = float(eff_policy.sum())
+    # --- Core selection (two-head) ---
+    def compute_play(self, gs: GamePerspective) -> Tuple[Any, float, int, int, float, float]:
+        """Evaluate once and return (move, value, action_idx, tile_idx, logp_action, logp_tile)."""
+        a_probs, t_probs, value = self.network.evaluate(gs)
+        a_probs = np.asarray(a_probs, dtype=np.float64)
+        t_probs = np.asarray(t_probs, dtype=np.float64)
 
-        # Normalize explicitly to avoid tiny drift
-        p = eff_policy / sum_prob
-        idxs = np.arange(p.size)
-        move = int(np.random.choice(idxs, p=p))
+        # Action head selection with legality mask
+        a_mask = gs.legal_action_mask()
+        eff_a = self._temper_and_mask(a_probs, a_mask)
+        sum_a = float(max(1e-12, eff_a.sum()))
+        pa = eff_a / sum_a
+        action_idx = int(np.random.choice(np.arange(pa.size), p=pa))
 
-        # Avoid log(0) by clipping for logging
-        log_policy = np.log(np.clip(eff_policy, 1e-12, None))
-        if not gs.is_legal(build_move_from_flat(gs, int(move))):
+        # Tile head selection conditioned on chosen action
+        t_mask = gs.legal_tile_mask(action_idx)
+        eff_t = self._temper_and_mask(t_probs, t_mask)
+        sum_t = float(max(1e-12, eff_t.sum()))
+        pt = eff_t / sum_t
+        tile_idx = int(np.random.choice(np.arange(pt.size), p=pt))
+
+        # Log-probs for chosen heads
+        logp_action = float(np.log(max(1e-12, eff_a[action_idx])))
+        logp_tile = float(np.log(max(1e-12, eff_t[tile_idx])))
+
+        move = build_move_from_two_head(gs, action_idx, tile_idx)
+        if not gs.is_legal(move):
             DebugSnapshot.save_illegal_move(
-                action_index=move,
-                action_obj = build_move_from_flat(gs, int(move)),
+                action_index=(action_idx, tile_idx),
+                action_obj=move,
                 game_perspective=gs
             )
-        return build_move_from_flat(gs, int(move)), float(value), log_policy
+        return move, float(value), action_idx, tile_idx, logp_action, logp_tile
+
 
     def _select_action(self, gs: GamePerspective) -> Optional[Any]:
-        move, _, _ = self.compute_play(gs)
+        move, *_ = self.compute_play(gs)
         return move
 
     @classmethod
-    def from_directory(cls, model_dir: str, player_id: int = 0, temperature: float = 1.0) -> Self:
+    def from_directory(cls, model_dir: str, temperature: float = 1.0) -> Self:
         """Load an ACPlayer from a directory containing model.pt and scaler.pkl files.
 
         Args:
             model_dir: Path to directory containing model.pt and scaler.pkl
-            player_id: Player ID for the ACPlayer
             temperature: Temperature for action selection
 
         Returns:
@@ -228,7 +238,8 @@ class ACPlayer(Player):
                 raise ValueError(f"Failed to load model from {model_path}: {e2}")
 
         # Create and return ACPlayer; attach loaded scaler so downstream save routines can persist it
-        return cls(player_id=player_id, network=network, gsv_scaler=gsv_scaler, temperature=temperature)
+        return cls(network=network, gsv_scaler=gsv_scaler,
+                   temperature=temperature)
 
     # Example usage:
     # # Load a trained ACPlayer from a model directory
@@ -241,7 +252,7 @@ class ACPlayer(Player):
     def play(self, game_state: GamePerspective):
         return self.compute_play(game_state)[0]
 
-    def choose_reaction(self, game_state: GamePerspective, options: Dict[str, List[List[Tile]]]) -> Reaction:
+    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
         return self.compute_play(game_state)[0]
 
 

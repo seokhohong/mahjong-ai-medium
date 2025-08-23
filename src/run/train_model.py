@@ -17,34 +17,30 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm  # type: ignore
 
-from core.learn import ACPlayer
+from core.learn.ac_player import ACPlayer
 from core.learn.ac_network import ACNetwork
 from sklearn.preprocessing import StandardScaler  # type: ignore
 
 # not using called discards yet
 class ACDataset(Dataset):
-    def __init__(self, npz_path: str, net: ACNetwork, *, negative_reward_weight: float = 1.0):
+    def __init__(self, npz_path: str, net: ACNetwork):
         data = np.load(npz_path, allow_pickle=True)
         # New compact format fields
         hand_arr = data['hand_idx']
         disc_arr = data['disc_idx']
         called_arr = data['called_idx']
         gsv_arr = data['game_state']
-        self.flat_idx = data['flat_idx']
-        # Load returns/advantages and apply optional negative reward weight transform
+        self.action_idx = data['action_idx']
+        self.tile_idx = data['tile_idx']
+        # Load returns/advantages
         returns = data['returns'].astype(np.float32)
         advantages = data['advantages'].astype(np.float32)
-        nrw = float(max(0.0, negative_reward_weight))
-        if nrw != 1.0:
-            # Scale only negative returns; positives unchanged
-            neg_mask = returns < 0
-            returns[neg_mask] = returns[neg_mask] * nrw
-            advantages[neg_mask] = advantages[neg_mask] * nrw
         self.returns = returns
         # scale advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         self.advantages = advantages
-        self.old_log_probs = data['old_log_probs'].astype(np.float32)
+        self.action_old_log_probs = data['action_log_probs'].astype(np.float32)
+        self.tile_old_log_probs = data['tile_log_probs'].astype(np.float32)
 
         # fit the standard scaler so we can properly use extract_features
         net.fit_scaler(gsv_arr)
@@ -80,10 +76,12 @@ class ACDataset(Dataset):
             'calls': self.calls[idx],
             'disc': self.disc[idx],
             'gsv': self.gsv[idx],
-            'flat_idx': int(self.flat_idx[idx]),
+            'action_idx': int(self.action_idx[idx]),
+            'tile_idx': int(self.tile_idx[idx]),
             'return': float(self.returns[idx]),
             'advantage': float(self.advantages[idx]),
-            'old_log_prob': float(self.old_log_probs[idx]),
+            'action_old_log_prob': float(self.action_old_log_probs[idx]),
+            'tile_old_log_prob': float(self.tile_old_log_probs[idx]),
         }
 
 
@@ -110,14 +108,16 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
     calls = torch.from_numpy(np.stack(batch['calls'])).to(dev)
     disc = torch.from_numpy(np.stack(batch['disc'])).to(dev)
     gsv = torch.from_numpy(np.stack(batch['gsv'])).to(dev)
-    flat_idx = torch.tensor(batch['flat_idx'], dtype=torch.long, device=dev)
-    old_log_probs = torch.tensor(batch['old_log_prob'], dtype=torch.float32, device=dev)
+    action_idx = torch.tensor(batch['action_idx'], dtype=torch.long, device=dev)
+    tile_idx = torch.tensor(batch['tile_idx'], dtype=torch.long, device=dev)
+    action_old_log_probs = torch.tensor(batch['action_old_log_prob'], dtype=torch.float32, device=dev)
+    tile_old_log_probs = torch.tensor(batch['tile_old_log_prob'], dtype=torch.float32, device=dev)
     advantages = torch.tensor(batch['advantage'], dtype=torch.float32, device=dev)
     returns = torch.tensor(batch['return'], dtype=torch.float32, device=dev)
     return (
         hand, calls, disc, gsv,
-        flat_idx,
-        old_log_probs,
+        action_idx, tile_idx,
+        action_old_log_probs, tile_old_log_probs,
         advantages, returns,
     )
 
@@ -128,40 +128,55 @@ def _compute_losses(
     calls: torch.Tensor,
     disc: torch.Tensor,
     gsv: torch.Tensor,
-    flat_idx: torch.Tensor,
-    old_log_probs: torch.Tensor,
+    action_idx: torch.Tensor,
+    tile_idx: torch.Tensor,
+    action_old_log_probs: torch.Tensor,
+    tile_old_log_probs: torch.Tensor,
     advantages: torch.Tensor,
     returns: torch.Tensor,
     *,
-    mode: str = 'ppo',
+    mode: str = 'ppo', #ppo or bc = behavioral cloning
     epsilon: float = 0.2,
     value_coeff: float = 0.5,
     entropy_coeff: float = 0.01,
     print_debug: bool = False,
 ):
-    pp, val = model(hand.float(), calls.float(), disc.float(), gsv.float())
+    a_pp, t_pp, val = model(hand.float(), calls.float(), disc.float(), gsv.float())
     val = val.squeeze(1)
     batch_size_curr = int(gsv.size(0))
-    if mode == 'bc':
-        log_pp = (pp.clamp_min(1e-8)).log()
-        policy_loss = F.nll_loss(log_pp, flat_idx.to(dtype=torch.long, device=pp.device))
-        value_loss = F.mse_loss(val.view_as(returns), returns)
-        total = policy_loss + value_coeff * value_loss
-        return total, policy_loss, value_loss, batch_size_curr
+
     # PPO path
-    idx = flat_idx.to(device=pp.device, dtype=torch.long).view(-1, 1)
-    chosen = torch.gather(pp.clamp_min(1e-8), 1, idx).squeeze(1)
-    logp = chosen.log()
-    ratio = torch.exp(logp - old_log_probs)
-    clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
-    policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-    value_loss = F.mse_loss(val.view_as(returns), returns)
-    entropy_loss = -(pp * (pp.clamp_min(1e-8).log())).sum(dim=1).mean()
-    total = policy_loss + value_coeff * value_loss + entropy_coeff * entropy_loss
+    a_idx = action_idx.to(device=a_pp.device, dtype=torch.long).view(-1, 1)
+    t_idx = tile_idx.to(device=t_pp.device, dtype=torch.long).view(-1, 1)
+    chosen_a = torch.gather(a_pp.clamp_min(1e-8), 1, a_idx).squeeze(1)
+    chosen_t = torch.gather(t_pp.clamp_min(1e-8), 1, t_idx).squeeze(1)
+    logp_joint = chosen_a.log() + chosen_t.log()
+    old_logp_joint = action_old_log_probs + tile_old_log_probs
+    ratio = torch.exp(logp_joint - old_logp_joint)
+
     if print_debug:
         print(f"\nRatio stats: mean={ratio.mean():.4f}, std={ratio.std():.4f}")
         print(f"Advantage stats: mean={advantages.mean():.6f}, std={advantages.std():.6f}")
         print(f"Fraction clipped: {((ratio < (1 - epsilon)) | (ratio > (1 + epsilon))).float().mean():.3f}")
+
+    # mixed training: if the ratio is way off, then we need to just learn the expert move introduced
+    if mode == 'bc' or ratio.detach().cpu().numpy().max() > 5.0:
+        log_a = (a_pp.clamp_min(1e-8)).log()
+        log_t = (t_pp.clamp_min(1e-8)).log()
+        policy_loss_a = F.nll_loss(log_a, action_idx.to(dtype=torch.long, device=a_pp.device))
+        policy_loss_t = F.nll_loss(log_t, tile_idx.to(dtype=torch.long, device=t_pp.device))
+        policy_loss = policy_loss_a + policy_loss_t
+        value_loss = F.mse_loss(val.view_as(returns), returns)
+        total = policy_loss + value_coeff * value_loss
+        return total, policy_loss, value_loss, batch_size_curr
+
+    clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
+    policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
+    value_loss = F.mse_loss(val.view_as(returns), returns)
+    entropy_loss_a = -(a_pp * (a_pp.clamp_min(1e-8).log())).sum(dim=1).mean()
+    entropy_loss_t = -(t_pp * (t_pp.clamp_min(1e-8).log())).sum(dim=1).mean()
+    entropy_loss = entropy_loss_a + entropy_loss_t
+    total = policy_loss + value_coeff * value_loss + entropy_coeff * entropy_loss
     return total, policy_loss, value_loss, batch_size_curr
 
 
@@ -182,7 +197,6 @@ def train_ppo(
     *,
     hidden_size: int = 128,
     embedding_dim: int = 16,
-    negative_reward_weight: float = 1.0,
     kl_threshold: float | None = 0.008,
     patience: int = 0,
 ) -> str:
@@ -206,10 +220,10 @@ def train_ppo(
         net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=hidden_size, embedding_dim=embedding_dim, temperature=0.05)
         net = net.to(dev)
         # Ensure the scaler we persist is the exact one used by the network during preprocessing
-        player = ACPlayer(player_id=0, gsv_scaler=gsv_scaler, network=net)
+        player = ACPlayer(gsv_scaler=gsv_scaler, network=net)
 
     model = net.torch_module
-    ds = ACDataset(dataset_path, net, negative_reward_weight=negative_reward_weight)
+    ds = ACDataset(dataset_path, net)
     # Build train/validation split
     n = len(ds)
     k = int(max(0, min(n, round(float(val_split) * n))))
@@ -237,14 +251,16 @@ def train_ppo(
             for batch in dloader:
                 (
                     hand, calls, disc, gsv,
-                    flat_idx,
-                    _old_log_probs,
+                    action_idx, tile_idx,
+                    _a_old_log_probs, _t_old_log_probs,
                     _advantages,
                     _returns,
                 ) = _prepare_batch_tensors(batch, dev)
-                pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                pred = torch.argmax(pp, dim=1)
-                correct += int((pred == flat_idx).sum().item())
+                a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                pred_a = torch.argmax(a_pp, dim=1)
+                pred_t = torch.argmax(t_pp, dim=1)
+                both = (pred_a == action_idx) & (pred_t == tile_idx)
+                correct += int(both.sum().item())
                 count += int(gsv.size(0))
         model.train()
         return float(correct) / float(max(1, count))
@@ -270,8 +286,8 @@ def train_ppo(
             for batch in progress:
                 (
                     hand, calls, disc, gsv,
-                    flat_idx,
-                    old_log_probs,
+                    action_idx, tile_idx,
+                    action_old_log_probs, tile_old_log_probs,
                     advantages,
                     returns,
                 ) = _prepare_batch_tensors(batch, dev)
@@ -279,8 +295,8 @@ def train_ppo(
                 loss, policy_loss, value_loss, _= _compute_losses(
                     model,
                     hand, calls, disc, gsv,
-                    flat_idx,
-                    old_log_probs,
+                    action_idx, tile_idx,
+                    action_old_log_probs, tile_old_log_probs,
                     advantages,
                     returns,
                     mode='bc',
@@ -301,9 +317,11 @@ def train_ppo(
                 with torch.no_grad():
                     was_training = model.training
                     model.eval()
-                    pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                    pred = torch.argmax(pp, dim=1)
-                    correct += int((pred == flat_idx).sum().item())
+                    a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                    pred_a = torch.argmax(a_pp, dim=1)
+                    pred_t = torch.argmax(t_pp, dim=1)
+                    both = (pred_a == action_idx) & (pred_t == tile_idx)
+                    correct += int(both.sum().item())
                     if was_training:
                         model.train()
                 progress.set_postfix(loss=f"{float(loss.item()):.4f}", pol=f"{float(policy_loss.item()):.4f}", val=f"{float(value_loss.item()):.4f}")
@@ -322,16 +340,16 @@ def train_ppo(
                     for vb in dl_val:
                         (
                             hand, calls, disc, gsv,
-                            flat_idx,
-                            old_log_probs,
+                            action_idx, tile_idx,
+                            action_old_log_probs, tile_old_log_probs,
                             advantages,
                             returns,
                         ) = _prepare_batch_tensors(vb, dev)
                         loss_v, policy_loss_v, value_loss_v, _ = _compute_losses(
                             model,
                             hand, calls, disc, gsv,
-                            flat_idx,
-                            old_log_probs,
+                            action_idx, tile_idx,
+                            action_old_log_probs, tile_old_log_probs,
                             advantages,
                             returns,
                             mode='bc',
@@ -342,9 +360,11 @@ def train_ppo(
                         v_pol += float(policy_loss_v.item()) * bsz
                         v_val += float(value_loss_v.item()) * bsz
                         v_count += bsz
-                        pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                        pred = torch.argmax(pp, dim=1)
-                        v_correct += int((pred == flat_idx).sum().item())
+                        a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                        pred_a = torch.argmax(a_pp, dim=1)
+                        pred_t = torch.argmax(t_pp, dim=1)
+                        both = (pred_a == action_idx) & (pred_t == tile_idx)
+                        v_correct += int(both.sum().item())
                 vden = max(1, v_count)
                 val_acc = (v_correct / max(1, v_count))
                 print(f"\nWarmUp {epoch+1} [val] - total: {v_total/vden:.4f} | policy: {v_pol/vden:.4f} | value: {v_val/vden:.4f} | acc: {val_acc:.4f}")
@@ -384,8 +404,8 @@ def train_ppo(
             tensors = _prepare_batch_tensors(batch, dev)
             (
                 hand, calls, disc, gsv,
-                flat_idx,
-                old_log_probs,
+                action_idx, tile_idx,
+                action_old_log_probs, tile_old_log_probs,
                 advantages, returns,
             ) = tensors
 
@@ -393,8 +413,8 @@ def train_ppo(
             last_step = (bi == (len(dl) - 1))
             total, policy_loss, value_loss, batch_size_curr = _compute_losses(
                 model, hand, calls, disc, gsv,
-                flat_idx,
-                old_log_probs,
+                action_idx, tile_idx,
+                action_old_log_probs, tile_old_log_probs,
                 advantages, returns, mode='ppo',
                 epsilon=epsilon,
                 value_coeff=value_coeff,
@@ -435,14 +455,14 @@ def train_ppo(
                     tensors = _prepare_batch_tensors(vb, dev)
                     (
                         hand, calls, disc, gsv,
-                        flat_idx,
-                        old_log_probs,
+                        action_idx, tile_idx,
+                        action_old_log_probs, tile_old_log_probs,
                         advantages, returns,
                     ) = tensors
                     total_v, policy_loss_v, value_loss_v, bsz = _compute_losses(
                         model, hand, calls, disc, gsv,
-                        flat_idx,
-                        old_log_probs,
+                        action_idx, tile_idx,
+                        action_old_log_probs, tile_old_log_probs,
                         advantages, returns,
                         epsilon=epsilon,
                         value_coeff=value_coeff,
@@ -454,14 +474,15 @@ def train_ppo(
                     val_val += float(value_loss_v.item()) * bsz
                     val_pol_main += float(policy_loss_v.item()) * bsz
                     # Collect current policy probabilities for this batch
-                    pp_curr, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                    curr_probs_chunks.append(pp_curr.detach().cpu())
+                    a_curr, t_curr, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                    # Concatenate heads for KL tracking if desired; here track action head only for consistency
+                    curr_probs_chunks.append(a_curr.detach().cpu())
                     # If previous epoch's probs are available, compute KL(prev || curr)
                     if prev_val_policy_probs is not None:
                         prev_slice = prev_val_policy_probs[offset:offset+bsz, :]
                         # Numerical stability
                         prev_safe = prev_slice.clamp_min(1e-8)
-                        curr_safe = pp_curr.clamp_min(1e-8)
+                        curr_safe = a_curr.clamp_min(1e-8)
                         # KL(prev||curr) per sample, then mean
                         kl_batch = (prev_safe * (prev_safe.log() - curr_safe.detach().cpu().log())).sum(dim=1)
                         val_kl_prev_curr_sum += float(kl_batch.mean().item()) * bsz
@@ -539,7 +560,6 @@ def main():
     ap.add_argument('--warm_up_max_epochs', type=int, default=50, help='Maximum warm-up epochs before switching even if threshold not reached')
     ap.add_argument('--hidden_size', type=int, default=128, help='Hidden size for ACNetwork')
     ap.add_argument('--embedding_dim', type=int, default=16, help='Embedding dimension for ACNetwork')
-    ap.add_argument('--negative_reward_weight', type=float, default=1.0, help='Scale factor applied to negative returns/advantages after loading dataset (>=0). 1.0 means no change')
     args = ap.parse_args()
 
     train_ppo(
@@ -556,7 +576,6 @@ def main():
         warm_up_max_epochs=args.warm_up_max_epochs,
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
-        negative_reward_weight=float(max(0.0, args.negative_reward_weight)),
         kl_threshold=args.kl_threshold,
         patience=args.patience,
     )

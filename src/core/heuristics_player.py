@@ -116,7 +116,7 @@ class MediumHeuristicsPlayer(Player):
         # Fallback: first legal move
         return legal_moves[0]
 
-    def choose_reaction(self, game_state: GamePerspective, options):  # type: ignore[override]
+    def choose_reaction(self, game_state: GamePerspective, options: List):  # type: ignore[override]
         # Ron if possible (fast path)
         if game_state.can_ron():
             return Ron()
@@ -129,15 +129,15 @@ class MediumHeuristicsPlayer(Player):
             return PassCall()
         # Prefer KanDaimin over Pon over Chi if allowed
         if options:
-            kd = options.get('kan_daimin')
-            if kd:
-                return KanDaimin(kd[0])
-            p = options.get('pon')
-            if p:
-                return Pon(p[0])
-            c = options.get('chi')
-            if c:
-                return Chi(c[0])
+            for r in options:
+                if isinstance(r, KanDaimin):
+                    return r
+            for r in options:
+                if isinstance(r, Pon):
+                    return r
+            for r in options:
+                if isinstance(r, Chi):
+                    return r
         return PassCall()
 
 

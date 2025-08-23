@@ -22,7 +22,7 @@ from core.learn.ac_network import ACNetwork
 from core.learn.ac_player import ACPlayer
 from core.learn.data_utils import load_gsv_scaler, build_state_from_arrays
 from core.learn.feature_engineering import decode_game_perspective
-from core.learn.policy_utils import flat_index_for_action
+from core.learn.policy_utils import encode_two_head_action
 
 
 def load_dataset(data_path: str) -> Dict[str, Any]:
@@ -38,14 +38,15 @@ def load_dataset(data_path: str) -> Dict[str, Any]:
     called_arr = data['called_idx']
     gsv_arr = data['game_state']
     called_discards_arr = data['called_discards']
-    flat_idx = data['flat_idx']
+    action_idx = data['action_idx']
+    tile_idx = data['tile_idx']
 
     N = len(hand_arr)
     print(f"Loading dataset with {N} samples...")
 
     # Convert to the format expected by the network
     states = []
-    actions = []
+    actions = []  # list of (action_idx, tile_idx)
 
     for i in range(N):
         state_dict = build_state_from_arrays(
@@ -56,7 +57,7 @@ def load_dataset(data_path: str) -> Dict[str, Any]:
             called_discards_arr[i],
         )
         states.append(state_dict)
-        actions.append(int(flat_idx[i]))
+        actions.append((int(action_idx[i]), int(tile_idx[i])))
 
     return {'states': states, 'actions': actions}
 
@@ -88,18 +89,15 @@ def validate_model(model_path: str, data_path: str, accuracy_threshold: float, m
     total_samples = len(states)
 
     # Evaluate each sample
-    for i, (state_dict, true_action) in enumerate(tqdm(zip(states, actions), desc="Evaluating")):
+    for i, (state_dict, (true_a_idx, true_t_idx)) in enumerate(tqdm(zip(states, actions), desc="Evaluating")):
         # Decode state into GamePerspective
         game_perspective = decode_game_perspective(state_dict)
 
         # Get model prediction
         predicted_move, _, _ = ac_player.compute_play(game_perspective)
-
-        # Convert predicted move back to flat index
-        predicted_action = flat_index_for_action(game_perspective, predicted_move)
-
-        # Check if prediction matches ground truth
-        if predicted_action == true_action:
+        pa_idx, pt_idx = encode_two_head_action(predicted_move)
+        # Check if prediction matches ground truth on both heads
+        if pa_idx == true_a_idx and pt_idx == true_t_idx:
             correct_predictions += 1
 
     # Calculate accuracy

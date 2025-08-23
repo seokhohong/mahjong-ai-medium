@@ -138,14 +138,21 @@ class DebugSnapshot:
     @staticmethod
     def save_illegal_move(
         *,
-        action_index: Optional[int] = None,
+        action_index: Optional[tuple[int, int]] = None,
         game_perspective: Optional[Any] = None,
         action_obj: Optional[Any] = None,
         encoded_state: Optional[Dict[str, Any]] = None,
         value: Optional[float] = None,
-        main_logp: Optional[float] = None,
-        main_probs: Optional[list] = None,
-        reason: str = 'illegal_action_index',
+        # Two-head logging (primary action + auxiliary tile)
+        action_logp: Optional[float] = None,
+        tile_logp: Optional[float] = None,
+        # Per-head probability dumps (optional)
+        action_probs: Optional[list] = None,
+        tile_probs: Optional[list] = None,
+        # Optional legality masks at the time of selection
+        action_mask: Optional[list] = None,
+        tile_mask: Optional[list] = None,
+        reason: str = 'default',
         out_dir: Optional[str] = None,
     ) -> Optional[str]:
         """Serialize an illegal move snapshot to a .pkl file.
@@ -159,15 +166,21 @@ class DebugSnapshot:
             payload = {
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
                 'reason': reason,
-                'action_index': (int(action_index) if action_index is not None else None),
+                # Store tuple for two-head (action_idx, tile_idx)
+                'action_index': action_index[0] if action_index is not None else None,
+                'tile_index': action_index[1] if action_index is not None else None,
                 'game_perspective': game_perspective,
                 'action_obj': action_obj,
                 'encoded_state': encoded_state,
                 'value': (float(value) if value is not None else None),
-                'main_logp': (float(main_logp) if main_logp is not None else None),
-                'main_probs': list(main_probs) if main_probs is not None else None,
+                # Two-head logs
+                'action_logp': (float(action_logp) if action_logp is not None else None),
+                'tile_logp': (float(tile_logp) if tile_logp is not None else None),
+                'action_probs': list(action_probs) if action_probs is not None else None,
+                'tile_probs': list(tile_probs) if tile_probs is not None else None,
+                'action_mask': list(action_mask) if action_mask is not None else None,
+                'tile_mask': list(tile_mask) if tile_mask is not None else None,
             }
-            idx_part = str(action_index) if action_index is not None else 'NA'
             fname = f"illegal_move_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.pkl"
             fpath = os.path.join(target_dir, fname)
             with open(fpath, 'wb') as f:

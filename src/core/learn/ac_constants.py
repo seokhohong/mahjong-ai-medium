@@ -1,26 +1,44 @@
 from __future__ import annotations
 
-# Canonical order for AC main policy head
-# Indices correspond to logits/probabilities emitted by ACNetwork.head_action
-MAIN_HEAD_ORDER = ['chi', 'pon', 'ron', 'tsumo', 'discard', 'pass']
+# Two-head policy specification
+# Action head enumerates core actions, including fully enumerated Chi (6) and Pon (2) variants.
+# Tile head enumerates tiles plus a no-op index.
 
-# Mapping from action type string to main head index
-MAIN_HEAD_INDEX = {name: idx for idx, name in enumerate(MAIN_HEAD_ORDER)}
+# Action head order (size = 16)
+# - Singletons (not parameterized by tile head): tsumo, ron, pass, kan_daimin
+# - Tile-parameterized (use tile head): discard, riichi, kan_kakan, kan_ankan
+# - Chi variants (6): low/mid/high x no-aka/aka
+# - Pon variants (2): no-aka, aka
+ACTION_HEAD_ORDER: list[str] = [
+    'discard',       # uses tile head
+    'riichi',        # uses tile head
+    'tsumo',
+    'ron',
+    'pass',
+    'kan_daimin',
+    'kan_kakan',     # uses tile head
+    'kan_ankan',     # uses tile head
+    'chi_low_noaka',
+    'chi_mid_noaka',
+    'chi_high_noaka',
+    'chi_low_aka',
+    'chi_mid_aka',
+    'chi_high_aka',
+    'pon_noaka',
+    'pon_aka',
+]
+ACTION_HEAD_INDEX = {name: i for i, name in enumerate(ACTION_HEAD_ORDER)}
+ACTION_HEAD_SIZE: int = len(ACTION_HEAD_ORDER)
 
-# Flat policy space sizing matches policy_utils/build_move_from_flat and GamePerspective.legal_flat_mask
-# Layout (length 160):
-# 0..36:  Discard by tile index
-# 37..73: Riichi by discard tile
-# 74:     Tsumo
-# 75:     Ron
-# 76..81: Chi variants (no-aka 0..2, with-aka 3..5)
-# 82..83: Pon (no-aka, with-aka)
-# 84:     Kan Daimin
-# 85..121: Kan Kakan by tile index
-# 122..158: Kan Ankan by tile index
-# 159:    Pass
+# Tile head indexing (size = 38):
+# - 0..36 = flat tile index (direct mapping)
+# - 37    = no-op (TILE_HEAD_NOOP)
+TILE_HEAD_SIZE: int = 38
+TILE_HEAD_NOOP: int = TILE_HEAD_SIZE - 1
+
+# Legacy flat policy (kept for reference/back-compat reading of old datasets/models only)
 FLAT_POLICY_SIZE: int = 160
-# Tile index space (0 is padding; 1..37 represent suited ranks/suits per encoding)
+# Tile index space used by feature embeddings (unchanged)
 TILE_INDEX_PAD: int = 0
 TILE_INDEX_SIZE: int = 38
 
@@ -38,12 +56,10 @@ MAX_TURNS: int = 256
 
 
 def action_type_to_main_index(action_type: str) -> int:
-    """Map a serialized action type to the main head index.
-
-    Falls back to 'pass' on unknown types.
-    """
+    """Legacy helper; for two-head setup prefer ACTION_HEAD_* constants."""
     at = (action_type or 'pass').lower()
-    return MAIN_HEAD_INDEX.get(at, MAIN_HEAD_INDEX['pass'])
+    # Best-effort mapping
+    return ACTION_HEAD_INDEX.get(at, ACTION_HEAD_INDEX['pass'])
 
 
 def chi_variant_index(last_discarded_tile: 'Tile', tiles: list['Tile']) -> int:
@@ -73,6 +89,8 @@ def chi_variant_index(last_discarded_tile: 'Tile', tiles: list['Tile']) -> int:
         return 1
     if ranks == [d + 1, d + 2]:
         return 2
-    return -1
+    raise IllegalChiException()
 
+class IllegalChiException(Exception):
+    pass
 

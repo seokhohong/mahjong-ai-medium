@@ -14,20 +14,20 @@ from ..game import GamePerspective, Tile, TileType, Suit
 from core.constants import NUM_PLAYERS
 from .feature_engineering import encode_game_perspective
 from .ac_constants import (
-    FLAT_POLICY_SIZE,
     TILE_INDEX_SIZE,
     MAX_CALLS,
     MAX_CALLED_SET_SIZE,
+    ACTION_HEAD_SIZE,
+    TILE_HEAD_SIZE,
 )
 
 
 class ACNetwork:
     """
-    Actor-Critic network for MediumJong with shared trunk and multiple heads:
-    - Policy main-head over actions: [Chi, Pon, Ron, Tsumo, Discard, Pass] (size=6)
-    - Policy tile-head: one-hot over 18 tile indices (size=18)
-    - Policy chi-range-head: 3-class (low, medium, high) (size=3)
-    - Value head: real-valued state value (R)
+    Actor-Critic network for MediumJong with shared trunk and two policy heads:
+    - Action head over ACTION_HEAD_SIZE
+    - Tile head over TILE_HEAD_SIZE (0=no-op, 1..37=tiles)
+    - Value head: scalar
 
     All heads share the same feature extractor from inputs to the pre-head layer.
     """
@@ -90,8 +90,9 @@ class ACNetwork:
                     nn.ReLU(),
                     nn.Dropout(0.3),
                 )
-                # Heads: single flat policy sized per constants
-                self.head_policy = nn.Linear(outer.hidden_size // 2, int(FLAT_POLICY_SIZE))
+                # Heads: new two-head policy (action, tile) + value
+                self.head_action = nn.Linear(outer.hidden_size // 2, int(ACTION_HEAD_SIZE))
+                self.head_tile = nn.Linear(outer.hidden_size // 2, int(TILE_HEAD_SIZE))
                 self.head_value = nn.Linear(outer.hidden_size // 2, 1)
 
             def forward(self, hand_seq: torch.Tensor, calls_seq: torch.Tensor, disc_seq: torch.Tensor, gsv: torch.Tensor):
@@ -109,9 +110,32 @@ class ACNetwork:
                 disc_features = disc_features_per_player.reshape(batch_size, num_players * disc_features_per_player.shape[1])
                 x = torch.cat([hand_features, calls_features, disc_features, gsv], dim=1)
                 z = self.trunk(x)
-                pp = F.softmax(self.head_policy(z), dim=-1)
+                action_logits = self.head_action(z)
+                tile_logits = self.head_tile(z)
+                action_pp = F.softmax(action_logits, dim=-1)
+                tile_pp = F.softmax(tile_logits, dim=-1)
                 val = self.head_value(z)
-                return pp, val
+                return action_pp, tile_pp, val
+
+            def forward_two_head(self, hand_seq: torch.Tensor, calls_seq: torch.Tensor, disc_seq: torch.Tensor, gsv: torch.Tensor):
+                # Same feature extraction as forward()
+                hand_features = self.hand_conv(hand_seq).squeeze(-1)
+                batch_size, num_players, embedding_dim, flat_calls_len = calls_seq.shape
+                calls_flat = calls_seq.reshape(batch_size * num_players, embedding_dim, flat_calls_len)
+                calls_features_per_player = self.calls_conv(calls_flat).squeeze(-1)
+                calls_features = calls_features_per_player.reshape(batch_size, num_players * calls_features_per_player.shape[1])
+                _, _, embedding_dim_disc, max_discards_per_player = disc_seq.shape
+                disc_flat = disc_seq.reshape(batch_size * num_players, embedding_dim_disc, max_discards_per_player)
+                disc_features_per_player = self.disc_conv(disc_flat).squeeze(-1)
+                disc_features = disc_features_per_player.reshape(batch_size, num_players * disc_features_per_player.shape[1])
+                x = torch.cat([hand_features, calls_features, disc_features, gsv], dim=1)
+                z = self.trunk(x)
+                action_logits = self.head_action(z)
+                tile_logits = self.head_tile(z)
+                action_pp = F.softmax(action_logits, dim=-1)
+                tile_pp = F.softmax(tile_logits, dim=-1)
+                val = self.head_value(z)
+                return action_pp, tile_pp, val
 
         self._net = _ACModule(self)
         self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -186,28 +210,27 @@ class ACNetwork:
         gs = self._gsv_scaler.transform([gs])[0]
         return hand_seq.astype(np.float32), calls_seq.astype(np.float32), disc_seq.astype(np.float32), gs.astype(np.float32)
 
-    def evaluate(self, game_state: GamePerspective) -> Tuple[Dict[str, np.ndarray], float]:
-        # not sure if this is slow, but we need to set it to eval mode before inference
+    def evaluate(self, game_state: GamePerspective) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Return (action_head_probs, tile_head_probs, value) for two-head policy.
+        """
         self._net.eval()
-        # Use the feature engineering exporter directly; ignore called_discards for now.
         feat = encode_game_perspective(game_state)
-        hand_idx = feat['hand_idx']            # (14,)
-        called_idx = feat['called_idx']        # (4, max_called)
-        disc_idx = feat['disc_idx']            # (4, max_discards)
-        game_state_vec = feat['game_state']    # (GSV',)
-
+        hand_idx = feat['hand_idx']
+        called_idx = feat['called_idx']
+        disc_idx = feat['disc_idx']
+        game_state_vec = feat['game_state']
         h, c, d, g = self.extract_features_from_indexed(hand_idx, disc_idx, called_idx, game_state_vec)
-
         with torch.no_grad():
-            pp, val = self._net(
+            a_pp, t_pp, val = self._net(
                 torch.from_numpy(h[None, ...]).to(self._device),
                 torch.from_numpy(c[None, ...]).to(self._device),
                 torch.from_numpy(d[None, ...]).to(self._device),
                 torch.from_numpy(g[None, ...]).to(self._device),
             )
-        policy = pp.cpu().numpy()[0]
-        value = float(val.cpu().numpy()[0][0])
-        return policy, value
+        a = a_pp.cpu().numpy()[0]
+        t = t_pp.cpu().numpy()[0]
+        v = float(val.cpu().numpy()[0][0])
+        return a, t, v
 
     @property
     def torch_module(self) -> nn.Module:

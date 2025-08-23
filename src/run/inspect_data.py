@@ -5,20 +5,14 @@ import argparse
 import numpy as np
 
 from core.learn.feature_engineering import decode_game_perspective
-from core.learn.policy_utils import build_move_from_flat
+from core.learn.policy_utils import build_move_from_two_head
 from core.learn.data_utils import build_state_from_npz_row, make_npz_state_row_getter
 from core.game import GameOutcome
 from core.tile import Suit
 
 
-def inspect_data(states: List[Dict[str, Any]], actions: List[int], *, include_winds: bool = True, actor_id: int | None = None) -> List[str]:
-    """Pretty-print a list of entries by rehydrating GamePerspective via feature engineering.
-
-    - states: list of dicts as returned by feature encoding (hand_idx, disc_idx, called_idx, game_state, called_discards)
-    - actions: list of flat action indices (ints)
-
-    Returns a list of human-readable lines for a single entry.
-    """
+def inspect_data(states: List[Dict[str, Any]], action_pairs: List[tuple[int, int]], *, include_winds: bool = True, actor_id: int | None = None) -> List[str]:
+    """Pretty-print entries using two-head actions (action_idx, tile_idx)."""
     lines: List[str] = []
 
     def _fmt_tile(t) -> str:
@@ -57,7 +51,7 @@ def inspect_data(states: List[Dict[str, Any]], actions: List[int], *, include_wi
         except Exception:
             return '[]'
 
-    for i, (s_obj, a_obj) in enumerate(zip(states, actions)):
+    for i, (s_obj, pair) in enumerate(zip(states, action_pairs)):
         try:
             gp = decode_game_perspective(s_obj)
         except Exception as e:
@@ -70,16 +64,18 @@ def inspect_data(states: List[Dict[str, Any]], actions: List[int], *, include_wi
             for pid in range(4)
         }
         called_s = {pid: _fmt_called_sets(gp.called_sets.get(pid, [])) for pid in range(4)}
-        last_discard = _fmt_tile(gp.last_discarded_tile) if gp.last_discarded_tile is not None else 'None'
-        # Convert flat index to a concrete move (Action/Reaction)
+        last_discard = _fmt_tile(gp._reactable_tile) if gp._reactable_tile is not None else 'None'
+        # Convert two-head indices to a concrete move (Action/Reaction)
         try:
-            mv = build_move_from_flat(gp, int(a_obj))
+            a_idx = int(pair[0])
+            t_idx = int(pair[1])
+            mv = build_move_from_two_head(gp, a_idx, t_idx)
             if mv is not None:
                 action_desc = f"{type(mv).__name__}: {mv}"
             else:
-                action_desc = {'flat_idx': int(a_obj)}
+                action_desc = {'action_idx': a_idx, 'tile_idx': t_idx}
         except Exception:
-            action_desc = {'flat_idx': int(a_obj)}
+            action_desc = {'action_idx': int(pair[0]), 'tile_idx': int(pair[1])}
         if include_winds:
             lines.append(
                 f"[{i}] P{(actor_id if actor_id is not None else '?')} | RW:{gp.round_wind.name} | SW["
@@ -90,7 +86,7 @@ def inspect_data(states: List[Dict[str, Any]], actions: List[int], *, include_wi
                 f"[{i}] P{(actor_id if actor_id is not None else '?')} | Riichi:" + str(int(gp.riichi_declared.get(actor_id, False) if hasattr(gp, 'riichi_declared') else 0)) + " | Hand " + hand_s
             )
         lines.append(
-            f"     LastDiscard:{last_discard} by {gp.last_discard_player} | CanCall:{int(bool(gp.can_call))} | CanRon:{int(gp.can_ron())} | CanTsumo:{int(gp.can_tsumo())}"
+            f"     LastDiscard:{last_discard} by {gp._owner_of_reactable_tile} | CanCall:{int(bool(gp.can_call))} | CanRon:{int(gp.can_ron())} | CanTsumo:{int(gp.can_tsumo())}"
         )
         lines.append(
             f"     Called:{called_s}"
@@ -119,8 +115,10 @@ def main() -> int:
     actor_ids = data["actor_ids"]
     returns = data["returns"]
     advantages = data["advantages"] if "advantages" in data.files else None
-    flat_idx = data["flat_idx"]
-    old_log_probs = data["old_log_probs"] if "old_log_probs" in data.files else None
+    action_idx = data["action_idx"]
+    tile_idx = data["tile_idx"]
+    action_log_probs = data["action_log_probs"] if "action_log_probs" in data.files else None
+    tile_log_probs = data["tile_log_probs"] if "tile_log_probs" in data.files else None
     get_state_row = make_npz_state_row_getter(data)
     outcomes_arr = data["game_outcomes_obj"] if "game_outcomes_obj" in data.files else None
 
@@ -155,17 +153,21 @@ def main() -> int:
         for i in idxs:
             st = get_state_row(i)
             actor = int(actor_ids[i])
-            lines = inspect_data([st], [int(flat_idx[i])], include_winds=False, actor_id=actor)
+            lines = inspect_data([st], [(int(action_idx[i]), int(tile_idx[i]))], include_winds=False, actor_id=actor)
             # Header with reward/advantage/actor/step
             rew = float(returns[i])
             adv = (float(advantages[i]) if advantages is not None else None)
             actor = int(actor_ids[i])
             step = int(step_ids[i])
-            # Probability of chosen action from stored old_log_probs
+            # Probability of chosen action from stored two-head log-probs (show both heads and joint)
             prob_s = ""
-            if old_log_probs is not None:
-                p = float(np.exp(float(old_log_probs[i])))
-                prob_s = f" | prob={p:.4f}"
+            if action_log_probs is not None and tile_log_probs is not None:
+                a_lp = float(action_log_probs[i])
+                t_lp = float(tile_log_probs[i])
+                a_p = float(np.exp(a_lp))
+                t_p = float(np.exp(t_lp))
+                joint_p = float(np.exp(a_lp + t_lp))
+                prob_s = f" | action_p={a_p:.4f} | tile_p={t_p:.4f} | joint_p={joint_p:.4f}"
             if adv is not None:
                 print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | advantage={adv:+.3f} | {prob_s}")
             else:

@@ -10,14 +10,15 @@ import os
 # Add this test directory to Python path to import helpers
 sys.path.insert(0, os.path.dirname(__file__))
 
-from core.game import MediumJong, Player, Discard, Tsumo, Ron, Pon, Chi, CalledSet
+from core.game import MediumJong, Player, CalledSet
+from core.action import Discard, Tsumo, Ron, Pon, Chi
 from core.tile import Tile, TileType, Suit
 from test_utils import ForceDiscardPlayer
 
 
 class TestMediumStepLegalities(unittest.TestCase):
     def setUp(self):
-        self.players = [Player(i) for i in range(4)]
+        self.players = [Player() for _ in range(4)]
         self.game = MediumJong(self.players)
 
     def test_game_initialization(self):
@@ -51,8 +52,8 @@ class TestMediumStepLegalities(unittest.TestCase):
 
     def test_reaction_chi_on_3p_discard(self):
         # Player 0 will discard 3p
-        p0 = ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE))
-        game = MediumJong([p0, Player(1), Player(2), Player(3)])
+        p0 = ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE))
+        game = MediumJong([p0, Player(), Player(), Player()])
         # Ensure player 0 has 3p in hand to discard
         game._player_hands[0] = [Tile(Suit.PINZU, TileType.THREE)] + game._player_hands[0][1:]
         # Ensure player 1 (left of 0) can Chi with 2p and 4p
@@ -60,13 +61,13 @@ class TestMediumStepLegalities(unittest.TestCase):
         # Directly perform the discard to enter reaction phase without auto-resolution
         game.step(0, Discard(Tile(Suit.PINZU, TileType.THREE)))
         # Player 1 should be able to Chi
-        chi_move = Chi([Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)])
+        chi_move = Chi([Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)], 1)
         self.assertTrue(game.is_legal(1, chi_move))
 
     def test_reaction_pon_on_3p_discard(self):
         # Player 0 will discard 3p
-        p0 = ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE))
-        game = MediumJong([p0, Player(1), Player(2), Player(3)])
+        p0 = ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE))
+        game = MediumJong([p0, Player(), Player(), Player()])
         # Ensure player 0 has 3p in hand to discard
         game._player_hands[0] = [Tile(Suit.PINZU, TileType.THREE)] + game._player_hands[0][1:]
         # Ensure player 2 has two 3p to Pon
@@ -78,8 +79,8 @@ class TestMediumStepLegalities(unittest.TestCase):
 
     def test_reaction_ron_on_3p_discard(self):
         # Player 0 will discard 3p
-        p0 = ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE))
-        game = MediumJong([p0, Player(1), Player(2), Player(3)])
+        p0 = ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE))
+        game = MediumJong([p0, Player(), Player(), Player()])
         # Ensure player 0 has 3p in hand to discard
         game._player_hands[0] = [Tile(Suit.PINZU, TileType.THREE)] + game._player_hands[0][1:]
         # Configure player 1 to be closed tenpai waiting on 3p with a yaku (pinfu):

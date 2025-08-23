@@ -40,10 +40,10 @@ def build_players() -> List[Player]:
 	from core.learn.data_utils import load_gsv_scaler
 
 	return [
-        RecordingHeuristicACPlayer(0),
-        ACPlayer.from_directory("models/ac_ppo_20250821_132238", player_id=1, temperature=0),
-		RecordingHeuristicACPlayer(2),
-		RecordingHeuristicACPlayer(3),
+        RecordingHeuristicACPlayer(),
+        ACPlayer.from_directory("models/ac_ppo_20250821_132238", temperature=0),
+        RecordingHeuristicACPlayer(),
+        RecordingHeuristicACPlayer(),
 	]
 
 
@@ -64,12 +64,6 @@ def play_matches(players: List[Player], games: int, *, shuffle_each_game: bool =
 		else:
 			ordered_players = players
 
-		# MediumJong uses each Player's player_id for seating/rotation.
-		# Reassign player_id to match the current shuffled seating (0..3) before creating the game.
-		original_ids = [p.player_id for p in players]
-		for seat, p in enumerate(ordered_players):
-			p.player_id = seat
-
 		game = MediumJong(ordered_players)
 		game.play_round()
 		assert game.is_game_over()
@@ -77,10 +71,6 @@ def play_matches(players: List[Player], games: int, *, shuffle_each_game: bool =
 		final_points = game.get_points()
 		for i in range(4):
 			per_player_scores[order[i]].append(float(final_points[i]))
-
-		# Restore original player_ids for the next iteration
-		for idx, p in enumerate(players):
-			p.player_id = original_ids[idx]
 
 	# Compute summary stats
 	stats = []

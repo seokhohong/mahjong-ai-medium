@@ -8,9 +8,13 @@ import torch
 from sklearn.preprocessing import StandardScaler
 
 from core.game import MediumJong, Player
-from core.learn import ACPlayer, ACNetwork
+from core.learn.ac_player import ACPlayer
+from core.learn.ac_network import ACNetwork
 from core.learn.ac_constants import GAME_STATE_VEC_LEN
-from core.learn.policy_utils import build_move_from_flat, flat_index_for_action
+from core.learn.policy_utils import (
+    build_move_from_two_head,
+    encode_two_head_action,
+)
 from core.learn.data_utils import build_state_from_npz_row
 from core.learn.feature_engineering import encode_game_perspective, MAX_HAND_LEN
 from core.learn.recording_ac_player import ExperienceBuffer, RecordingHeuristicACPlayer
@@ -23,35 +27,51 @@ class ScriptedRecordingPlayer(Player):
     Strategy: choose the lowest-index legal discard at each action state.
     """
 
-    def __init__(self, pid: int, buffer: ExperienceBuffer):
-        super().__init__(pid)
+    def __init__(self, buffer: ExperienceBuffer):
+        super().__init__()
         self.buffer = buffer
 
     def play(self, gs):  # type: ignore[override]
-        mask = gs.legal_flat_mask()
-        choice = None
-        # Prefer discard band 0..34
-        for idx in range(0, 35):
-            if mask[idx] == 1:
-                choice = idx
-                break
-        if choice is None:
-            # Fallback to first any legal action
-            for idx, bit in enumerate(mask):
-                if bit == 1:
-                    choice = idx
+        # Prefer a discard if available, else first legal action
+        a_mask = gs.legal_action_mask()
+        discard_idx = None
+        from core.learn.ac_constants import ACTION_HEAD_INDEX
+        if a_mask[ACTION_HEAD_INDEX['discard']] == 1:
+            discard_idx = ACTION_HEAD_INDEX['discard']
+        # Choose action
+        if discard_idx is not None:
+            a_idx = discard_idx
+            t_mask = gs.legal_tile_mask(a_idx)
+            # pick lowest tile index enabled (1..37). If none, fallback to no-op (shouldn't happen for discard)
+            t_idx = 0
+            for i in range(1, 38):
+                if t_mask[i] == 1:
+                    t_idx = i
                     break
-        assert choice is not None, "No legal move found"
-        move = build_move_from_flat(gs, int(choice))
-        assert move is not None, f"Failed to build move from flat index {choice}"
+        else:
+            # fallback to first legal action head and its first legal tile
+            a_idx = None
+            for i, bit in enumerate(a_mask):
+                if bit == 1:
+                    a_idx = i
+                    break
+            assert a_idx is not None, "No legal action found"
+            t_mask = gs.legal_tile_mask(a_idx)
+            t_idx = 0
+            for i in range(38):
+                if t_mask[i] == 1:
+                    t_idx = i
+                    break
+        move = build_move_from_two_head(gs, int(a_idx), int(t_idx))
+        assert move is not None, f"Failed to build move from two-head indices {(a_idx, t_idx)}"
         # Record experience with zero value/logp
         self.buffer.add(
             encode_game_perspective(gs),
-            int(choice),
+            (int(a_idx), int(t_idx)),
             0.0,
             0.0,
-            main_logp=0.0,
-            main_probs=None,
+            action_logp=0.0,
+            tile_logp=0.0,
         )
         return move
 
@@ -78,23 +98,28 @@ def _build_tensors_from_states_actions(net, states, actions, dev):
     calls = torch.from_numpy(np.stack(calls_list)).to(dev)
     disc = torch.from_numpy(np.stack(disc_list)).to(dev)
     gsv = torch.from_numpy(np.stack(gsv_list)).to(dev)
-    flat_idx = torch.tensor(list(actions), dtype=torch.long, device=dev)
-    return hand, calls, disc, gsv, flat_idx
+    # actions is a list of (action_idx, tile_idx)
+    a_idx = torch.tensor([int(a[0]) for a in actions], dtype=torch.long, device=dev)
+    t_idx = torch.tensor([int(a[1]) for a in actions], dtype=torch.long, device=dev)
+    return hand, calls, disc, gsv, a_idx, t_idx
 
 
-def _train_bc_to_perfect(model, hand, calls, disc, gsv, flat_idx, *, max_steps: int = 200):
+def _train_bc_to_perfect(model, hand, calls, disc, gsv, a_idx, t_idx, *, max_steps: int = 200):
     import torch  # type: ignore
     opt = torch.optim.Adam(model.parameters(), lr=5e-3)
     for _ in range(max_steps):
-        pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-        log_pp = (pp.clamp_min(1e-8)).log()
-        loss = __import__('torch').nn.functional.nll_loss(log_pp, flat_idx)
+        pa, pt, _v = model(hand.float(), calls.float(), disc.float(), gsv.float())
+        log_pa = (pa.clamp_min(1e-8)).log()
+        log_pt = (pt.clamp_min(1e-8)).log()
+        nll = __import__('torch').nn.functional.nll_loss
+        loss = nll(log_pa, a_idx) + nll(log_pt, t_idx)
         opt.zero_grad()
         loss.backward()
         opt.step()
         with __import__('torch').no_grad():
-            pred = __import__('torch').argmax(pp, dim=1)
-            acc = float((pred == flat_idx).float().mean().item())
+            pred_a = __import__('torch').argmax(pa, dim=1)
+            pred_t = __import__('torch').argmax(pt, dim=1)
+            acc = float(((pred_a == a_idx) & (pred_t == t_idx)).float().mean().item())
             if acc >= 1.0:
                 break
     assert acc >= 1.0, "model failed to memorize"
@@ -105,19 +130,18 @@ def _assert_replay_identical(net, states, actions):
     import numpy as np  # local import
     from core.learn.ac_player import ACPlayer
     from core.learn.feature_engineering import decode_game_perspective
-    acp = ACPlayer(0, net, temperature=0)
+    acp = ACPlayer(network=net, temperature=0)
     misses = []
-    for i, (st, action_idx) in enumerate(zip(states, actions)):
+    for i, (st, action_tuple) in enumerate(zip(states, actions)):
         gp = decode_game_perspective(st)
-        _, _, log_policy = acp.compute_play(gp)
-        # Check that the observed action is within the top-3 choices of the policy
-        # Using log-probabilities is fine since log is monotonic
-        order = np.argsort(-log_policy)[:3]
-        if int(action_idx) not in set(order.tolist()):
-            misses.append((i, int(action_idx), order.tolist()))
-    # Require at least 90% of states have the observed action in top-3
+        # Evaluate action head directly
+        pa, pt, _ = acp.network.evaluate(gp, scaler=acp.gsv_scaler)
+        order = np.argsort(-pa)[:3]
+        gold_a = int(action_tuple[0])
+        if gold_a not in set(order.tolist()):
+            misses.append((i, gold_a, order.tolist()))
     match_frac = 1.0 - (len(misses) / max(1, len(states)))
-    assert match_frac >= 0.9, f"Observed action in top-3 for only {match_frac:.3f} of states; first misses: {misses[:5]}"
+    assert match_frac >= 0.9, f"Observed action head in top-3 for only {match_frac:.3f} of states; first misses: {misses[:5]}"
 
 
 def _features_key(state_dict):
@@ -145,10 +169,10 @@ class TestTrainEndToEnd(unittest.TestCase):
         torch.manual_seed(123)
 
         # Play a full game using deterministic heuristic recorders
-        rec_players = [RecordingHeuristicACPlayer(0, random_exploration=0.0),
-                   RecordingHeuristicACPlayer(1, random_exploration=0.0),
-                   RecordingHeuristicACPlayer(2, random_exploration=0.0),
-                   RecordingHeuristicACPlayer(3, random_exploration=0.0)]
+        rec_players = [RecordingHeuristicACPlayer(random_exploration=0.0),
+                       RecordingHeuristicACPlayer(random_exploration=0.0),
+                       RecordingHeuristicACPlayer(random_exploration=0.0),
+                       RecordingHeuristicACPlayer(random_exploration=0.0)]
         g = MediumJong(rec_players)
         steps = 0
         while not g.is_game_over() and steps < 256:
@@ -170,12 +194,14 @@ class TestTrainEndToEnd(unittest.TestCase):
         model = net.torch_module
         model.eval()
         net.fit_scaler(np.array([state["game_state"] for state in all_states]))
-        hand, calls, disc, gsv, flat_idx = _build_tensors_from_states_actions(net, all_states, all_actions, dev)
-        _train_bc_to_perfect(model, hand, calls, disc, gsv, flat_idx, max_steps=400)
+        hand, calls, disc, gsv, a_idx, t_idx = _build_tensors_from_states_actions(net, all_states, all_actions, dev)
+        _train_bc_to_perfect(model, hand, calls, disc, gsv, a_idx, t_idx, max_steps=400)
         # After training, assert the model argmax matches the training actions for every sample
         with torch.no_grad():
-            model_pred_probs, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-            self.assertTrue(np.allclose(model_pred_probs[0].cpu().numpy(), model(hand.float()[[0]], calls.float()[[0]], disc.float()[[0]], gsv.float()[[0]])[0].cpu().numpy()))
+            pa, pt, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+            pa_solo, pt_solo, _ = model(hand.float()[[0]], calls.float()[[0]], disc.float()[[0]], gsv.float()[[0]])
+            self.assertTrue(np.allclose(pa[0].cpu().numpy(), pa_solo[0].cpu().numpy()))
+            self.assertTrue(np.allclose(pt[0].cpu().numpy(), pt_solo[0].cpu().numpy()))
 
     def test_build_ac_dataset_and_train_ppo_pipeline(self):
         """Test the complete pipeline: build dataset -> train model -> verify exact predictions."""
@@ -228,20 +254,21 @@ class TestTrainEndToEnd(unittest.TestCase):
 
             # After warm-up to ~40% accuracy, load ACPlayer from the saved directory
             model_dir = os.path.dirname(trained_model_path)
-            player = ACPlayer.from_directory(model_dir, player_id=0, temperature=0)
+            player = ACPlayer.from_directory(model_dir, temperature=0)
 
             # Iterate through dataset and rehydrate GamePerspective; measure accuracy
             correct = 0
             total = 0
             with np.load(dataset_path, allow_pickle=True) as data:
-                N = int(len(data['flat_idx']))
+                N = int(len(data['action_idx']))
                 for i in range(N):
                     st = build_state_from_npz_row(data, i)
                     gp = decode_game_perspective(st)
-                    move, _, _ = player.compute_play(gp)
-                    pred_idx = flat_index_for_action(gp, move)
-                    gold_idx = int(data['flat_idx'][i])
-                    correct += int(pred_idx == gold_idx)
+                    move, _, a_idx, t_idx, _, _ = player.compute_play(gp)
+                    pred_a, pred_t = a_idx, t_idx
+                    gold_a = int(data['action_idx'][i])
+                    gold_t = int(data['tile_idx'][i])
+                    correct += int((pred_a == gold_a) and (pred_t == gold_t))
                     total += 1
 
             acc = (correct / max(1, total))
@@ -276,11 +303,10 @@ class TestTrainEndToEnd(unittest.TestCase):
                 pickle.dump(network._gsv_scaler, f)
 
             # Test loading from directory
-            loaded_player = ACPlayer.from_directory(tmp_dir, player_id=1, temperature=0.5)
+            loaded_player = ACPlayer.from_directory(tmp_dir, temperature=0.5)
 
             # Verify the player was loaded correctly (model + scaler)
             self.assertIsInstance(loaded_player, ACPlayer)
-            self.assertEqual(loaded_player.player_id, 1)
             self.assertAlmostEqual(loaded_player.temperature, 0.5)
             self.assertIsNotNone(loaded_player.gsv_scaler)
 
@@ -293,34 +319,40 @@ class TestTrainEndToEnd(unittest.TestCase):
         from core.learn.ac_player import ACPlayer
         from core.game import MediumJong
         from core.learn.recording_ac_player import RecordingHeuristicACPlayer
+        from core.learn.ac_constants import ACTION_HEAD_INDEX
 
         # Determinism
         random.seed(123)
         np.random.seed(123)
 
         # Build a default, untrained AC network/player
-        base_player = ACPlayer.default(player_id=0, temperature=0.1)
+        base_player = ACPlayer.default(temperature=0.1)
 
         # dummy fit for this test
         base_player.network.fit_scaler(np.ones((10, GAME_STATE_VEC_LEN)))
 
         # Clone two players that share the same network but different temperatures
-        cold_player = ACPlayer(0, base_player.network, gsv_scaler=base_player.gsv_scaler, temperature=0.05)
-        warm_player = ACPlayer(0, base_player.network, gsv_scaler=base_player.gsv_scaler, temperature=1.0)
+        cold_player = ACPlayer(network=base_player.network, gsv_scaler=base_player.gsv_scaler, temperature=0.05)
+        warm_player = ACPlayer(network=base_player.network, gsv_scaler=base_player.gsv_scaler, temperature=1.0)
 
         # Same opponents for both runs
-        opps = [RecordingHeuristicACPlayer(1, random_exploration=0.0), RecordingHeuristicACPlayer(2, random_exploration=0.0), RecordingHeuristicACPlayer(3, random_exploration=0.0)]
+        opps = [RecordingHeuristicACPlayer(random_exploration=0.0), RecordingHeuristicACPlayer(random_exploration=0.0),
+                RecordingHeuristicACPlayer(random_exploration=0.0)]
 
         # Run with cold temperature
         g1 = MediumJong([cold_player] + opps)
         moves_cold = []
+        discard_tiles_cold = []
         steps = 0
         while not g1.is_game_over() and steps < 200:
             gp = g1.get_game_perspective(g1.current_player_idx)
             if g1.current_player_idx == 0:
                 mv = cold_player.play(gp)
-                # Record fully-parameterized action as flat index
-                moves_cold.append(flat_index_for_action(gp, mv))
+                # Record action head index
+                ai, ti = encode_two_head_action(mv)
+                moves_cold.append(ai)
+                if ai == ACTION_HEAD_INDEX['discard']:
+                    discard_tiles_cold.append(int(ti))
             g1.play_turn()
             steps += 1
 
@@ -329,12 +361,16 @@ class TestTrainEndToEnd(unittest.TestCase):
         np.random.seed(123)
         g2 = MediumJong([warm_player] + opps)
         moves_warm = []
+        discard_tiles_warm = []
         steps = 0
         while not g2.is_game_over() and steps < 200:
             gp = g2.get_game_perspective(g2.current_player_idx)
             if g2.current_player_idx == 0:
                 mv = warm_player.play(gp)
-                moves_warm.append(flat_index_for_action(gp, mv))
+                ai, ti = encode_two_head_action(mv)
+                moves_warm.append(ai)
+                if ai == ACTION_HEAD_INDEX['discard']:
+                    discard_tiles_warm.append(int(ti))
             g2.play_turn()
             steps += 1
 
@@ -342,21 +378,26 @@ class TestTrainEndToEnd(unittest.TestCase):
         self.assertGreater(len(moves_cold), 0)
         self.assertGreater(len(moves_warm), 0)
 
-        # Compare distributions over a larger number of samples
+        # Compare tile-level distributions on discard actions (where temperature should affect tile selection)
         import collections
-        cold_counts = collections.Counter(moves_cold)
-        warm_counts = collections.Counter(moves_warm)
-        # Normalize to probability distributions over observed actions
+        self.assertGreater(len(discard_tiles_cold), 0)
+        self.assertGreater(len(discard_tiles_warm), 0)
+
+        cold_tile_counts = collections.Counter(discard_tiles_cold)
+        warm_tile_counts = collections.Counter(discard_tiles_warm)
+
         def to_dist(counter):
             total = sum(counter.values())
-            return {k: v / float(total) for k, v in counter.items() if total > 0}
-        p_cold = to_dist(cold_counts)
-        p_warm = to_dist(warm_counts)
-        # Compute L1 distance over the union of actions
-        actions = set(p_cold.keys()) | set(p_warm.keys())
-        l1 = sum(abs(p_cold.get(a, 0.0) - p_warm.get(a, 0.0)) for a in actions)
-        # Expect a noticeable difference in distributions when temperature differs substantially
-        self.assertGreater(l1, 0.05)
+            return {k: v / float(max(1, total)) for k, v in counter.items()}
+
+        p_cold_tiles = to_dist(cold_tile_counts)
+        p_warm_tiles = to_dist(warm_tile_counts)
+
+        # Compute L1 distance over the union of observed tiles
+        all_tiles = set(p_cold_tiles.keys()) | set(p_warm_tiles.keys())
+        l1_tiles = sum(abs(p_cold_tiles.get(t, 0.0) - p_warm_tiles.get(t, 0.0)) for t in all_tiles)
+        # Expect a noticeable difference when temperatures differ substantially
+        self.assertGreater(l1_tiles, 0.05)
 
 
 def cleanup_old_models():

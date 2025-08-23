@@ -29,7 +29,8 @@ def _decode_gp_from_row(data, row_idx):
 
 
 def _post_action_concealed_and_calls(gp, move):
-    from core.game import Discard, Riichi, Chi, Pon, KanDaimin, KanAnkan, KanKakan, CalledSet
+    from core.action import Discard, Riichi, Chi, Pon, KanDaimin, KanAnkan, KanKakan
+    from core.game import CalledSet
     from core.tile import Tile
     concealed = list(gp.player_hand)
     called_sets = list(gp.called_sets.get(0, []))
@@ -130,16 +131,16 @@ class TestCreateDataset(unittest.TestCase):
         from core.game import MediumJong
         from core.learn.recording_ac_player import RecordingHeuristicACPlayer
         from core.learn.feature_engineering import decode_game_perspective
-        from core.learn.policy_utils import build_move_from_flat
+        from core.learn.policy_utils import build_move_from_two_head
 
         random.seed(123)
         np.random.seed(123)
 
         players = [
-            RecordingHeuristicACPlayer(0, random_exploration=0.0),
-            RecordingHeuristicACPlayer(1, random_exploration=0.0),
-            RecordingHeuristicACPlayer(2, random_exploration=0.0),
-            RecordingHeuristicACPlayer(3, random_exploration=0.0),
+            RecordingHeuristicACPlayer(random_exploration=0.0),
+            RecordingHeuristicACPlayer(random_exploration=0.0),
+            RecordingHeuristicACPlayer(random_exploration=0.0),
+            RecordingHeuristicACPlayer(random_exploration=0.0),
         ]
         g = MediumJong(players)
 
@@ -154,8 +155,11 @@ class TestCreateDataset(unittest.TestCase):
             self.assertEqual(len(p.experience.states), len(p.experience.actions))
             for st, act in zip(p.experience.states, p.experience.actions):
                 gp = decode_game_perspective(st)
-                move = build_move_from_flat(gp, int(act))
+                # act is a tuple (action_idx, tile_idx)
+                move = build_move_from_two_head(gp, int(act[0]), int(act[1]))
                 self.assertIsNotNone(move)
+                if not gp.is_legal(move):
+                    print(move, gp)
                 self.assertTrue(gp.is_legal(move))
                 total += 1
         self.assertGreater(total, 0)

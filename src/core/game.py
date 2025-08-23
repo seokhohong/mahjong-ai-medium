@@ -1,11 +1,11 @@
 import random
 import math
-import os
-import pickle
-from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Dict, Any, Union, Tuple
+import numpy as np
+
+from src.core.learn.ac_constants import chi_variant_index, ACTION_HEAD_INDEX, ACTION_HEAD_ORDER, TILE_HEAD_NOOP
 from .constants import (
     NUM_PLAYERS as MC_NUM_PLAYERS,
     DEALER_ID_START,
@@ -44,6 +44,7 @@ from .constants import (
     DEALER_RON_MULTIPLIER,
     NON_DEALER_RON_MULTIPLIER,
 )
+from .learn.policy_utils import _flat_tile_index
 
 # Tile enums, dataclass, and helpers moved to dedicated module
 from .tile import (
@@ -55,6 +56,23 @@ from .tile import (
     _dora_next,
     _tile_sort_key,
     make_tile,
+)
+
+
+# Action and reaction dataclasses moved to dedicated module
+from .action import (
+    Action,
+    Reaction,
+    Discard,
+    Riichi,
+    Tsumo,
+    Ron,
+    PassCall,
+    Pon,
+    Chi,
+    KanDaimin,
+    KanKakan,
+    KanAnkan,
 )
 
 
@@ -188,64 +206,7 @@ class GameOutcome:
             )
         return "\n".join(lines)
 
-# Actions and reactions
-@dataclass
-class Action: ...
-
-
-@dataclass
-class Reaction: ...
-
-
-@dataclass
-class Tsumo(Action): ...
-
-
-@dataclass
-class Ron(Reaction): ...
-
-
-@dataclass
-class Discard(Action):
-    tile: Tile
-
-
-@dataclass
-class Riichi(Action):
-    # Declare riichi by discarding this tile
-    tile: Tile
-
-
-@dataclass
-class Pon(Reaction):
-    tiles: List[Tile]
-
-
-@dataclass
-class Chi(Reaction):
-    tiles: List[Tile]
-
-
-@dataclass
-class PassCall(Reaction): ...
-
-
-@dataclass
-class KanDaimin(Reaction):
-    # Call Kan on a discard with three identical tiles from hand
-    tiles: List[Tile]
-
-
-@dataclass
-class KanKakan(Action):
-    # Upgrade an existing Pon to Kan using the drawn 4th tile
-    tile: Tile
-
-
-@dataclass
-class KanAnkan(Action):
-    # Concealed Kan from four tiles in hand
-    tile: Tile
+# Actions and reactions are imported from src.core.action
 
 
 @dataclass
@@ -428,10 +389,10 @@ def _has_ittsu(all_tiles: List[Tile]) -> bool:
             return True
     return False
 
-def _is_chi_possible_with(hand: List[Tile], target: Tile) -> List[List[Tile]]:
-    options: List[List[Tile]] = []
+def _possible_chis(hand: List[Tile], target: Tile) -> List[Chi]:
+    options: List[Chi] = []
     if target.suit == Suit.HONORS:
-        return options
+        return []
     s = target.suit
     v = int(target.tile_type.value)
     def has(val: int) -> Optional[Tile]:
@@ -443,17 +404,17 @@ def _is_chi_possible_with(hand: List[Tile], target: Tile) -> List[List[Tile]]:
     if v - 2 >= 1 and v - 1 >= 1:
         a = has(v-2); b = has(v-1)
         if a and b:
-            options.append([a, b])
+            options.append(Chi([a, b], 0)) # variant 0
     # (v-1, v+1)
     if v - 1 >= 1 and v + 1 <= 9:
         a = has(v-1); b = has(v+1)
         if a and b:
-            options.append([a, b])
+            options.append(Chi([a, b], 1))
     # (v+1, v+2)
     if v + 1 <= 9 and v + 2 <= 9:
         a = has(v+1); b = has(v+2)
         if a and b:
-            options.append([a, b])
+            options.append(Chi([a, b], 2))
     return options
 
 
@@ -598,8 +559,138 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
         han += 2
         fu = FU_CHIITOI
     else:
-        # Standard hand requires 4 melds + pair; if not formable, no win
-        fu = FU_BASELINE
+        # Standard hand fu: start from 20 base and add components
+        open_hand = _is_open_hand(called_sets)
+
+        # Helper: classify tile as terminal/honor vs simple
+        def _is_terminal_or_honor(t: Tile) -> bool:
+            if t.suit == Suit.HONORS:
+                return True
+            v = int(t.tile_type.value)
+            return v == 1 or v == 9
+
+        # Base fu (20 for standard hands)
+        fu = 20
+
+        # 1) Meld fu from called sets
+        for cs in called_sets:
+            if not cs.tiles:
+                continue
+            t0 = cs.tiles[0]
+            th = _is_terminal_or_honor(t0)
+            if cs.call_type == 'chi':
+                # sequences give no fu
+                pass
+            elif cs.call_type == 'pon':
+                # Open triplet
+                fu += 4 if th else 2
+            elif cs.call_type in ('kan_daimin', 'kan_kakan'):
+                # Open kan
+                fu += 16 if th else 8
+            elif cs.call_type == 'kan_ankan':
+                # Closed kan
+                fu += 32 if th else 16
+
+        # 2) Meld fu from concealed triplets present in concealed tiles
+        cnt = _count_tiles(concealed_tiles)
+        for (suit, val), c in cnt.items():
+            if c >= 3:
+                # Concealed triplet (ankan counted above via called_sets)
+                if suit == Suit.HONORS or val in (1, 9):
+                    fu += 8
+                else:
+                    fu += 4
+
+        # 3) Pair fu (yakuhai pair)
+        # Detect any pair in concealed tiles that is dragon or seat/round wind
+        pair_fu_added = False
+        for (suit, val), c in cnt.items():
+            if c >= 2 and suit == Suit.HONORS:
+                try:
+                    h = Honor(val)  # type: ignore[arg-type]
+                except Exception:
+                    continue
+                if h in (Honor.WHITE, Honor.GREEN, Honor.RED) or h == seat_wind or h == round_wind:
+                    fu += 2
+                    pair_fu_added = True
+                    break
+
+        # 4) Wait fu (+2 for kanchan, penchan, tanki)
+        # Infer winning tile by removing one tile that was likely just added and checking waits
+        def _infer_win_tile_and_wait_fu() -> int:
+            from .tenpai import waits_for_tiles as _waits_13
+            # Build unique tile kinds from concealed hand
+            kinds: List[Tile] = []
+            seen = set()
+            for t in concealed_tiles:
+                key = (t.suit, int(t.tile_type.value))
+                if key not in seen:
+                    seen.add(key)
+                    kinds.append(t)
+            # Try each as the winning tile
+            for cand in kinds:
+                # Remove one cand -> 13 tiles
+                removed = False
+                hand13: List[Tile] = []
+                for t in concealed_tiles:
+                    if (not removed) and t.suit == cand.suit and t.tile_type == cand.tile_type:
+                        removed = True
+                        continue
+                    hand13.append(t)
+                if len(hand13) != len(concealed_tiles) - 1:
+                    continue
+                waits = _waits_13(hand13)
+                # Check if cand is indeed a wait
+                if any(w.suit == cand.suit and w.tile_type == cand.tile_type for w in waits):
+                    # Classify wait type for suits only
+                    if cand.suit == Suit.HONORS:
+                        # Honors cannot form sequences; only tanki or shanpon. Tanki if hand13 had exactly one of cand.
+                        if cnt.get((cand.suit, int(cand.tile_type.value)), 0) - 1 == 1:
+                            return 2
+                        return 0
+                    v = int(cand.tile_type.value)
+                    # Count of cand in 13 tiles
+                    c13 = sum(1 for t in hand13 if t.suit == cand.suit and int(t.tile_type.value) == v)
+                    if c13 == 1:
+                        # Likely tanki (pair wait)
+                        return 2
+                    if c13 >= 2:
+                        # Shanpon (two pairs waiting to become triplet) -> 0
+                        return 0
+                    # c13 == 0 -> sequence wait; distinguish kanchan/penchan/ryanmen
+                    def has(val: int) -> bool:
+                        return any(t.suit == cand.suit and int(t.tile_type.value) == val for t in hand13)
+                    # Kanchan: v-1 and v+1 exist
+                    if 2 <= v <= 8 and has(v-1) and has(v+1):
+                        return 2
+                    # Penchan: 1-2-[3] or [7]-8-9
+                    if (v == 3 and has(1) and has(2)) or (v == 7 and has(8) and has(9)):
+                        return 2
+                    # Otherwise ryanmen or other -> 0
+                    return 0
+            return 0
+
+        fu += _infer_win_tile_and_wait_fu()
+
+        # 5) Winning method fu
+        if win_by_tsumo:
+            # +2 for tsumo; waived for pinfu tsumo below
+            fu += 2
+        else:
+            # Closed ron +10
+            if not open_hand:
+                fu += 10
+
+        # Pinfu handling:
+        # - Closed pinfu tsumo is fixed 20 (no +2 tsumo)
+        # - Closed pinfu ron will already be 30 (20 base + 10 menzen ron)
+        if _is_pinfu(all_tiles, called_sets, seat_wind, round_wind):
+            if win_by_tsumo:
+                fu = 20
+
+        # Open hand with no fu sources should be set to 30 on ron (per tests)
+        if open_hand and not win_by_tsumo and fu <= 20:
+            fu = 30
         if _is_tanyao(all_tiles):
             han += 1
         if _is_toitoi(all_tiles, called_sets):
@@ -648,6 +739,12 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
     # Count red-5 (aka) as dora as well
     aka_han = _count_aka_han(all_tiles)
     han += dora_han + aka_han
+    
+    # Fu rounding (except chiitoi 25 fu already handled)
+    if not chiitoi:
+        # Round up to nearest 10
+        if fu % 10 != 0:
+            fu = fu + (10 - fu % 10)
 
     return fu, han, dora_han
 
@@ -711,8 +808,8 @@ class GamePerspective:
                  ) -> None:
         self.player_hand = sorted(list(player_hand), key=_tile_sort_key)
         self.remaining_tiles = remaining_tiles
-        self.last_discarded_tile = last_discarded_tile
-        self.last_discard_player = last_discard_player
+        self._reactable_tile = last_discarded_tile
+        self._owner_of_reactable_tile = last_discard_player
         self.called_sets = {pid: list(sets) for pid, sets in called_sets.items()}
         self.player_discards = {pid: list(ts) for pid, ts in player_discards.items()}
         self.called_discards = {pid: list(idxs) for pid, idxs in called_discards.items()}
@@ -741,9 +838,9 @@ class GamePerspective:
 
         newly = self.newly_drawn_tile
         newly_s = str(newly) if newly is not None else 'None'
-        last = self.last_discarded_tile
+        last = self._reactable_tile
         last_s = str(last) if last is not None else 'None'
-        last_from = 'None' if self.last_discard_player is None else f"P{self.last_discard_player}"
+        last_from = 'None' if self._owner_of_reactable_tile is None else f"P{self._owner_of_reactable_tile}"
         my_called = _fmt_called_sets(self.called_sets.get(0, []))
         state_s = 'Action' if self.state is Action else 'Reaction'
         can_call_s = '1' if self.can_call else '0'
@@ -754,6 +851,103 @@ class GamePerspective:
 
     def _concealed_tiles(self) -> List[Tile]:
         return list(self.player_hand)
+
+    def legal_action_mask(self) -> np.ndarray:
+        """Return ACTION_HEAD_SIZE-length 0/1 mask over action head.
+
+        For tile-parameterized actions, mark 1 if there exists at least one legal instantiation.
+        """
+        import numpy as _np
+        m = _np.zeros((len(ACTION_HEAD_ORDER),), dtype=_np.float64)
+        moves = self.legal_moves()
+        # Presence flags
+        has = {name: False for name in ACTION_HEAD_ORDER}
+        last = self._reactable_tile
+        # Pre-compute reaction options (flat list)
+        reaction_opts: List[Reaction] = self.get_call_options() if self.state is Reaction else []
+        # Chi variants
+        for r in reaction_opts:
+            if isinstance(r, Chi):
+                has_aka = False
+                if last is not None:
+                    has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
+                variant = getattr(r, 'chi_variant_index', None)
+                if variant == 0:
+                    has['chi_low_aka' if has_aka else 'chi_low_noaka'] = True
+                elif variant == 1:
+                    has['chi_mid_aka' if has_aka else 'chi_mid_noaka'] = True
+                elif variant == 2:
+                    has['chi_high_aka' if has_aka else 'chi_high_noaka'] = True
+        # Pon variants
+        for r in reaction_opts:
+            if isinstance(r, Pon):
+                has_aka = False
+                if last is not None:
+                    has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
+                has['pon_aka' if has_aka else 'pon_noaka'] = True
+        # Daiminkan present
+        if any(isinstance(r, KanDaimin) for r in reaction_opts):
+            has['kan_daimin'] = True
+        # Iterate legal moves for other actions
+        for mv in moves:
+            if isinstance(mv, Discard):
+                has['discard'] = True
+            elif isinstance(mv, Riichi):
+                has['riichi'] = True
+            elif isinstance(mv, Tsumo):
+                has['tsumo'] = True
+            elif isinstance(mv, Ron):
+                has['ron'] = True
+            elif isinstance(mv, KanKakan):
+                has['kan_kakan'] = True
+            elif isinstance(mv, KanAnkan):
+                has['kan_ankan'] = True
+            elif isinstance(mv, PassCall):
+                has['pass'] = True
+        for name, ok in has.items():
+            if name in ACTION_HEAD_INDEX and ok:
+                m[ACTION_HEAD_INDEX[name]] = 1.0
+        return m
+
+    def legal_tile_mask(self, action_idx: int) -> np.ndarray:
+        """Return TILE_HEAD_SIZE-length 0/1 mask for the tile head given chosen action.
+
+        If the chosen action is not tile-parameterized, returns mask with only no-op enabled.
+        For tile-parameterized actions, enables tile slots corresponding to legal instantiations.
+        """
+        import numpy as _np
+        name = ACTION_HEAD_ORDER[action_idx] if 0 <= action_idx < len(ACTION_HEAD_ORDER) else None
+        m = _np.zeros((38,), dtype=_np.float64)
+        if name is None:
+            return m
+        # Non-parameterized -> no-op only
+        if name in ('tsumo', 'ron', 'pass', 'kan_daimin') or name.startswith('chi_') or name.startswith('pon_'):
+            m[TILE_HEAD_NOOP] = 1.0
+            return m
+        # Collect legal tiles per action
+        cand: list[int] = []
+        if name == 'discard' or name == 'riichi':
+            for mv in self.legal_moves():
+                if (name == 'discard' and isinstance(mv, Discard)) or (name == 'riichi' and isinstance(mv, Riichi)):
+                    cand.append(tile_flat_index(mv.tile))
+        elif name == 'kan_kakan':
+            for mv in self.legal_moves():
+                if isinstance(mv, KanKakan):
+                    cand.append(tile_flat_index(mv.tile))
+        elif name == 'kan_ankan':
+            for mv in self.legal_moves():
+                if isinstance(mv, KanAnkan):
+                    cand.append(tile_flat_index(mv.tile))
+        # Populate mask
+        if cand:
+            for idx in cand:
+                if 0 <= idx <= 36:
+                    m[idx] = 1.0
+        else:
+            # If no legal instantiation detected, still allow no-op to avoid invalid sampling
+            m[TILE_HEAD_NOOP] = 1.0
+        return m
+
 
     def _has_yaku_if_complete(self) -> bool:
         # Simple heuristic: evaluate yaku on this hand if it is standard or chiitoi
@@ -804,7 +998,7 @@ class GamePerspective:
         return False
 
     def can_ron(self) -> bool:
-        if self.last_discarded_tile is None or self.last_discard_player == 0:
+        if self._reactable_tile is None or self._owner_of_reactable_tile == 0:
             return False
         # Furiten blocks ron
         if self._is_furiten():
@@ -813,8 +1007,8 @@ class GamePerspective:
 
     def _win_possible(self, require_yaku: bool, include_last_discard: bool = False) -> bool:
         ct = list(self.player_hand)
-        if include_last_discard and self.last_discarded_tile is not None:
-            ct = ct + [self.last_discarded_tile]
+        if include_last_discard and self._reactable_tile is not None:
+            ct = ct + [self._reactable_tile]
         cs = self.called_sets.get(0, [])
         ok = False
         if _is_chiitoi(ct, cs):
@@ -873,99 +1067,32 @@ class GamePerspective:
                 return True
         return False
 
-    def legal_flat_mask(self) -> List[int]:
-        """Return a flat 0/1 mask indicating legal actions in a fixed action space.
-
-        Layout (length 160):
-        - 0..36: Discard by tile index (0..36)
-        - 37..73: Riichi by discard tile index (0..36)
-        - 74: Tsumo
-        - 75: Ron
-        - 76..81: Chi variants without aka [low, mid, high] then with aka [low, mid, high]
-        - 82..83: Pon [no-aka, with-aka]
-        - 84: Kan (daiminkan) on last discard
-        - 85..121: Kan Kakan by tile index (0..36)
-        - 122..158: Kan Ankan by tile index (0..36)
-        - 159: Pass (only meaningful in reaction state)
-        """
-        TOTAL = 160
-        OFF_DISCARD = 0
-        OFF_RIICHI = 37
-        OFF_TSUMO = 74
-        OFF_RON = 75
-        OFF_CHI = 76            # 0..2 no-aka, 3..5 with-aka
-        OFF_PON_NOAKA = 82
-        OFF_PON_AKA = 83
-        OFF_KAN_DAIMIN = 84
-        OFF_KAKAN = 85
-        OFF_ANKAN = 122
-        OFF_PASS = 159
-
-        mask = [0] * TOTAL
-
-        # Build mask directly from single source of truth: legal_moves()
-        for m in self.legal_moves():
-            if isinstance(m, Discard):
-                idx = tile_flat_index(m.tile)
-                mask[OFF_DISCARD + idx] = 1
-            elif isinstance(m, Riichi):
-                idx = tile_flat_index(m.tile)
-                mask[OFF_RIICHI + idx] = 1
-            elif isinstance(m, Tsumo):
-                mask[OFF_TSUMO] = 1
-            elif isinstance(m, Ron):
-                mask[OFF_RON] = 1
-            elif isinstance(m, Chi):
-                v = _chi_variant_index(self.last_discarded_tile, m.tiles)
-                if 0 <= v <= 2:
-                    aka = any(t.aka for t in (m.tiles + ([self.last_discarded_tile] if self.last_discarded_tile else [])))
-                    mask[OFF_CHI + v + (3 if aka else 0)] = 1
-            elif isinstance(m, Pon):
-                aka = any(t.aka for t in (m.tiles + ([self.last_discarded_tile] if self.last_discarded_tile else [])))
-                mask[OFF_PON_AKA if aka else OFF_PON_NOAKA] = 1
-            elif isinstance(m, KanDaimin):
-                mask[OFF_KAN_DAIMIN] = 1
-            elif isinstance(m, KanKakan):
-                idx = tile_flat_index(m.tile)
-                mask[OFF_KAKAN + idx] = 1
-            elif isinstance(m, KanAnkan):
-                idx = tile_flat_index(m.tile)
-                mask[OFF_ANKAN + idx] = 1
-            elif isinstance(m, PassCall):
-                mask[OFF_PASS] = 1
-
-        return mask
-
-    def legal_flat_mask_np(self):
-        """Return the legal actions mask as a numpy 1D array of 0/1 with length 160.
-
-        This mirrors legal_flat_mask but returns an np.ndarray for downstream models.
-        """
-        import numpy as _np  # local import to avoid hard dependency at module import time
-        return _np.asarray(self.legal_flat_mask(), dtype=_np.float64)
-
     def discard_is_called(self, player_id: int, discard_index: int) -> bool:
         return discard_index in self.called_discards.get(player_id, [])
 
-    def get_call_options(self) -> Dict[str, List[List[Tile]]]:
-        options = {'pon': [], 'chi': [], 'kan_daimin': []}  # kan_daimin: react to discard
-        last = self.last_discarded_tile
-        lp = self.last_discard_player
+    def get_call_options(self) -> List[Reaction]:
+        """Return a flat list of legal reaction moves to the last discard.
+
+        Includes `Chi`, `Pon`, and `KanDaimin` when available. Empty when no
+        reactions are possible or reacting to own discard.
+        """
+        reactions: List[Reaction] = []
+        last = self._reactable_tile
+        lp = self._owner_of_reactable_tile
         if last is None or lp is None or lp == 0:
-            return options
+            return reactions
         hand = list(self.player_hand)
         # Pon
         same = [t for t in hand if t.suit == last.suit and t.tile_type == last.tile_type]
         if len(same) >= 2:
-            options['pon'].append([same[0], same[1]])
+            reactions.append(Pon([same[0], same[1]]))
         # Chi (left player only)
         if 0 == (lp + 1) % 4 and last.suit != Suit.HONORS:
-            for pair in _is_chi_possible_with(hand, last):
-                options['chi'].append(pair)
+            reactions.extend(_possible_chis(hand, last))
         # Daiminkan: need three in hand
         if len(same) >= 3:
-            options['kan_daimin'].append([same[0], same[1], same[2]])
-        return options
+            reactions.append(KanDaimin([same[0], same[1], same[2]]))
+        return reactions
 
     def is_legal(self, move: Union[Action, Reaction]) -> bool:
         # Riichi restriction: after declaring, only Tsumo or Kan actions are allowed on own turn
@@ -1004,74 +1131,39 @@ class GamePerspective:
                     return self.newly_drawn_tile is not None and move.tile == self.newly_drawn_tile
                 return move.tile in self.player_hand
             return False
-
-        # Reactions
-        if self.state is not Reaction:
-            return False
-        # Riichi restriction on reactions: cannot Chi/Pon/KanDaimin after declaring Riichi
-        if riichi_locked and isinstance(move, (Pon, Chi, KanDaimin)):
-            return False
-        if isinstance(move, Ron):
-            return self.can_ron()
-        if isinstance(move, PassCall):
+        if isinstance(move, (Chi, Pon, KanDaimin, Ron, PassCall)):
+            # Reactions
+            if self.state is not Reaction:
+                return False
+            if isinstance(move, PassCall):
+                return True
+            # Riichi restriction on reactions: cannot Chi/Pon/KanDaimin after declaring Riichi
+            if riichi_locked and isinstance(move, (Pon, Chi, KanDaimin)):
+                return False
+            if isinstance(move, Ron):
+                return self.can_ron()
+            if isinstance(move, PassCall):
+                opts = self.get_call_options()
+                return self.can_ron() or bool(opts)
             opts = self.get_call_options()
-            return self.can_ron() or bool(opts['pon'] or opts['chi'] or opts['kan_daimin'])
-        if self.can_ron() and isinstance(move, (Pon, Chi, KanDaimin)):
+            if isinstance(move, (Pon, Chi, KanDaimin)):
+                return any(move == cand for cand in opts)
             return False
-        opts = self.get_call_options()
-        if isinstance(move, Pon):
-            return any(sorted([(t.suit.value, int(t.tile_type.value)) for t in move.tiles]) ==
-                       sorted([(t.suit.value, int(t.tile_type.value)) for t in cand]) for cand in opts['pon'])
-        if isinstance(move, Chi):
-            return any(sorted([(t.suit.value, int(t.tile_type.value)) for t in move.tiles]) ==
-                       sorted([(t.suit.value, int(t.tile_type.value)) for t in cand]) for cand in opts['chi'])
-        if isinstance(move, KanDaimin):
-            return any(sorted([(t.suit.value, int(t.tile_type.value)) for t in move.tiles]) ==
-                       sorted([(t.suit.value, int(t.tile_type.value)) for t in cand]) for cand in opts['kan_daimin'])
         return False
 
-    def legal_moves(self) -> List[Union[Action, Reaction]]:
-        moves: List[Union[Action, Reaction]] = []
-        riichi_locked = self.riichi_declared.get(0, False)
-        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player is not None and self.last_discard_player != 0:
-            if self.can_ron():
-                return [PassCall(), Ron()]
-            if riichi_locked:
-                # After Riichi, only Pass or Ron as reactions
-                return [PassCall()]
-            opts = self.get_call_options()
-            any_call = False
-            for ts in opts['pon']:
-                moves.append(Pon(ts)); any_call = True
-            for ts in opts['chi']:
-                moves.append(Chi(ts)); any_call = True
-            for ts in opts['kan_daimin']:
-                moves.append(KanDaimin(ts)); any_call = True
-            if any_call:
-                moves.insert(0, PassCall())
-            return moves
 
     def legal_moves(self) -> List[Union[Action, Reaction]]:
         moves: List[Union[Action, Reaction]] = []
         riichi_locked = self.riichi_declared.get(0, False)
-        if self.state is Reaction and self.last_discarded_tile is not None and self.last_discard_player is not None and self.last_discard_player != 0:
+        if self.state is Reaction:
+            moves = [PassCall()]
             if self.can_ron():
-                return [PassCall(), Ron()]
+                return moves + [Ron()]
             if riichi_locked:
                 # After Riichi, only Pass or Ron as reactions
-                return [PassCall()]
-            opts = self.get_call_options()
-            any_call = False
-            for ts in opts['pon']:
-                moves.append(Pon(ts)); any_call = True
-            for ts in opts['chi']:
-                moves.append(Chi(ts)); any_call = True
-            for ts in opts['kan_daimin']:
-                moves.append(KanDaimin(ts)); any_call = True
-            if any_call:
-                moves.insert(0, PassCall())
+                return moves
+            moves.extend(self.get_call_options())
             return moves
-
         if self.state is Action:
             if self.can_tsumo():
                 moves.append(Tsumo())
@@ -1148,8 +1240,6 @@ class GamePerspective:
 
 
 class Player:
-    def __init__(self, player_id: int):
-        self.player_id = player_id
 
     def play(self, game_state: GamePerspective) -> Action:
         moves = game_state.legal_moves()
@@ -1168,15 +1258,18 @@ class Player:
         # Fallback
         return moves[0]
 
-    def choose_reaction(self, game_state: GamePerspective, options: Dict[str, List[List[Tile]]]) -> Reaction:
+    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
         if game_state.can_ron():
             return Ron()
-        if options.get('kan_daimin'):
-            return KanDaimin(options['kan_daimin'][0])
-        if options.get('pon'):
-            return Pon(options['pon'][0])
-        if options.get('chi'):
-            return Chi(options['chi'][0])
+        for r in options:
+            if isinstance(r, KanDaimin):
+                return r
+        for r in options:
+            if isinstance(r, Pon):
+                return r
+        for r in options:
+            if isinstance(r, Chi):
+                return r
         return PassCall()
 
 
@@ -1187,6 +1280,9 @@ class MediumJong:
         if len(players) != MediumJong.NUM_PLAYERS:
             raise ValueError("MediumJong requires exactly 4 players")
         self.players = players
+        # Internal mapping from Player instance to absolute player id (0..3)
+        # This avoids relying on Player having a player_id attribute.
+        self._player_to_id: Dict[Player, int] = {p: i for i, p in enumerate(players)}
         self._player_hands: Dict[int, List[Tile]] = {i: [] for i in range(4)}
         self._player_called_sets: Dict[int, List[CalledSet]] = {i: [] for i in range(4)}
         self.player_discards: Dict[int, List[Tile]] = {i: [] for i in range(4)}
@@ -1268,6 +1364,18 @@ class MediumJong:
                 self._player_hands[pid].append(self.tiles.pop())
 
         # Helper methods for riichi/ippatsu state management
+
+    def get_player_id(self, player: Player) -> int:
+        """Return absolute player id for a Player instance (0..3).
+
+        MediumJong manages this mapping internally and does not rely on
+        Player.player_id existing.
+        """
+        return self._player_to_id[player]
+
+    def get_player(self, player_id: int) -> Player:
+        """Return Player instance for an absolute player id (0..3)."""
+        return self.players[player_id]
 
     def _cancel_ippatsu_all(self) -> None:
         """Cancel ippatsu eligibility for all players."""
@@ -1583,8 +1691,8 @@ class MediumJong:
             opts = gs.get_call_options()
             if gs.can_ron():
                 can_ron[pid] = True
-                choices[pid] = self.players[pid].choose_reaction(gs, { })  # type: ignore[arg-type]
-            elif opts['pon'] or opts['chi'] or opts['kan_daimin']:
+                choices[pid] = self.players[pid].choose_reaction(gs, [])
+            elif opts:
                 choices[pid] = self.players[pid].choose_reaction(gs, opts)
         # Ron first
         rons = [pid for pid, ch in choices.items() if isinstance(ch, Ron) and can_ron.get(pid, False)]

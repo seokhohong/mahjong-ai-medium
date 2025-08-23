@@ -4,6 +4,8 @@ import sys
 from typing import Any
 from pathlib import Path
 import numpy as np
+from core.learn.ac_constants import ACTION_HEAD_INDEX, ACTION_HEAD_ORDER
+from core.learn.policy_utils import encode_two_head_action, build_move_from_two_head
 
 
 def _ensure_src_importable() -> None:
@@ -30,11 +32,12 @@ def main() -> None:
         sys.exit(1)
 
     actor_id = data.get("actor_id")
-    perspective = data.get("perspective")
+    perspective = data.get("game_perspective")
+    perspective.get_call_options()
+    perspective.legal_moves()
+    action = build_move_from_two_head(perspective, data["action_index"], data["tile_index"])
     move = data.get("move")
     game = data.get("game")
-    perspective.legal_flat_mask()
-    perspective.is_legal(move)
     print("===== MediumJong Illegal Move Debug =====")
     print(f"File: {args.file}")
     print(f"Actor ID: {actor_id}")
@@ -43,7 +46,8 @@ def main() -> None:
     # Pretty print move
     print("\n-- Move --")
     try:
-        from src.core.game import Discard, Riichi, Pon, Chi, KanDaimin, KanKakan, KanAnkan, Tsumo, Ron, Tile
+        from src.core.action import Discard, Riichi, Pon, Chi, KanDaimin, KanKakan, KanAnkan, Tsumo, Ron
+        from src.core.tile import Tile
     except Exception:
         # Import only used for isinstance checks; if it fails, fallback to generic print
         Discard = Riichi = Pon = Chi = KanDaimin = KanKakan = KanAnkan = Tsumo = Ron = object  # type: ignore

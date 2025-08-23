@@ -28,6 +28,10 @@ from src.core.game import (
     Tsumo,
     Ron,
     Discard,
+    Reaction,
+    Pon,
+    Chi,
+    KanDaimin,
 )
 from src.core.learn.ac_network import ACNetwork
 from src.core.learn.ac_player import ACPlayer
@@ -58,8 +62,8 @@ class TextViewerPlayer(Player):
 
     We keep the player stateless; the engine provides GamePerspective with all info.
     """
-    def __init__(self, player_id: int, base: Player, lines: List[str]) -> None:
-        super().__init__(player_id)
+    def __init__(self, base: Player, lines: List[str]) -> None:
+        super().__init__()
         self._base = base
         self._lines = lines
 
@@ -76,21 +80,22 @@ class TextViewerPlayer(Player):
                 pass
             my_called = _fmt_called_sets(gs.called_sets.get(gs.player_id, []))
             self._lines.append(
-                f"Turn: P{self.player_id} | Hand {_fmt_hand(gs.player_hand)} | Called {my_called} | Draw {newly_s} | Action {action_s}"
+                f"Turn: P{gs.player_id} | Hand {_fmt_hand(gs.player_hand)} | Called {my_called} | Draw {newly_s} | Action {action_s}"
             )
         except Exception:
             pass
 
-    def _log_reaction(self, gs: Any, options: Dict[str, List[List[Tile]]], action: Any) -> None:
+    def _log_reaction(self, gs: Any, options: List[Reaction], action: Any) -> None:
         try:
             last = gs._reactable_tile
             last_s = str(last) if last is not None else 'None'
-            pon_ct = len(options.get('pon', [])) if options else 0
-            chi_ct = len(options.get('chi', [])) if options else 0
+            pon_ct = sum(1 for r in options if isinstance(r, Pon)) if options else 0
+            chi_ct = sum(1 for r in options if isinstance(r, Chi)) if options else 0
+            kan_ct = sum(1 for r in options if isinstance(r, KanDaimin)) if options else 0
             action_s = type(action).__name__
             my_called = _fmt_called_sets(gs.called_sets.get(gs.player_id, []))
             self._lines.append(
-                f"Reaction: P{self.player_id} on {last_s} from P{gs._owner_of_reactable_tile} | Called {my_called} | opts pon={pon_ct} chi={chi_ct} | Chosen {action_s}"
+                f"Reaction: P{gs.player_id} on {last_s} from P{gs._owner_of_reactable_tile} | Called {my_called} | opts pon={pon_ct} chi={chi_ct} kan={kan_ct} | Chosen {action_s}"
             )
         except Exception:
             pass
@@ -100,7 +105,7 @@ class TextViewerPlayer(Player):
         self._log_turn(game_state, action)
         return action
 
-    def choose_reaction(self, game_state: Any, options: Dict[str, List[List[Tile]]]) -> Any:  # type: ignore[name-defined]
+    def choose_reaction(self, game_state: Any, options: List[Reaction]) -> Any:  # type: ignore[name-defined]
         action = self._base.choose_reaction(game_state, options)
         self._log_reaction(game_state, options, action)
         return action
@@ -115,7 +120,7 @@ def simulate_with_text(tile_copies: int = 4, seed: int = 0, ac_model: Optional[s
     lines: List[str] = []
 
     # Build wrapped players
-    base_players: List[Player] = [Player(i) for i in range(4)]
+    base_players: List[Player] = [Player() for _ in range(4)]
     # If a model path is provided, seat 0 uses ACPlayer with that model
     if ac_model:
         try:
@@ -127,11 +132,11 @@ def simulate_with_text(tile_copies: int = 4, seed: int = 0, ac_model: Optional[s
 
             net = ACNetwork(gsv_scaler=gsv_scaler)
             net.load_model(ac_model)
-            base_players[0] = ACPlayer(0, net, gsv_scaler=None)
+            base_players[0] = ACPlayer(network=net, gsv_scaler=None)
             lines.append(f"Seat 0 using ACPlayer with model '{ac_model}'")
         except Exception as e:
             lines.append(f"Failed to load AC model '{ac_model}': {e}. Falling back to baseline Player.")
-    players = [TextViewerPlayer(i, base_players[i], lines) for i in range(4)]
+    players = [TextViewerPlayer(base_players[i], lines) for i in range(4)]
 
     game = SimpleJong(players, tile_copies=tile_copies)
     # Ensure wrapped base players receive game back-reference

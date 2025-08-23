@@ -12,7 +12,7 @@ from core.heuristics_player import MediumHeuristicsPlayer
 
 class TestHeuristicsPlayerGame(unittest.TestCase):
     def test_heuristics_players_complete_a_game(self):
-        players = [MediumHeuristicsPlayer(i) for i in range(4)]
+        players = [MediumHeuristicsPlayer() for i in range(4)]
         g = MediumJong(players)
         # Run until game over with a safety cap to prevent infinite loops in case of regression
         for _ in range(2000):

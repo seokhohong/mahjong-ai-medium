@@ -13,15 +13,15 @@ from test_utils import ForceActionPlayer, NoReactionPlayer, ForceDiscardPlayer
 
 from core.game import (
     MediumJong, Player,
-    Discard, Tsumo, Chi, Riichi,
     CalledSet, OutcomeType,
 )
+from core.action import Discard, Tsumo, Chi, Riichi
 from core.tile import Tile, TileType, Suit, Honor
 
 
 class TestMediumJongBasics(unittest.TestCase):
     def setUp(self):
-        self.players = [Player(i) for i in range(4)]
+        self.players = [Player() for i in range(4)]
         self.game = MediumJong(self.players)
 
     def test_initialization(self):
@@ -39,7 +39,7 @@ class TestMediumJongBasics(unittest.TestCase):
 
     def test_tile_sorting_honors(self):
         # Ensure honors sort without error and by honor rank 1..7 (E,S,W,N,P,G,R)
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         scrambled_honors = [
             Tile(Suit.HONORS, Honor.RED),
             Tile(Suit.HONORS, Honor.EAST),
@@ -101,7 +101,7 @@ class TestMediumJongBasics(unittest.TestCase):
         self.assertEqual([str(t) for t in sorted_tiles], ['3p', '4p', '0p', '6p'])
 
     def test_chi_left_only(self):
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         # Prepare controlled hands
         g._player_hands[1] = [Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)] + g._player_hands[1][2:]
         g._player_hands[2] = [Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)] + g._player_hands[2][2:]
@@ -119,7 +119,7 @@ class TestMediumJongBasics(unittest.TestCase):
     def test_pon_any_player(self):
         import random
         random.seed(123)
-        g = MediumJong([ForceDiscardPlayer(0, target=Tile(Suit.SOUZU, TileType.FIVE)), Player(1), Player(2), Player(3)])
+        g = MediumJong([ForceDiscardPlayer(target=Tile(Suit.SOUZU, TileType.FIVE)), Player(), Player(), Player()])
         g._player_hands[2] = [
             Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR),
             Tile(Suit.HONORS, Honor.EAST), Tile(Suit.HONORS, Honor.EAST), Tile(Suit.HONORS, Honor.EAST),
@@ -132,12 +132,14 @@ class TestMediumJongBasics(unittest.TestCase):
         self.assertTrue(len(g._player_called_sets[2]) > 0)
 
     def test_chain_pon_calls(self):
+        import random
+        random.seed(123)
         # Chain pon scenario:
         # P0 discards 3p -> P1 pon; P1 discards 4s -> P2 pon.
-        p0 = ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE))
-        p1 = ForceDiscardPlayer(1, Tile(Suit.SOUZU, TileType.FOUR))  # after pon, discard 4s
-        p2 = Player(2)  # default reaction prefers pon if available
-        p3 = NoReactionPlayer(3)
+        p0 = ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE))
+        p1 = ForceDiscardPlayer(Tile(Suit.SOUZU, TileType.FOUR))  # after pon, discard 4s
+        p2 = Player()  # default reaction prefers pon if available
+        p3 = NoReactionPlayer()
         g = MediumJong([p0, p1, p2, p3])
 
         # Ensure P0 has a 3p to discard
@@ -178,13 +180,13 @@ class TestMediumJongBasics(unittest.TestCase):
         # Player 0 with 4x NORTH should Ankan on first play_turn, keep turn, then discard on second
         class KanThenDiscard(Player):
             def play(self, gs):  # type: ignore[override]
-                from core.game import KanAnkan
+                from core.action import KanAnkan
                 for m in gs.legal_moves():
                     if isinstance(m, KanAnkan):
                         return m
                 return Discard(gs.player_hand[0])
 
-        g = MediumJong([KanThenDiscard(0), NoReactionPlayer(1), NoReactionPlayer(2), NoReactionPlayer(3)])
+        g = MediumJong([KanThenDiscard(), NoReactionPlayer(), NoReactionPlayer(), NoReactionPlayer()])
         g._player_hands[0] = [
             Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.NORTH),
             Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.NORTH)
@@ -204,7 +206,7 @@ class TestMediumJongBasics(unittest.TestCase):
 
     def test_ron_priority_over_calls(self):
 
-        players = [ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE)), Player(1), Player(2), Player(3)]
+        players = [ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)), Player(), Player(), Player()]
         g = MediumJong(players)
         # Configure: player 3 can ron on 3p; player 2 can pon 3p
         # Player 3 exact 13 tiles (Tanyao-ready): 2p,4p; 345s; 456s; 456m; pair 77p
@@ -233,7 +235,7 @@ class TestYakuAndRiichi(unittest.TestCase):
                 # Return any discard to continue
                 return Discard(game_state.player_hand[0])
 
-        players = [CheckTsumoLegal(0), Player(1), Player(2), Player(3)]
+        players = [CheckTsumoLegal(), Player(), Player(), Player()]
         g = MediumJong(players)
         # Construct complete no-yaku hand for player 0 after a draw
         # 123m, 234p, 345s, 456m, pair 9s9s (no tanyao due to terminals; no sanshoku; no iipeikou)
@@ -254,7 +256,7 @@ class TestYakuAndRiichi(unittest.TestCase):
         g.play_turn()
 
     def test_tanyao_enables_win(self):
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         # All simples hand waiting completed
         tiles = [
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
@@ -271,7 +273,7 @@ class TestYakuAndRiichi(unittest.TestCase):
 
     def test_yakuhai_winds(self):
         # Player 0 tsumo with triplet of East; closed hand; expect 3 han: 1 seat wind + 1 round wind + 1 menzen tsumo
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         # Construct 13-tile closed hand:
         # E E E | 234m | 345p | 77s (pair) | 4s 5s (waiting on 6s)
         tiles_13 = [
@@ -299,7 +301,8 @@ class TestYakuAndRiichi(unittest.TestCase):
     def test_riichi_lock_and_uradora(self):
         import random
         random.seed(433)
-        g = MediumJong([ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.TWO))), NoReactionPlayer(1), NoReactionPlayer(2), NoReactionPlayer(3)])
+        g = MediumJong([ForceActionPlayer(Riichi(Tile(Suit.MANZU, TileType.TWO))), NoReactionPlayer(),
+                        NoReactionPlayer(), NoReactionPlayer()])
         # Put player 0 in tenpai with closed hand; ensure Riichi legal and then only discard drawn/kan/tsumo allowed
         # Tenpai example: needing 3p to complete 2-3-4p
         base = [
@@ -322,7 +325,7 @@ class TestYakuAndRiichi(unittest.TestCase):
 
     def test_menzen_tsumo_yakuless(self):
         # Closed hand with no yaku except menzen tsumo should win by tsumo
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         tiles_13 = [
             # 234m sequence
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
@@ -357,20 +360,20 @@ class TestYakuAndRiichi(unittest.TestCase):
         # and the only yaku should be menzen tsumo.
         class KanThenTsumo(Player):
             def play(self, gs):  # type: ignore[override]
-                from core.game import KanAnkan
+                from core.action import KanAnkan
                 # If ankan is legal, perform it first
                 for m in gs.legal_moves():
                     if isinstance(m, KanAnkan):
                         return m
                 # If tsumo is legal now, do it
                 if gs.can_tsumo():
-                    from core.game import Tsumo
+                    from core.action import Tsumo
                     return Tsumo()
                 # Otherwise discard any
-                from core.game import Discard
+                from core.action import Discard
                 return Discard(gs.player_hand[0])
 
-        g = MediumJong([KanThenTsumo(0), NoReactionPlayer(1), NoReactionPlayer(2), NoReactionPlayer(3)])
+        g = MediumJong([KanThenTsumo(), NoReactionPlayer(), NoReactionPlayer(), NoReactionPlayer()])
         # Start with four NORTHs to enable immediate Ankan, and a nearly complete closed hand with no yaku
         g._player_hands[0] = [
             Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.NORTH),
@@ -402,7 +405,7 @@ class TestScoring(unittest.TestCase):
         import random
         random.seed(42)
         for _ in range(10):
-            g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+            g = MediumJong([Player(), Player(), Player(), Player()])
             g.play_round()
             pts = g.get_points()
             self.assertIsNotNone(pts)
@@ -415,7 +418,7 @@ class TestScoring(unittest.TestCase):
 
     def test_dealer_tsumo_vs_non_dealer(self):
         # Dealer tsumo by drawing winning tile
-        g = MediumJong([ForceActionPlayer(0, Tsumo()), Player(1), Player(2), Player(3)])
+        g = MediumJong([ForceActionPlayer(Tsumo()), Player(), Player(), Player()])
         # 13 tiles waiting on 3s to complete tanyao hand
         dealer_wait = [
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
@@ -435,10 +438,10 @@ class TestScoring(unittest.TestCase):
         s_dealer = g._score_hand(0, win_by_tsumo=True)
 
         # Non-dealer tsumo by player 1
-        g2 = MediumJong([ForceDiscardPlayer(0, Tile(Suit.HONORS, Honor.NORTH)),
-                         ForceActionPlayer(1, Tsumo()),
-                         NoReactionPlayer(2),
-                         NoReactionPlayer(3)])
+        g2 = MediumJong([ForceDiscardPlayer(Tile(Suit.HONORS, Honor.NORTH)),
+                         ForceActionPlayer(Tsumo()),
+                         NoReactionPlayer(),
+                         NoReactionPlayer()])
         nondealer_wait = list(dealer_wait)
         g2._player_hands[1] = nondealer_wait.copy()
         # Make it player 1's turn directly and provide winning tile draw
@@ -465,7 +468,7 @@ class TestScoring(unittest.TestCase):
                     return Tsumo()
                 return Discard(gs.player_hand[0])
 
-        g = MediumJong([Player(0), TsumoIfPossible(1), Player(2), Player(3)])
+        g = MediumJong([Player(), TsumoIfPossible(), Player(), Player()])
         # Concealed tiles (10): 234m, 345s(aka 5s), 77m, 45m (avoid sanshoku)
         concealed = [
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
@@ -505,10 +508,10 @@ class TestScoring(unittest.TestCase):
         # Player 1 wins by ron from Player 0's discard; ensure points are populated
         from test_utils import ForceDiscardPlayer
         g = MediumJong([
-            ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE)),
-            Player(1),
-            NoReactionPlayer(2),
-            NoReactionPlayer(3),
+            ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)),
+            Player(),
+            NoReactionPlayer(),
+            NoReactionPlayer(),
         ])
         # Construct player 1 hand to ron on 3p discard
         g._player_hands[1] = [
@@ -537,10 +540,10 @@ class TestScoring(unittest.TestCase):
         import random
         random.seed(234)
         g = MediumJong([
-            ForceDiscardPlayer(0, Tile(Suit.HONORS, Honor.NORTH)),
-            ForceDiscardPlayer(1, Tile(Suit.PINZU, TileType.THREE)),
-            NoReactionPlayer(2),
-            NoReactionPlayer(3),
+            ForceDiscardPlayer(Tile(Suit.HONORS, Honor.NORTH)),
+            ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)),
+            NoReactionPlayer(),
+            NoReactionPlayer(),
         ])
         # Construct dealer (P0) hand to ron on 3p discard
         g._player_hands[0] = [
@@ -568,10 +571,10 @@ class TestScoring(unittest.TestCase):
         # Setup: Player 0 discards 3p; Players 1 and 2 can both ron on 3p with tanyao hands
         from test_utils import ForceDiscardPlayer, NoReactionPlayer
         g = MediumJong([
-            ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE)),
-            Player(1),
-            Player(2),
-            NoReactionPlayer(3),
+            ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)),
+            Player(),
+            Player(),
+            NoReactionPlayer(),
         ])
         # Both players 1 and 2 wait on 3p (tanyao-completable)
         ron_wait_hand = [
@@ -625,7 +628,7 @@ class TestScoring(unittest.TestCase):
                         return m
                 return Discard(gs.player_hand[0])
 
-        g = MediumJong([DiscardWinning(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([DiscardWinning(), Player(), Player(), Player()])
         # Set P1 to ron on 3p
         base_s = [
             Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO), Tile(Suit.SOUZU, TileType.THREE),
@@ -655,7 +658,7 @@ class TestScoring(unittest.TestCase):
 
     def test_riichi_stick_lost_on_exhaustive_draw(self):
         # P0 declares riichi; at exhaustive draw, P0 loses 1k but gains 3k from noten payments (others not tenpai)
-        g = MediumJong([ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.ONE))), Player(1), Player(2), Player(3)])
+        g = MediumJong([ForceActionPlayer(Riichi(Tile(Suit.MANZU, TileType.ONE))), Player(), Player(), Player()])
         # Make all others noten
         for pid in [1,2,3]:
             g._player_hands[pid] = [
@@ -685,7 +688,7 @@ class TestScoring(unittest.TestCase):
 
     def test_sanankou_counts_with_open_hand(self):
         # Three concealed triplets and one open chi should count Sanankou (2 han)
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         concealed = [
             # 111m concealed triplet
             Tile(Suit.MANZU, TileType.ONE), Tile(Suit.MANZU, TileType.ONE), Tile(Suit.MANZU, TileType.ONE),
@@ -709,7 +712,7 @@ class TestScoring(unittest.TestCase):
 
     def test_sanshoku_closed_and_open(self):
         # Closed sanshoku: three sequences of 3-4-5 across m/p/s, closed hand
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         closed_hand = [
             Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR), Tile(Suit.MANZU, TileType.FIVE),
             Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
@@ -730,7 +733,7 @@ class TestScoring(unittest.TestCase):
         self.assertGreaterEqual(s_closed['han'], 2)
 
         # Open sanshoku: make one of the sequences an open chi
-        g2 = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g2 = MediumJong([Player(), Player(), Player(), Player()])
         # Concealed tiles: 345m, 34s (waiting 5s), 678m, pair 77p -> 10 tiles
         open_hand_concealed = [
             Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR), Tile(Suit.MANZU, TileType.FIVE),
@@ -756,7 +759,7 @@ class TestScoring(unittest.TestCase):
 
     def test_ittsu_closed_and_open(self):
         # Closed ittsu: 123m, 456m, 78m (wait 9m), 345s, pair 77p
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         closed_hand = [
             # 123m, 456m, 78m
             Tile(Suit.MANZU, TileType.ONE), Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE),
@@ -781,7 +784,7 @@ class TestScoring(unittest.TestCase):
         self.assertGreaterEqual(s_closed['han'], 3)
 
         # Open ittsu: make 456m an open chi
-        g2 = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g2 = MediumJong([Player(), Player(), Player(), Player()])
         concealed = [
             # 123m, 78m (wait 9m)
             Tile(Suit.MANZU, TileType.ONE), Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE),
@@ -808,7 +811,7 @@ class TestScoring(unittest.TestCase):
         self.assertGreaterEqual(s_open['han'], 1)
 
     def test_non_dealer_ron_mangan_from_dealer_discard(self):
-        players = [ForceDiscardPlayer(0, Tile(Suit.SOUZU, TileType.SIX)), Player(1), Player(2), Player(3)]
+        players = [ForceDiscardPlayer(Tile(Suit.SOUZU, TileType.SIX)), Player(), Player(), Player()]
         g = MediumJong(players)
         # Construct player 1 hand: 123s, 234s, 789s, pair 66s, plus 45s waiting on 6s
         p1_tiles = [
@@ -839,10 +842,10 @@ class TestScoring(unittest.TestCase):
         from test_utils import ForceActionPlayer, ForceDiscardPlayer, NoReactionPlayer
         # Force P0 and P1 to declare Riichi when legal; P2 will discard 3p; P3 no reactions
         g = MediumJong([
-            ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.NINE))),
-            ForceActionPlayer(1, Riichi(Tile(Suit.MANZU, TileType.NINE))),
-            ForceDiscardPlayer(2, Tile(Suit.PINZU, TileType.THREE)),
-            NoReactionPlayer(3),
+            ForceActionPlayer(Riichi(Tile(Suit.MANZU, TileType.NINE))),
+            ForceActionPlayer(Riichi(Tile(Suit.MANZU, TileType.NINE))),
+            ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)),
+            NoReactionPlayer(),
         ])
         # Configure P0 hand to be tenpai so Riichi(9m) is legal when discarding the drawn 9m
         g._player_hands[0] = [
@@ -878,7 +881,7 @@ class TestScoring(unittest.TestCase):
 
     def test_rinshan(self):
         # After Ankan (concealed kan) of four NORTH tiles, a rinshan draw should occur from the dead wall
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         # Ensure player 0 has four NORTHs
         g._player_hands[0] = [
             Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.NORTH),
@@ -893,7 +896,7 @@ class TestScoring(unittest.TestCase):
         g.dead_wall = [indicator_src, rinshan_tile]
         before_len = len(g.dead_wall)
         # Perform Ankan on NORTH
-        from core.game import KanAnkan
+        from core.action import KanAnkan
         self.assertTrue(g.is_legal(0, KanAnkan(Tile(Suit.HONORS, Honor.NORTH))))
         g.step(0, KanAnkan(Tile(Suit.HONORS, Honor.NORTH)))
         # Rinshan draw should have happened and drawn the last tile from dead wall
@@ -909,16 +912,16 @@ class TestScoring(unittest.TestCase):
 
     def test_initial_dora_exists(self):
         # Simple instantiation of MediumJong should have at least one dora indicator
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         self.assertTrue(hasattr(g, 'dora_indicators'))
         self.assertGreaterEqual(len(g.dora_indicators), 1)
 
     def test_riichi_ippatsu_tsumo_with_single_uradora(self):
         # Player 0: closed tenpai with no yaku except riichi + menzen tsumo; ensure exactly 1 uradora gives 4 han total
-        g = MediumJong([ForceActionPlayer(0, Riichi(Tile(Suit.MANZU, TileType.NINE))),
-                        NoReactionPlayer(1),
-                        NoReactionPlayer(2),
-                        NoReactionPlayer(3)])
+        g = MediumJong([ForceActionPlayer(Riichi(Tile(Suit.MANZU, TileType.NINE))),
+                        NoReactionPlayer(),
+                        NoReactionPlayer(),
+                        NoReactionPlayer()])
         # Construct 13-tile closed hand: triplet 222m; sequences 345p and 678m; pair 11m; wait 6s on 45s
         tiles_13 = [
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.TWO),
@@ -955,7 +958,7 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(pts[3], -3866)
 
     def test_keiten_one_in_tenpai(self):
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         g._player_hands[0] = _make_tenpai_hand()
         g._player_hands[1] = _make_noten_hand()
         g._player_hands[2] = _make_noten_hand()
@@ -970,7 +973,7 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(pay[3], -1000)
 
     def test_keiten_two_in_tenpai(self):
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         g._player_hands[0] = _make_tenpai_hand()
         g._player_hands[1] = _make_tenpai_hand()
         g._player_hands[2] = _make_noten_hand()
@@ -984,7 +987,7 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(pay[3], -1500)
 
     def test_keiten_three_in_tenpai(self):
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         g._player_hands[0] = _make_tenpai_hand()
         g._player_hands[1] = _make_tenpai_hand()
         g._player_hands[2] = _make_tenpai_hand()
@@ -999,7 +1002,7 @@ class TestScoring(unittest.TestCase):
 
     def test_keiten_all_or_none_in_tenpai(self):
         # None in tenpai
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         g._player_hands[0] = _make_noten_hand()
         g._player_hands[1] = _make_noten_hand()
         g._player_hands[2] = _make_noten_hand()
@@ -1013,7 +1016,7 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(pay[3], 0)
 
         # All in tenpai
-        g2 = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g2 = MediumJong([Player(), Player(), Player(), Player()])
         th = _make_tenpai_hand()
         g2._player_hands[0] = th
         g2._player_hands[1] = th
@@ -1032,7 +1035,7 @@ class TestGameOutcome(unittest.TestCase):
         # Force an exhaustive draw by emptying wall quickly
         from core.game import MediumJong, Player
         import core.game
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         g.tiles = []
         g.play_turn()
         self.assertTrue(g.is_game_over())
@@ -1063,7 +1066,7 @@ class TestGameOutcome(unittest.TestCase):
                 if gs.can_tsumo():
                     return Tsumo()
                 return core.game.Discard(gs.player_hand[0])
-        g = MediumJong([TsumoIfCan(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([TsumoIfCan(), Player(), Player(), Player()])
         g._player_hands[0] = [
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
             Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),

@@ -10,13 +10,13 @@ from test_utils import ForceActionPlayer, ForceDiscardPlayer, NoReactionPlayer
 from core.game import (
     MediumJong, Player, Tile, TileType, Suit, Honor,
     Discard, Tsumo, Ron, Pon, Chi, CalledSet, PassCall, Riichi,
-    KanKakan, KanAnkan
+    KanKakan, KanAnkan, KanDaimin, tile_flat_index
 )
-
+from core.learn.ac_constants import ACTION_HEAD_INDEX, chi_variant_index, ACTION_HEAD_ORDER, TILE_HEAD_NOOP
 
 class TestMediumLegality(unittest.TestCase):
     def setUp(self):
-        self.players = [Player(i) for i in range(4)]
+        self.players = [Player() for _ in range(4)]
         self.game = MediumJong(self.players)
 
     def test_illegal_ron_without_discard(self):
@@ -54,7 +54,7 @@ class TestMediumLegality(unittest.TestCase):
         self.assertTrue(self.game.is_legal(0, Discard(tile)))
 
     def test_double_ron_on_same_discard(self):
-        g = MediumJong([ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE)), Player(1), Player(2), Player(3)])
+        g = MediumJong([ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)), Player(), Player(), Player()])
         # Players 1 and 2 can ron on 3p: base 9 souzu + pair 7m7m + 2p,4p (13 tiles)
         base_s = [
             Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO), Tile(Suit.SOUZU, TileType.THREE),
@@ -73,20 +73,20 @@ class TestMediumLegality(unittest.TestCase):
 
     def test_illegal_chi_by_non_left_player(self):
         # Set up a direct discard by player 0 to enter reaction state without auto-resolving
-        game = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        game = MediumJong([Player(), Player(), Player(), Player()])
         game._player_hands[0] = [Tile(Suit.PINZU, TileType.THREE)] + game._player_hands[0][1:]
         # Player 2 has 2p and 4p but is not the left player (player 1 is left of 0)
         game._player_hands[2][:2] = [Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)]
         game.current_player_idx = 0
         game.step(0, Discard(Tile(Suit.PINZU, TileType.THREE)))
         # Now verify player 2 cannot chi on player 0's discard
-        chi_move = Chi([Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)])
+        chi_move = Chi([Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)], 1)
         self.assertFalse(game.is_legal(2, chi_move))
         with self.assertRaises(MediumJong.IllegalMoveException):
             game.step(2, chi_move)
 
     def test_chi_not_legal_when_ron_available(self):
-        g = MediumJong([ForceDiscardPlayer(0, Tile(Suit.PINZU, TileType.THREE)), Player(1), Player(2), Player(3)])
+        g = MediumJong([ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)), Player(), Player(), Player()])
         # Player 1 has three called sets; to ron after 3p discard, they need 2p,4p plus a pair concealed
         cs1 = CalledSet(tiles=[Tile(Suit.HONORS, Honor.WHITE)]*3, call_type='pon', called_tile=Tile(Suit.HONORS, Honor.WHITE), caller_position=1, source_position=0)
         cs2 = CalledSet(tiles=[Tile(Suit.HONORS, Honor.GREEN)]*3, call_type='pon', called_tile=Tile(Suit.HONORS, Honor.GREEN), caller_position=1, source_position=0)
@@ -105,7 +105,7 @@ class TestMediumLegality(unittest.TestCase):
         self.assertFalse(any(isinstance(m, Chi) for m in moves_p1))
 
     def test_legal_chi_by_left_player(self):
-        game = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        game = MediumJong([Player(), Player(), Player(), Player()])
         non_part = [
             Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO),
             Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
@@ -115,10 +115,24 @@ class TestMediumLegality(unittest.TestCase):
         game._player_hands[1] = [Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)] + non_part
         game._draw_tile()
         game.step(0, Discard(Tile(Suit.PINZU, TileType.THREE)))
-        self.assertTrue(game.is_legal(1, Chi([Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)])))
+        self.assertTrue(game.is_legal(1, Chi([Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)], 1)))
+        self.assertTrue(game.is_legal(1, PassCall()))
+
+    def test_discard_not_legal_on_reaction(self):
+        game = MediumJong([Player(), Player(), Player(), Player()])
+        non_part = [
+            Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.SEVEN), Tile(Suit.SOUZU, TileType.SEVEN), Tile(Suit.SOUZU, TileType.EIGHT), Tile(Suit.SOUZU, TileType.NINE)
+        ]
+        game.tiles=[Tile(Suit.PINZU, TileType.THREE)]
+        game._player_hands[1] = [Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)] + non_part
+        game._draw_tile()
+        game.step(0, Discard(Tile(Suit.PINZU, TileType.THREE)))
+        self.assertLess(len(game.legal_moves(1)), 3) # should not have discards
 
     def test_legal_pon_by_any_player(self):
-        game = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        game = MediumJong([Player(), Player(), Player(), Player()])
         non_part = [
             Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO),
             Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.SIX),
@@ -143,7 +157,7 @@ class TestMediumLegality(unittest.TestCase):
                 _ = self.game.legal_moves(pid)
 
     def test_legal_moves_reaction_phase_includes_ron_and_pass(self):
-        game = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        game = MediumJong([Player(), Player(), Player(), Player()])
         base_s = [
             Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO), Tile(Suit.SOUZU, TileType.THREE),
             Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
@@ -165,7 +179,7 @@ class TestMediumLegality(unittest.TestCase):
 
     def test_riichi_multiple_discard_options_in_tenpai(self):
         # Construct a hand where discarding 2m or 8m both keep tenpai
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         hand = [
             Tile(Suit.MANZU, TileType.TWO),  # candidate A
             Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),  # 23(4)
@@ -191,7 +205,7 @@ class TestMediumLegality(unittest.TestCase):
                 # Otherwise discard first
                 return Discard(gs.player_hand[0])
 
-        g = MediumJong([TsumoIfPossible(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([TsumoIfPossible(), Player(), Player(), Player()])
         base_s = [
             Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO), Tile(Suit.SOUZU, TileType.THREE),
             Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
@@ -214,7 +228,7 @@ class TestMediumLegality(unittest.TestCase):
 
     def test_kakan_legal_with_existing_pon_and_fourth_tile(self):
         # Player 1 has a pon of 5s and holds the fourth 5s in hand -> kakan is legal during their action
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         # Give player 1 a pon called set of 5s
         pon_5s = CalledSet(
             tiles=[Tile(Suit.SOUZU, TileType.FIVE)] * 3,
@@ -235,7 +249,7 @@ class TestMediumLegality(unittest.TestCase):
 
     def test_kakan_illegal_without_existing_pon(self):
         # Player 1 does not have a pon of 5s -> kakan illegal even if they have three 5s concealed
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         # Give player 1 three concealed 5s but no called sets
         g._player_called_sets[1] = []
         g._player_hands[1][:3] = [Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE)]
@@ -248,7 +262,7 @@ class TestMediumLegality(unittest.TestCase):
 
     def test_kakan_illegal_with_pon_but_missing_fourth_tile(self):
         # Player 1 has a pon of 5s but does NOT hold the fourth 5s -> kakan illegal
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
         pon_5s = CalledSet(
             tiles=[Tile(Suit.SOUZU, TileType.FIVE)] * 3,
             call_type='pon',
@@ -280,7 +294,7 @@ class TestMediumLegality(unittest.TestCase):
         We do not assert specific riichi legality by yaku/tenpai here; only that the
         GamePerspective surfaces Riichi, Ankan, and Discard actions concurrently in this edge setup.
         """
-        g = MediumJong([Player(0), Player(1), Player(2), Player(3)])
+        g = MediumJong([Player(), Player(), Player(), Player()])
 
         # Build a 14-tile closed hand for P0 with a concealed quad of 5p
         quad_5p = [Tile(Suit.PINZU, TileType.FIVE)] * 4
@@ -313,8 +327,89 @@ class TestMediumLegality(unittest.TestCase):
         # Expect a Riichi action object present among legal moves list
         self.assertTrue(any(isinstance(m, Riichi) for m in moves))
 
+    def test_tile_legality(self):
+        """Run a full round using a LegalityCheckPlayer that verifies action/tile
+        legality and masks for both actions and reactions. The game loop is
+        driven by `MediumJong.play_round()` and assertions live inside the
+        player's methods.
+        """
+
+        class LegalityCheckPlayer(Player):
+            def __init__(self, tester: 'unittest.TestCase') -> None:
+                super().__init__()
+                self.t = tester
+
+            def play(self, gs):  # type: ignore[override]
+                # Verify all legal moves align with masks; then pick a move.
+                moves = gs.legal_moves()
+                self.t.assertGreater(len(moves), 0)
+                act_mask = gs.legal_action_mask()
+
+                # Compact type mapping declared once
+                TYPE_TO_INDEX_PARAM = {
+                    Discard: (ACTION_HEAD_INDEX['discard'], True),
+                    Riichi: (ACTION_HEAD_INDEX['riichi'], True),
+                    Tsumo: (ACTION_HEAD_INDEX['tsumo'], False),
+                    KanKakan: (ACTION_HEAD_INDEX['kan_kakan'], True),
+                    KanAnkan: (ACTION_HEAD_INDEX['kan_ankan'], True),
+                }
+
+                for mv in moves:
+                    # Action mask consistency for core actions
+                    for cls, (aidx, param) in TYPE_TO_INDEX_PARAM.items():
+                        if isinstance(mv, cls):
+                            self.t.assertEqual(int(act_mask[aidx]), 1)
+                            if param:
+                                tile_idx = tile_flat_index(mv.tile)
+                                tmask = gs.legal_tile_mask(aidx)
+                                self.t.assertEqual(int(tmask[tile_idx]), 1)
+                                self.t.assertEqual(int(tmask[TILE_HEAD_NOOP]), 0)
+                            break
+                # Delegate move selection to base Player
+                return super().play(gs)
+
+            def choose_reaction(self, gs, options):  # type: ignore[override]
+                act_mask = gs.legal_action_mask()
+                last = gs._reactable_tile
+                # Validate each option matches action mask bits
+                for r in options:
+                    if isinstance(r, Pon):
+                        # Aka vs no-aka depends on whether any tile in (r.tiles + [last]) is aka
+                        has_aka = False
+                        if last is not None:
+                            has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
+                        name = 'pon_aka' if has_aka else 'pon_noaka'
+                        aidx = ACTION_HEAD_INDEX[name]
+                        self.t.assertEqual(int(act_mask[aidx]), 1)
+                    elif isinstance(r, Chi):
+                        # Determine chi variant relative to last discard and aka flag
+                        variant = chi_variant_index(last, r.tiles) if last is not None else -1
+                        has_aka = False
+                        if last is not None:
+                            has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
+                        if variant in (0, 1, 2):
+                            name = ['chi_low', 'chi_mid', 'chi_high'][variant] + ('_aka' if has_aka else '_noaka')
+                            aidx = ACTION_HEAD_INDEX[name]
+                            self.t.assertEqual(int(act_mask[aidx]), 1)
+                    elif isinstance(r, KanDaimin):
+                        aidx = ACTION_HEAD_INDEX['kan_daimin']
+                        self.t.assertEqual(int(act_mask[aidx]), 1)
+                # Delegate reaction selection to base Player
+                return super().choose_reaction(gs, options)
+
+        # Seed for deterministic shuffling
+        rng_seed = 0
+        __import__('random').seed(rng_seed)
+
+        g = MediumJong([
+            LegalityCheckPlayer(self),
+            LegalityCheckPlayer(self),
+            LegalityCheckPlayer(self),
+            LegalityCheckPlayer(self),
+        ])
+        # Drive the entire round; assertions inside the player will fail the test if inconsistent
+        g.play_round(max_steps=10000)
+        self.assertTrue(g.is_game_over())
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
-
-
-

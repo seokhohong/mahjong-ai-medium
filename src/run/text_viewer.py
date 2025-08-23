@@ -13,6 +13,7 @@ from core.game import MediumJong, Player  # type: ignore
 from core.tile import Suit, Tile
 from core.learn.ac_player import ACPlayer  # type: ignore
 from core.learn.recording_ac_player import RecordingHeuristicACPlayer  # type: ignore
+from core.action import Reaction, Pon, Chi, KanDaimin
 
 
 def _fmt_tile(t: Any) -> str:
@@ -56,7 +57,7 @@ def _fmt_called_sets(csets) -> str:
 
 class LoggingPlayer(Player):
     def __init__(self, inner: Player):
-        super().__init__(inner.player_id)
+        super().__init__()
         self.inner = inner
 
     def play(self, gs):  # type: ignore[override]
@@ -64,24 +65,25 @@ class LoggingPlayer(Player):
         # Pretty print current perspective and chosen move
         # GamePerspective is rotated so that index 0 is always the current (self) player
         actor = 0  # local index in perspective
-        abs_pid = self.inner.player_id
+        # Prefer engine-provided player_id on the perspective when available
+        abs_pid = getattr(gs, 'player_id', '?')
         hand_s = '[' + ', '.join(_fmt_tile(t) for t in sorted(gs.player_hand, key=lambda t: (t.suit.value, int(t.tile_type.value)))) + ']'
         called_s = {pid: _fmt_called_sets(gs.called_sets.get(pid, [])) for pid in range(4)}
         disc_s = {pid: '[' + ', '.join(_fmt_tile(t) for t in gs.player_discards.get(pid, [])) + ']' for pid in range(4)}
         last_discard = _fmt_tile(gs._reactable_tile) if gs._reactable_tile is not None else 'None'
         riichi_flag = int(getattr(gs, 'riichi_declared', {}).get(actor, False))
         print(f"P{abs_pid} (loc {actor}) | RW:{gs.round_wind.name} | SW[" + ', '.join(gs.seat_winds[j].name for j in range(4)) + f"] | Riichi:{riichi_flag} | Hand {hand_s}")
-        print(f"    LastDiscard:{last_discard} by {gs._owner_of_reactable_tile} | CanCall:{int(bool(gs.can_call))} | CanRon:{int(gs.can_ron())} | CanTsumo:{int(gs.can_tsumo())}")
-        print(f"    Called:{called_s}")
-        print(f"    Discards:{disc_s}")
-        print(f"    Action:{type(move).__name__}: {move}")
+        print(f"    Reactable Tile: {last_discard} by {gs._owner_of_reactable_tile} | CanCall:{int(bool(gs.can_call))} | CanRon:{int(gs.can_ron())} | CanTsumo:{int(gs.can_tsumo())}")
+        print(f"    Called: {called_s}")
+        print(f"    Discards: {disc_s}")
+        print(f"    Action: {type(move).__name__}: {move}")
         return move
 
-    def choose_reaction(self, gs, options):  # type: ignore[override]
+    def choose_reaction(self, gs, options: List[Reaction]):  # type: ignore[override]
         move = self.inner.choose_reaction(gs, options)
         # Pretty print reaction decision
         actor = 0
-        abs_pid = self.inner.player_id
+        abs_pid = '?'
         last_discard = _fmt_tile(gs._reactable_tile) if gs._reactable_tile is not None else 'None'
         # Format options succinctly
         def _fmt_opts():
@@ -89,15 +91,16 @@ class LoggingPlayer(Player):
                 parts: list[str] = []
                 if gs.can_ron():
                     parts.append('Ron')
-                pon = options.get('pon', []) if isinstance(options, dict) else []
-                chi = options.get('chi', []) if isinstance(options, dict) else []
-                kan = options.get('kan_daimin', []) if isinstance(options, dict) else []
-                if pon:
-                    parts.append('Pon(' + ' | '.join('[' + ', '.join(_fmt_tile(t) for t in ts) + ']' for ts in pon) + ')')
-                if chi:
-                    parts.append('Chi(' + ' | '.join('[' + ', '.join(_fmt_tile(t) for t in ts) + ']' for ts in chi) + ')')
-                if kan:
-                    parts.append('KanDaimin(' + ' | '.join('[' + ', '.join(_fmt_tile(t) for t in ts) + ']' for ts in kan) + ')')
+                if options:
+                    pon_sets = [r.tiles for r in options if isinstance(r, Pon)]
+                    chi_sets = [r.tiles for r in options if isinstance(r, Chi)]
+                    kan_sets = [r.tiles for r in options if isinstance(r, KanDaimin)]
+                    if pon_sets:
+                        parts.append('Pon(' + ' | '.join('[' + ', '.join(_fmt_tile(t) for t in ts) + ']' for ts in pon_sets) + ')')
+                    if chi_sets:
+                        parts.append('Chi(' + ' | '.join('[' + ', '.join(_fmt_tile(t) for t in ts) + ']' for ts in chi_sets) + ')')
+                    if kan_sets:
+                        parts.append('KanDaimin(' + ' | '.join('[' + ', '.join(_fmt_tile(t) for t in ts) + ']' for ts in kan_sets) + ')')
                 return ', '.join(parts) if parts else 'None'
             except Exception:
                 return 'None'
@@ -109,10 +112,12 @@ class LoggingPlayer(Player):
 def build_players(model_dir: str | None, temperature: float) -> List[Player]:
     players: List[Player] = []
     if model_dir:
-        players.append(ACPlayer.from_directory(model_dir, player_id=0, temperature=float(temperature)))
+        players.append(ACPlayer.from_directory(model_dir, temperature=float(temperature)))
     else:
-        players.append(RecordingHeuristicACPlayer(0, random_exploration=0.0))
-    players.extend([RecordingHeuristicACPlayer(1, random_exploration=0.0), RecordingHeuristicACPlayer(2, random_exploration=0.0), RecordingHeuristicACPlayer(3, random_exploration=0.0)])
+        players.append(RecordingHeuristicACPlayer(random_exploration=0.0))
+    players.extend([RecordingHeuristicACPlayer(random_exploration=0.0),
+                    RecordingHeuristicACPlayer(random_exploration=0.0),
+                    RecordingHeuristicACPlayer(random_exploration=0.0)])
     # Wrap with logging
     return [LoggingPlayer(p) for p in players]
 

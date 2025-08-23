@@ -90,8 +90,7 @@ def build_ac_dataset(
     tile_idx_list: List[int] = []
     all_returns: List[float] = []
     all_advantages: List[float] = []
-    action_log_probs: List[float] = []
-    tile_log_probs: List[float] = []
+    joint_log_probs: List[float] = []
     # Two-head policy stores separate log-probs for each head
     all_game_ids: List[int] = []
     all_step_ids: List[int] = []
@@ -144,8 +143,7 @@ def build_ac_dataset(
                 tile_idx_list.append(int(t_idx))
                 all_returns.append(float(nstep[t]))
                 all_advantages.append(float(adv[t]))
-                action_log_probs.append(float(p.experience.action_log_probs[t]))
-                tile_log_probs.append(float(p.experience.tile_log_probs[t]))
+                joint_log_probs.append(float(p.experience.joint_log_probs[t]))
                 all_game_ids.append(int(gi))
                 all_step_ids.append(int(t))
                 all_actor_ids.append(int(pid))
@@ -179,8 +177,7 @@ def build_ac_dataset(
         'tile_idx': np.asarray(tile_idx_list, dtype=np.int64),
         'returns': np.asarray(all_returns, dtype=np.float32),
         'advantages': np.asarray(all_advantages, dtype=np.float32),
-        'action_log_probs': np.asarray(action_log_probs, dtype=np.float32),
-        'tile_log_probs': np.asarray(tile_log_probs, dtype=np.float32),
+        'joint_log_probs': np.asarray(joint_log_probs, dtype=np.float32),
         'game_ids': np.asarray(all_game_ids, dtype=np.int32),
         'step_ids': np.asarray(all_step_ids, dtype=np.int32),
         'actor_ids': np.asarray(all_actor_ids, dtype=np.int32),
@@ -201,8 +198,7 @@ def save_dataset(built, out_path):
         tile_idx=built['tile_idx'],
         returns=built['returns'],
         advantages=built['advantages'],
-        action_log_probs=built['action_log_probs'],
-        tile_log_probs=built['tile_log_probs'],
+        joint_log_probs=built['joint_log_probs'],
         game_ids=built['game_ids'],
         step_ids=built['step_ids'],
         actor_ids=built['actor_ids'],

@@ -6,6 +6,7 @@ import os
 import pickle
 
 import numpy as np
+import random
 
 from .data_utils import DebugSnapshot
 from ..game import (
@@ -24,8 +25,11 @@ from .ac_network import ACNetwork
 from ..game import MediumJong
 from .ac_constants import chi_variant_index
 from .policy_utils import (
-    build_move_from_two_head
+    build_move_from_two_head,
+    encode_two_head_action,
 )
+from ..heuristics_player import MediumHeuristicsPlayer
+from ..action import Action as ActionState
 
 
 class ACPlayer(Player):
@@ -40,11 +44,15 @@ class ACPlayer(Player):
     """
 
     def __init__(self, network: Any, gsv_scaler: StandardScaler | None = None,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0,
+                 expert_injection: float = 0.0):
         super().__init__()
         self.network = network
         self.temperature = max(1e-6, float(temperature))
         self.gsv_scaler = gsv_scaler
+        self.expert_injection = max(0.0, min(1.0, float(expert_injection)))
+        # Lazy/simple expert policy instance for injection
+        self._expert_policy = MediumHeuristicsPlayer()
 
     @classmethod
     def default(
@@ -55,6 +63,7 @@ class ACPlayer(Player):
         embedding_dim: int = 16,
         network_temperature: float = 0.05,
         gsv_scaler: StandardScaler | None = None,
+        expert_injection: float = 0.0,
     ) -> Self:
         """Factory for a sensible default `ACPlayer`.
 
@@ -70,7 +79,8 @@ class ACPlayer(Player):
             embedding_dim=embedding_dim,
             temperature=network_temperature,
         )
-        return cls(network=network, gsv_scaler=gsv_scaler, temperature=temperature)
+        return cls(network=network, gsv_scaler=gsv_scaler, temperature=temperature,
+                   expert_injection=expert_injection)
 
     def _mask_to_indices(self, mask: np.ndarray) -> List[int]:
         return [i for i, ok in enumerate(mask) if ok]
@@ -111,40 +121,69 @@ class ACPlayer(Player):
 
         return eff
 
+        '''
+        # Optional expert injection: bypass policy heads and select an expert move
+        if self.expert_injection > 0.0 and random.random() < self.expert_injection:
+            try:
+                if gs.state is ActionState:
+                    expert_move = self._expert_policy.play(gs)
+                else:
+                    # Reaction path: supply options directly from game perspective
+                    options = gs.get_call_options()
+                    expert_move = self._expert_policy.choose_reaction(gs, options)
+                # Encode into two-head indices for logging/training compatibility
+                a_idx, t_idx = encode_two_head_action(expert_move)
+                if a_idx >= 0 and t_idx >= 0 and gs.is_legal(expert_move):
+                    return expert_move, float(value), int(a_idx), int(t_idx), 0.0, 0.0
+            except Exception:
+                # Fall back to network policy on any error
+                pass
+        '''
 
     # --- Core selection (two-head) ---
-    def compute_play(self, gs: GamePerspective) -> Tuple[Any, float, int, int, float, float]:
-        """Evaluate once and return (move, value, action_idx, tile_idx, logp_action, logp_tile)."""
+    def compute_play(self, gs: GamePerspective) -> Tuple[Any, float, int, int, float]:
+        """Evaluate once and return (move, value, action_idx, tile_idx, logp_joint)."""
         a_probs, t_probs, value = self.network.evaluate(gs)
         a_probs = np.asarray(a_probs, dtype=np.float64)
         t_probs = np.asarray(t_probs, dtype=np.float64)
 
-        # Action head selection with legality mask
-        a_mask = gs.legal_action_mask()
-        eff_a = self._temper_and_mask(a_probs, a_mask)
-        sum_a = float(max(1e-12, eff_a.sum()))
-        pa = eff_a / sum_a
-        action_idx = int(np.random.choice(np.arange(pa.size), p=pa))
+        # Build legal move table once
+        legal_moves = []
+        legal_a_indices = []
+        legal_t_indices = []
+        for move in gs.legal_moves():
+            action_idx, tile_idx = encode_two_head_action(move)
+            legal_moves.append(move)
+            legal_a_indices.append(action_idx)
+            legal_t_indices.append(tile_idx)
 
-        # Tile head selection conditioned on chosen action
-        t_mask = gs.legal_tile_mask(action_idx)
-        eff_t = self._temper_and_mask(t_probs, t_mask)
-        sum_t = float(max(1e-12, eff_t.sum()))
-        pt = eff_t / sum_t
-        tile_idx = int(np.random.choice(np.arange(pt.size), p=pt))
+        # Compute joint probabilities efficiently
+        legal_a_indices = np.array(legal_a_indices)
+        legal_t_indices = np.array(legal_t_indices)
 
-        # Log-probs for chosen heads
-        logp_action = float(np.log(max(1e-12, eff_a[action_idx])))
-        logp_tile = float(np.log(max(1e-12, eff_t[tile_idx])))
+        # Get probabilities for legal moves (with temperature if needed)
+        a_probs_legal = a_probs[legal_a_indices]
+        t_probs_legal = t_probs[legal_t_indices]
 
-        move = build_move_from_two_head(gs, action_idx, tile_idx)
-        if not gs.is_legal(move):
-            DebugSnapshot.save_illegal_move(
-                action_index=(action_idx, tile_idx),
-                action_obj=move,
-                game_perspective=gs
-            )
-        return move, float(value), action_idx, tile_idx, logp_action, logp_tile
+        # Apply temperature
+        if self.temperature != 1.0:
+            a_probs_legal = np.power(a_probs_legal, 1.0 / self.temperature)
+            t_probs_legal = np.power(t_probs_legal, 1.0 / self.temperature)
+
+        # Joint probabilities
+        joint_probs = a_probs_legal * t_probs_legal
+        joint_probs = joint_probs / joint_probs.sum()
+
+        # Sample
+        selected_idx = np.random.choice(len(legal_moves), p=joint_probs)
+        move = legal_moves[selected_idx]
+        action_idx = legal_a_indices[selected_idx]
+        tile_idx = legal_t_indices[selected_idx]
+
+        # For PPO, use joint log-prob of the selected move
+        logp_joint = float(np.log(max(1e-12, joint_probs[selected_idx])))
+
+        return move, float(value), action_idx, tile_idx, logp_joint
 
 
     def _select_action(self, gs: GamePerspective) -> Optional[Any]:

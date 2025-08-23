@@ -35,9 +35,8 @@ class TestFuScoring(unittest.TestCase):
         ]
         g._player_hands[0] = tiles_13
         self._reset_env(g)
-        g.current_player_idx = 0
         # Winning draw: 6m to make ryanmen 45m-6m -> 456m (pinfu tsumo waives +2 fu)
-        g.tiles = [Tile(Suit.MANZU, TileType.SIX)]
+        g.tiles = [Tile(Suit.MANZU, TileType.ONE)]
         g.play_turn()
         self.assertTrue(g.is_game_over())
         s = g._score_hand(0, win_by_tsumo=True)

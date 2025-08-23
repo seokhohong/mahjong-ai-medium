@@ -13,3 +13,4 @@ Not implemented yet:
 - fu from yakuhai pairs
 - fu on ron/tsumo
 - draw from 4 riichi or 4 kans
+- call restrictions: kuikae and not able to kan after pon

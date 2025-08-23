@@ -23,7 +23,7 @@ from sklearn.preprocessing import StandardScaler  # type: ignore
 
 # not using called discards yet
 class ACDataset(Dataset):
-    def __init__(self, npz_path: str, net: ACNetwork):
+    def __init__(self, npz_path: str, net: ACNetwork, fit_scaler = True):
         data = np.load(npz_path, allow_pickle=True)
         # New compact format fields
         hand_arr = data['hand_idx']
@@ -36,14 +36,18 @@ class ACDataset(Dataset):
         returns = data['returns'].astype(np.float32)
         advantages = data['advantages'].astype(np.float32)
         self.returns = returns
-        # scale advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         self.advantages = advantages
-        self.action_old_log_probs = data['action_log_probs'].astype(np.float32)
-        self.tile_old_log_probs = data['tile_log_probs'].astype(np.float32)
+        if 'joint_log_probs' in data.files:
+            self.joint_old_log_probs = data['joint_log_probs'].astype(np.float32)
+        else:
+            # Backward compatibility with datasets that stored separate head log-probs
+            a_lp = data['action_log_probs'].astype(np.float32)
+            t_lp = data['tile_log_probs'].astype(np.float32)
+            self.joint_old_log_probs = (a_lp + t_lp).astype(np.float32)
 
         # fit the standard scaler so we can properly use extract_features
-        net.fit_scaler(gsv_arr)
+        if fit_scaler:
+            net.fit_scaler(gsv_arr)
 
         # Pre-extract indexed states and transform to embedded sequences once
         hand_list = []
@@ -80,8 +84,7 @@ class ACDataset(Dataset):
             'tile_idx': int(self.tile_idx[idx]),
             'return': float(self.returns[idx]),
             'advantage': float(self.advantages[idx]),
-            'action_old_log_prob': float(self.action_old_log_probs[idx]),
-            'tile_old_log_prob': float(self.tile_old_log_probs[idx]),
+            'joint_old_log_prob': float(self.joint_old_log_probs[idx]),
         }
 
 
@@ -110,74 +113,129 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
     gsv = torch.from_numpy(np.stack(batch['gsv'])).to(dev)
     action_idx = torch.tensor(batch['action_idx'], dtype=torch.long, device=dev)
     tile_idx = torch.tensor(batch['tile_idx'], dtype=torch.long, device=dev)
-    action_old_log_probs = torch.tensor(batch['action_old_log_prob'], dtype=torch.float32, device=dev)
-    tile_old_log_probs = torch.tensor(batch['tile_old_log_prob'], dtype=torch.float32, device=dev)
+    joint_old_log_probs = torch.tensor(batch['joint_old_log_prob'], dtype=torch.float32, device=dev)
     advantages = torch.tensor(batch['advantage'], dtype=torch.float32, device=dev)
     returns = torch.tensor(batch['return'], dtype=torch.float32, device=dev)
     return (
         hand, calls, disc, gsv,
         action_idx, tile_idx,
-        action_old_log_probs, tile_old_log_probs,
+        joint_old_log_probs,
         advantages, returns,
     )
 
 
 def _compute_losses(
-    model: torch.nn.Module,
-    hand: torch.Tensor,
-    calls: torch.Tensor,
-    disc: torch.Tensor,
-    gsv: torch.Tensor,
-    action_idx: torch.Tensor,
-    tile_idx: torch.Tensor,
-    action_old_log_probs: torch.Tensor,
-    tile_old_log_probs: torch.Tensor,
-    advantages: torch.Tensor,
-    returns: torch.Tensor,
-    *,
-    mode: str = 'ppo', #ppo or bc = behavioral cloning
-    epsilon: float = 0.2,
-    value_coeff: float = 0.5,
-    entropy_coeff: float = 0.01,
-    print_debug: bool = False,
+        model: torch.nn.Module,
+        hand: torch.Tensor,
+        calls: torch.Tensor,
+        disc: torch.Tensor,
+        gsv: torch.Tensor,
+        action_idx: torch.Tensor,
+        tile_idx: torch.Tensor,
+        joint_old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        *,
+        mode: str = 'ppo',
+        epsilon: float = 0.2,
+        value_coeff: float = 0.5,
+        entropy_coeff: float = 0.01,
+        print_debug: bool = False,
 ):
     a_pp, t_pp, val = model(hand.float(), calls.float(), disc.float(), gsv.float())
     val = val.squeeze(1)
     batch_size_curr = int(gsv.size(0))
 
-    # PPO path
+    # Normalize advantages per batch
+    # This ensures consistent scale and prevents exploding gradients
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # Get chosen action probabilities
     a_idx = action_idx.to(device=a_pp.device, dtype=torch.long).view(-1, 1)
     t_idx = tile_idx.to(device=t_pp.device, dtype=torch.long).view(-1, 1)
     chosen_a = torch.gather(a_pp.clamp_min(1e-8), 1, a_idx).squeeze(1)
     chosen_t = torch.gather(t_pp.clamp_min(1e-8), 1, t_idx).squeeze(1)
-    logp_joint = chosen_a.log() + chosen_t.log()
-    old_logp_joint = action_old_log_probs + tile_old_log_probs
-    ratio = torch.exp(logp_joint - old_logp_joint)
 
+    # Compute log probabilities
+    logp_a = chosen_a.log()
+    logp_t = chosen_t.log()
+
+    # Joint log-prob and ratio against old joint
+    logp_joint = logp_a + logp_t
+    ratio_joint = torch.exp(logp_joint - joint_old_log_probs)
+
+    # Prepare lightweight debug aggregates for epoch-level reporting
+    # We return sums to enable exact aggregation across variable batch sizes
+    dbg = {
+        'bsz': batch_size_curr,
+        'ratio_sum': float(ratio_joint.sum().item()),
+        'ratio_sumsq': float((ratio_joint * ratio_joint).sum().item()),
+        'adv_sum': float(advantages.sum().item()),
+        'adv_sumsq': float((advantages * advantages).sum().item()),
+        'clipped_cnt': int(((ratio_joint < (1 - epsilon)) | (ratio_joint > (1 + epsilon))).sum().item()),
+    }
     if print_debug:
-        print(f"\nRatio stats: mean={ratio.mean():.4f}, std={ratio.std():.4f}")
-        print(f"Advantage stats: mean={advantages.mean():.6f}, std={advantages.std():.6f}")
-        print(f"Fraction clipped: {((ratio < (1 - epsilon)) | (ratio > (1 + epsilon))).float().mean():.3f}")
+        r_mean = dbg['ratio_sum'] / max(1, dbg['bsz'])
+        r_var = max(0.0, dbg['ratio_sumsq'] / max(1, dbg['bsz']) - r_mean * r_mean)
+        r_std = math.sqrt(r_var)
+        a_mean = dbg['adv_sum'] / max(1, dbg['bsz'])
+        a_var = max(0.0, dbg['adv_sumsq'] / max(1, dbg['bsz']) - a_mean * a_mean)
+        a_std = math.sqrt(a_var)
+        clip_rate = dbg['clipped_cnt'] / max(1, dbg['bsz'])
+        print(f"Joint ratio: mean={r_mean:.4f}, std={r_std:.4f}")
+        print(f"Advantage stats: mean={a_mean:.6f}, std={a_std:.6f}")
+        print(f"Joint clipped: {clip_rate:.3f}")
 
-    # mixed training: if the ratio is way off, then we need to just learn the expert move introduced
-    if mode == 'bc' or ratio.detach().cpu().numpy().max() > 5.0:
+    # Check for divergence earlier and more strictly based on joint ratio
+    if mode == 'bc' or ratio_joint.max().item() > 5.0:
+        if mode == 'ppo' and print_debug:
+            print(f"Switching to BC mode due to high joint ratio: {ratio_joint.max().item():.2f}")
+
         log_a = (a_pp.clamp_min(1e-8)).log()
         log_t = (t_pp.clamp_min(1e-8)).log()
         policy_loss_a = F.nll_loss(log_a, action_idx.to(dtype=torch.long, device=a_pp.device))
         policy_loss_t = F.nll_loss(log_t, tile_idx.to(dtype=torch.long, device=t_pp.device))
         policy_loss = policy_loss_a + policy_loss_t
         value_loss = F.mse_loss(val.view_as(returns), returns)
-        total = policy_loss + value_coeff * value_loss
-        return total, policy_loss, value_loss, batch_size_curr
 
-    clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
-    policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-    value_loss = F.mse_loss(val.view_as(returns), returns)
-    entropy_loss_a = -(a_pp * (a_pp.clamp_min(1e-8).log())).sum(dim=1).mean()
-    entropy_loss_t = -(t_pp * (t_pp.clamp_min(1e-8).log())).sum(dim=1).mean()
-    entropy_loss = entropy_loss_a + entropy_loss_t
-    total = policy_loss + value_coeff * value_loss + entropy_coeff * entropy_loss
-    return total, policy_loss, value_loss, batch_size_curr
+        # Add entropy even in BC mode to maintain exploration
+        entropy_loss_a = -(a_pp * log_a).sum(dim=1).mean()
+        entropy_loss_t = -(t_pp * log_t).sum(dim=1).mean()
+        entropy_loss = entropy_loss_a + entropy_loss_t
+
+        total = policy_loss + value_coeff * value_loss - entropy_coeff * entropy_loss
+        return total, policy_loss, value_loss, batch_size_curr, dbg
+
+    clipped_ratio = torch.clamp(ratio_joint, 1 - epsilon, 1 + epsilon)
+    policy_loss = -torch.min(
+        ratio_joint * advantages,
+        clipped_ratio * advantages
+    ).mean()
+
+    def safe_entropy_calculation(probs, min_prob=1e-8):
+        """
+        Compute entropy safely, avoiding NaN from 0 * log(0) cases.
+
+        Standard entropy: H = -sum(p * log(p))
+        Safe entropy: H = -sum(p * log(max(p, epsilon)))
+        """
+        # Clamp probabilities to avoid log(0)
+        probs_safe = probs.clamp_min(min_prob)
+
+        # Compute entropy: -sum(p * log(p))
+        # Use the original probs for weighting, but safe probs for log
+        entropy = -(probs * probs_safe.log()).sum(dim=1).mean()
+
+        return entropy
+
+    value_loss = F.mse_loss(val, returns)
+    entropy_a = safe_entropy_calculation(a_pp)
+    entropy_t = safe_entropy_calculation(t_pp)
+    entropy = entropy_a + entropy_t
+
+    total = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
+
+    return total, policy_loss, value_loss, batch_size_curr, dbg
 
 
 def train_ppo(
@@ -207,10 +265,8 @@ def train_ppo(
         try:
             player = ACPlayer.from_directory(init_model)
             net = player.network
-
-            # reset standard scaler since we're retraining it
-            net._gsv_scaler = StandardScaler()
-
+            model = net.torch_module
+            ds = ACDataset(dataset_path, net, fit_scaler=False) # in the future we can always fit scaler to fit new distribution
             print(f"Loaded initial weights from {init_model}")
         except Exception as e:
             raise ValueError(f"Warning: failed to load init model '{init_model}': {e}")
@@ -222,8 +278,8 @@ def train_ppo(
         # Ensure the scaler we persist is the exact one used by the network during preprocessing
         player = ACPlayer(gsv_scaler=gsv_scaler, network=net)
 
-    model = net.torch_module
-    ds = ACDataset(dataset_path, net)
+        model = net.torch_module
+        ds = ACDataset(dataset_path, net, fit_scaler=True)
     # Build train/validation split
     n = len(ds)
     k = int(max(0, min(n, round(float(val_split) * n))))
@@ -252,7 +308,7 @@ def train_ppo(
                 (
                     hand, calls, disc, gsv,
                     action_idx, tile_idx,
-                    _a_old_log_probs, _t_old_log_probs,
+                    _joint_old_log_probs,
                     _advantages,
                     _returns,
                 ) = _prepare_batch_tensors(batch, dev)
@@ -287,16 +343,16 @@ def train_ppo(
                 (
                     hand, calls, disc, gsv,
                     action_idx, tile_idx,
-                    action_old_log_probs, tile_old_log_probs,
+                    joint_old_log_probs,
                     advantages,
                     returns,
                 ) = _prepare_batch_tensors(batch, dev)
 
-                loss, policy_loss, value_loss, _= _compute_losses(
+                loss, policy_loss, value_loss, _, _dbg = _compute_losses(
                     model,
                     hand, calls, disc, gsv,
                     action_idx, tile_idx,
-                    action_old_log_probs, tile_old_log_probs,
+                    joint_old_log_probs,
                     advantages,
                     returns,
                     mode='bc',
@@ -341,15 +397,15 @@ def train_ppo(
                         (
                             hand, calls, disc, gsv,
                             action_idx, tile_idx,
-                            action_old_log_probs, tile_old_log_probs,
+                            joint_old_log_probs,
                             advantages,
                             returns,
                         ) = _prepare_batch_tensors(vb, dev)
-                        loss_v, policy_loss_v, value_loss_v, _ = _compute_losses(
+                        loss_v, policy_loss_v, value_loss_v, _, _ = _compute_losses(
                             model,
                             hand, calls, disc, gsv,
                             action_idx, tile_idx,
-                            action_old_log_probs, tile_old_log_probs,
+                            joint_old_log_probs,
                             advantages,
                             returns,
                             mode='bc',
@@ -387,12 +443,13 @@ def train_ppo(
     best_loss = math.inf
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     epochs_no_improve = 0
-    # Store previous epoch's validation policy probabilities to compute KL(prev || curr)
-    prev_val_policy_probs: torch.Tensor | None = None
-    # Track consecutive epochs where KL(prev||curr) <= threshold (when enabled)
+    # Store previous epoch's validation policy probabilities for BOTH heads to compute joint KL(prev || curr)
+    prev_val_action_probs: torch.Tensor | None = None
+    prev_val_tile_probs: torch.Tensor | None = None
+    # Track consecutive epochs where joint KL(prev||curr) <= threshold (when enabled)
     kl_below_count: int = 0
-    # Latest computed validation KL (prev||curr) average for logging/ES
-    v_avg_kl_prev_curr: float | None = None
+    # Latest computed validation joint KL (prev||curr) average for logging/ES
+    v_avg_joint_kl_prev_curr: float | None = None
     for epoch in range(epochs):
         total_loss = 0.0
         total_examples = 0
@@ -400,26 +457,33 @@ def train_ppo(
         total_value_loss = 0.0
         total_policy_loss_main = 0.0
         progress = tqdm(dl, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        # Epoch-level debug accumulators
+        dbg_ratio_sum = 0.0
+        dbg_ratio_sumsq = 0.0
+        dbg_adv_sum = 0.0
+        dbg_adv_sumsq = 0.0
+        dbg_clipped = 0
+        dbg_count = 0
         for bi, batch in enumerate(progress):
             tensors = _prepare_batch_tensors(batch, dev)
             (
                 hand, calls, disc, gsv,
                 action_idx, tile_idx,
-                action_old_log_probs, tile_old_log_probs,
+                joint_old_log_probs,
                 advantages, returns,
             ) = tensors
 
             # Print PPO debugging once per epoch at the last training step
             last_step = (bi == (len(dl) - 1))
-            total, policy_loss, value_loss, batch_size_curr = _compute_losses(
+            total, policy_loss, value_loss, batch_size_curr, dbg = _compute_losses(
                 model, hand, calls, disc, gsv,
                 action_idx, tile_idx,
-                action_old_log_probs, tile_old_log_probs,
+                joint_old_log_probs,
                 advantages, returns, mode='ppo',
                 epsilon=epsilon,
                 value_coeff=value_coeff,
                 entropy_coeff=entropy_coeff,
-                print_debug=last_step,
+                print_debug=False,
             )
 
             opt.zero_grad()
@@ -433,6 +497,13 @@ def train_ppo(
             total_policy_loss_main += float(policy_loss.item()) * batch_size_curr
             
             total_examples += batch_size_curr
+            # Accumulate epoch-level debug stats
+            dbg_ratio_sum += dbg['ratio_sum']
+            dbg_ratio_sumsq += dbg['ratio_sumsq']
+            dbg_adv_sum += dbg['adv_sum']
+            dbg_adv_sumsq += dbg['adv_sumsq']
+            dbg_clipped += int(dbg['clipped_cnt'])
+            dbg_count += int(dbg['bsz'])
             # Per-batch progress like Keras
             progress.set_postfix(
                 loss=f"{float(total.item()):.4f}",
@@ -440,29 +511,41 @@ def train_ppo(
                 val=f"{float(value_loss.item()):.4f}"
             )
 
+        # End-of-epoch debug summary (averages over training epoch)
+        if dbg_count > 0:
+            r_mean = dbg_ratio_sum / dbg_count
+            r_var = max(0.0, (dbg_ratio_sumsq / dbg_count) - r_mean * r_mean)
+            r_std = math.sqrt(r_var)
+            a_mean = dbg_adv_sum / dbg_count
+            a_var = max(0.0, (dbg_adv_sumsq / dbg_count) - a_mean * a_mean)
+            a_std = math.sqrt(a_var)
+            clip_rate = dbg_clipped / max(1, dbg_count)
+            print(f"Epoch {epoch + 1}/{epochs} [train dbg] - ratio_mean={r_mean:.4f} | ratio_std={r_std:.4f} | clipped={clip_rate:.3f} | adv_mean={a_mean:.6f} | adv_std={a_std:.6f}")
+
         # Evaluate on holdout set
         if dl_val is not None:
             model.eval()
             val_total = val_pol = val_val = 0.0
             val_pol_main = 0.0
             val_count = 0
-            # KL(prev || curr) across validation set (available from epoch >= 1)
-            val_kl_prev_curr_sum = 0.0
+            # Joint KL(prev || curr) across validation set (available from epoch >= 1)
+            val_joint_kl_prev_curr_sum = 0.0
             offset = 0
-            curr_probs_chunks: list[torch.Tensor] = []
+            curr_action_probs_chunks: list[torch.Tensor] = []
+            curr_tile_probs_chunks: list[torch.Tensor] = []
             with torch.no_grad():
                 for vb in dl_val:
                     tensors = _prepare_batch_tensors(vb, dev)
                     (
                         hand, calls, disc, gsv,
                         action_idx, tile_idx,
-                        action_old_log_probs, tile_old_log_probs,
+                        joint_old_log_probs,
                         advantages, returns,
                     ) = tensors
-                    total_v, policy_loss_v, value_loss_v, bsz = _compute_losses(
+                    total_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
                         model, hand, calls, disc, gsv,
                         action_idx, tile_idx,
-                        action_old_log_probs, tile_old_log_probs,
+                        joint_old_log_probs,
                         advantages, returns,
                         epsilon=epsilon,
                         value_coeff=value_coeff,
@@ -473,21 +556,26 @@ def train_ppo(
                     val_pol += float(policy_loss_v.item()) * bsz
                     val_val += float(value_loss_v.item()) * bsz
                     val_pol_main += float(policy_loss_v.item()) * bsz
-                    # Collect current policy probabilities for this batch
+                    # Collect current policy probabilities for this batch for BOTH heads
                     a_curr, t_curr, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                    # Concatenate heads for KL tracking if desired; here track action head only for consistency
-                    curr_probs_chunks.append(a_curr.detach().cpu())
-                    # If previous epoch's probs are available, compute KL(prev || curr)
-                    if prev_val_policy_probs is not None:
-                        prev_slice = prev_val_policy_probs[offset:offset+bsz, :]
+                    curr_action_probs_chunks.append(a_curr.detach().cpu())
+                    curr_tile_probs_chunks.append(t_curr.detach().cpu())
+                    # If previous epoch's probs are available, compute joint KL(prev || curr) = KL_a + KL_t
+                    if prev_val_action_probs is not None and prev_val_tile_probs is not None:
+                        prev_slice_a = prev_val_action_probs[offset:offset + bsz, :]
+                        prev_slice_t = prev_val_tile_probs[offset:offset + bsz, :]
                         # Numerical stability
-                        prev_safe = prev_slice.clamp_min(1e-8)
-                        curr_safe = a_curr.clamp_min(1e-8)
-                        # KL(prev||curr) per sample, then mean
-                        kl_batch = (prev_safe * (prev_safe.log() - curr_safe.detach().cpu().log())).sum(dim=1)
-                        val_kl_prev_curr_sum += float(kl_batch.mean().item()) * bsz
+                        prev_a_safe = prev_slice_a.clamp_min(1e-8)
+                        curr_a_safe = a_curr.clamp_min(1e-8)
+                        prev_t_safe = prev_slice_t.clamp_min(1e-8)
+                        curr_t_safe = t_curr.clamp_min(1e-8)
+                        # KL(prev||curr) per sample for both heads
+                        kl_a = (prev_a_safe * (prev_a_safe.log() - curr_a_safe.detach().cpu().log())).sum(dim=1)
+                        kl_t = (prev_t_safe * (prev_t_safe.log() - curr_t_safe.detach().cpu().log())).sum(dim=1)
+                        kl_joint = kl_a + kl_t
+                        val_joint_kl_prev_curr_sum += float(kl_joint.mean().item()) * bsz
                     offset += bsz
-                    
+
                     val_count += bsz
             vden = max(1, val_count)
             v_avg = val_total / vden
@@ -495,29 +583,33 @@ def train_ppo(
             v_avg_val = val_val / vden
             v_avg_pol_main = val_pol_main / vden
             # Finalize current epoch's concatenated validation probs for next epoch
-            curr_val_policy_probs = torch.cat(curr_probs_chunks, dim=0) if curr_probs_chunks else None
-            # Compute KL(prev||curr) average if prev exists; otherwise mark as None
-            v_avg_kl_prev_curr = (val_kl_prev_curr_sum / vden) if (prev_val_policy_probs is not None and vden > 0) else None
+            curr_val_action_probs = torch.cat(curr_action_probs_chunks, dim=0) if curr_action_probs_chunks else None
+            curr_val_tile_probs = torch.cat(curr_tile_probs_chunks, dim=0) if curr_tile_probs_chunks else None
+            # Compute joint KL(prev||curr) average if prev exists; otherwise mark as None
+            v_avg_joint_kl_prev_curr = (val_joint_kl_prev_curr_sum / vden) if (
+                        prev_val_action_probs is not None and prev_val_tile_probs is not None and vden > 0) else None
             print(
-                f"\nEpoch {epoch+1}/{epochs} [val] - total: {v_avg:.4f} | policy: {v_avg_pol:.4f} | value: {v_avg_val:.4f}"
-                + (f" | kl(prev||curr): {v_avg_kl_prev_curr:.4f}" if v_avg_kl_prev_curr is not None else " | kl(prev||curr): N/A")
+                f"\nEpoch {epoch + 1}/{epochs} [val] - total: {v_avg:.4f} | policy: {v_avg_pol:.4f} | value: {v_avg_val:.4f}"
+                + (
+                    f" | joint_kl(prev||curr): {v_avg_joint_kl_prev_curr:.4f}" if v_avg_joint_kl_prev_curr is not None else " | joint_kl(prev||curr): N/A")
             )
             # Update previous epoch validation policy probabilities for next epoch
-            if curr_val_policy_probs is not None:
-                prev_val_policy_probs = curr_val_policy_probs
+            if curr_val_action_probs is not None and curr_val_tile_probs is not None:
+                prev_val_action_probs = curr_val_action_probs
+                prev_val_tile_probs = curr_val_tile_probs
             model.train()
 
         # Early stopping
         if dl_val is not None:
-            # KL-based early stopping with patience: require KL(prev||curr) <= threshold for `patience` consecutive epochs
-            if kl_threshold is not None and v_avg_kl_prev_curr is not None:
-                if v_avg_kl_prev_curr <= float(kl_threshold):
+            # KL-based early stopping with patience: require joint KL(prev||curr) <= threshold for `patience` consecutive epochs
+            if kl_threshold is not None and v_avg_joint_kl_prev_curr is not None:
+                if v_avg_joint_kl_prev_curr <= float(kl_threshold):
                     kl_below_count += 1
                 else:
                     kl_below_count = 0
                 if patience and kl_below_count >= int(max(1, patience)):
                     print(
-                        f"Early stopping triggered: KL(prev||curr) <= {float(kl_threshold):.6f} for {kl_below_count} consecutive epoch(s) (patience={int(patience)})"
+                        f"Early stopping triggered: joint KL(prev||curr) <= {float(kl_threshold):.6f} for {kl_below_count} consecutive epoch(s) (patience={int(patience)})"
                     )
                     break
 

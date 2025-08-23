@@ -205,8 +205,7 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     tile_idx = np.empty(total_samples, dtype=np.int64)
     returns = np.empty(total_samples, dtype=np.float32)
     advantages = np.empty(total_samples, dtype=np.float32)
-    action_log_probs = np.empty(total_samples, dtype=np.float32)
-    tile_log_probs = np.empty(total_samples, dtype=np.float32)
+    joint_log_probs = np.empty(total_samples, dtype=np.float32)
     game_ids = np.empty(total_samples, dtype=np.int32)
     step_ids = np.empty(total_samples, dtype=np.int32)
     actor_ids = np.empty(total_samples, dtype=np.int32)
@@ -231,8 +230,7 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
             tile_idx[sample_offset:sample_offset + chunk_size] = data['tile_idx']
             returns[sample_offset:sample_offset + chunk_size] = data['returns']
             advantages[sample_offset:sample_offset + chunk_size] = data['advantages']
-            action_log_probs[sample_offset:sample_offset + chunk_size] = data['action_log_probs']
-            tile_log_probs[sample_offset:sample_offset + chunk_size] = data['tile_log_probs']
+            joint_log_probs[sample_offset:sample_offset + chunk_size] = data['joint_log_probs']
 
             # Apply game ID offset and copy
             gid = data['game_ids'] + offsets[i]
@@ -272,8 +270,7 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         'tile_idx': tile_idx,
         'returns': returns,
         'advantages': advantages,
-        'action_log_probs': action_log_probs,
-        'tile_log_probs': tile_log_probs,
+        'joint_log_probs': joint_log_probs,
         'game_ids': game_ids,
         'step_ids': step_ids,
         'actor_ids': actor_ids,
@@ -565,7 +562,7 @@ def _combine_results_optimized(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         'called_discards': [],
         'action_idx': [], 'tile_idx': [],
         'returns': [], 'advantages': [],
-        'action_log_probs': [], 'tile_log_probs': [],
+        'joint_log_probs': [],
         'game_ids': [], 'step_ids': [], 'actor_ids': [],
         'game_outcomes_obj': []
     }
@@ -589,8 +586,7 @@ def _combine_results_optimized(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             chunk_parts['tile_idx'].append(np.asarray(r['tile_idx'], dtype=np.int64))
             chunk_parts['returns'].append(np.asarray(r['returns'], dtype=np.float32))
             chunk_parts['advantages'].append(np.asarray(r['advantages'], dtype=np.float32))
-            chunk_parts['action_log_probs'].append(np.asarray(r['action_log_probs'], dtype=np.float32))
-            chunk_parts['tile_log_probs'].append(np.asarray(r['tile_log_probs'], dtype=np.float32))
+            chunk_parts['joint_log_probs'].append(np.asarray(r['joint_log_probs'], dtype=np.float32))
 
             # Apply offset to game_ids
             gid = np.asarray(r['game_ids'], dtype=np.int32) + np.int32(offsets[actual_i])
@@ -602,7 +598,7 @@ def _combine_results_optimized(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         # Combine this chunk and add to final parts
         for key in final_parts.keys():
-            if key in ['action_idx', 'tile_idx', 'returns', 'advantages', 'action_log_probs', 'tile_log_probs', 'game_ids', 'step_ids', 'actor_ids']:
+            if key in ['action_idx', 'tile_idx', 'returns', 'advantages', 'joint_log_probs', 'game_ids', 'step_ids', 'actor_ids']:
                 combined_chunk = _efficient_array_concat(
                     chunk_parts[key],
                     np.int64 if ('idx' in key or 'ids' in key) else np.float32
@@ -637,8 +633,7 @@ def _load_npz_as_dict(path: str) -> Dict[str, Any]:
         'tile_idx': data['tile_idx'],
         'returns': data['returns'],
         'advantages': data['advantages'],
-        'action_log_probs': data['action_log_probs'],
-        'tile_log_probs': data['tile_log_probs'],
+        'joint_log_probs': data['joint_log_probs'],
         'game_ids': data['game_ids'],
         'step_ids': data['step_ids'],
         'actor_ids': data['actor_ids'],

@@ -161,26 +161,20 @@ def build_move_from_two_head(gs, action_idx: int, tile_idx: int):
         variant = variant_map.get(base, -1)
         if variant < 0:
             return None
-        last = gs._reactable_tile
         for r in gs.get_call_options():
             if isinstance(r, Chi) and getattr(r, 'chi_variant_index', -1) == variant:
-                aka = False
-                if last is not None:
-                    aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
-                if aka == with_aka:
+                aka_state = any(getattr(t, 'aka', False) for t in r.tiles)
+                if aka_state == with_aka:
                     return r if gs.is_legal(r) else None
         return None
 
     # Pon variants
     if name.startswith('pon_'):
         with_aka = name.endswith('_aka')
-        last = gs._reactable_tile
         for r in gs.get_call_options():
             if isinstance(r, Pon):
-                aka = False
-                if last is not None:
-                    aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
-                if aka == with_aka:
+                aka_state = any(getattr(t, 'aka', False) for t in r.tiles)
+                if aka_state == with_aka:
                     return r if gs.is_legal(r) else None
         return None
 

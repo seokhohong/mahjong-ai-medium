@@ -37,13 +37,11 @@ class ExperienceBuffer:
         self.rewards: List[float] = []
         # Optional value baseline per step (e.g., V(s_t) from a network)
         self.values: List[float] = []
-        # Stored log-probs for chosen heads
-        self.action_log_probs: List[float] = []
-        self.tile_log_probs: List[float] = []
+        # Stored joint log-prob for chosen move
+        self.joint_log_probs: List[float] = []
 
     def add(self, state_features: Dict[str, Any], action_indices: Tuple[int, int], reward: float, value: float,
-            action_logp: float,
-            tile_logp: float,
+            joint_logp: float,
             raw_state: Optional[Any] = None,
             action_obj: Optional[Any] = None) -> None:
         ai, ti = int(action_indices[0]), int(action_indices[1])
@@ -55,8 +53,8 @@ class ExperienceBuffer:
                 action_obj=action_obj,
                 encoded_state=state_features,
                 value=float(value),
-                action_logp=float(action_logp),
-                tile_logp=float(tile_logp),
+                action_logp=float(joint_logp),
+                tile_logp=0.0,
                 reason='illegal_action_index',
             )
             return
@@ -64,16 +62,14 @@ class ExperienceBuffer:
         self.actions.append((ai, ti))
         self.rewards.append(float(reward))
         self.values.append(float(value))
-        self.action_log_probs.append(float(action_logp))
-        self.tile_log_probs.append(float(tile_logp))
+        self.joint_log_probs.append(float(joint_logp))
 
     def clear(self) -> None:
         self.states.clear()
         self.actions.clear()
         self.rewards.clear()
         self.values.clear()
-        self.action_log_probs.clear()
-        self.tile_log_probs.clear()
+        self.joint_log_probs.clear()
 
     def __len__(self) -> int:
         return len(self.states)
@@ -111,28 +107,26 @@ class RecordingACPlayer(ACPlayer):
 
     # Record decisions along with value estimates from the network
     def play(self, game_state: GamePerspective):  # type: ignore[override]
-        move, value, a_idx, t_idx, logp_a, logp_t = self.compute_play(game_state)
+        move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
         self.experience.add(
             encode_game_perspective(game_state),
             (a_idx, t_idx),
             0.0,
             float(value if not self._zero_network_reward else 0.0),
-            action_logp=logp_a,
-            tile_logp=logp_t,
+            joint_logp=logp_joint,
             raw_state=game_state,
             action_obj=move,
         )
         return move
 
     def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]):  # type: ignore[override]
-        move, value, a_idx, t_idx, logp_a, logp_t = self.compute_play(game_state)
+        move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
         self.experience.add(
             encode_game_perspective(game_state),
             (a_idx, t_idx),
             0.0,
             float(value if not self._zero_network_reward else 0.0),
-            action_logp=logp_a,
-            tile_logp=logp_t,
+            joint_logp=logp_joint,
             raw_state=game_state,
             action_obj=move,
         )
@@ -175,8 +169,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
             (int(ai), int(ti)),
             0.0,
             0.0,
-            action_logp=0.0,
-            tile_logp=0.0,
+            joint_logp=0.0,
             raw_state=game_state,
             action_obj=move,
         )
@@ -199,8 +192,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
                     (int(ai), int(ti)),
                     0.0,
                     0.0,
-                    action_logp=0.0,
-                    tile_logp=0.0,
+                    joint_logp=0.0,
                 )
                 return move
         # Otherwise, delegate to heuristic strategy
@@ -212,8 +204,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
             (int(ai), int(ti)),
             0.0,
             0.0,
-            action_logp=0.0,
-            tile_logp=0.0,
+            joint_logp=0.0,
         )
         return move
 

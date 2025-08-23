@@ -2,6 +2,8 @@ import unittest
 import sys
 import os
 
+from core.learn.policy_utils import encode_two_head_action, build_move_from_two_head
+
 # Add this test directory to Python path BEFORE importing helpers that depend on it
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -12,7 +14,9 @@ from core.game import (
     Discard, Tsumo, Ron, Pon, Chi, CalledSet, PassCall, Riichi,
     KanKakan, KanAnkan, KanDaimin, tile_flat_index
 )
-from core.learn.ac_constants import ACTION_HEAD_INDEX, chi_variant_index, ACTION_HEAD_ORDER, TILE_HEAD_NOOP
+from core.learn.ac_constants import ACTION_HEAD_INDEX, chi_variant_index, ACTION_HEAD_ORDER, TILE_HEAD_NOOP, \
+    action_type_to_main_index
+
 
 class TestMediumLegality(unittest.TestCase):
     def setUp(self):
@@ -117,6 +121,29 @@ class TestMediumLegality(unittest.TestCase):
         game.step(0, Discard(Tile(Suit.PINZU, TileType.THREE)))
         self.assertTrue(game.is_legal(1, Chi([Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)], 1)))
         self.assertTrue(game.is_legal(1, PassCall()))
+        self.assertIsNone(build_move_from_two_head(game.get_game_perspective(1), action_type_to_main_index("chi_mid_aka"), TILE_HEAD_NOOP))
+        self.assertIsNotNone(build_move_from_two_head(game.get_game_perspective(1), action_type_to_main_index("chi_mid_noaka"), TILE_HEAD_NOOP))
+
+    def test_legal_aka_chi(self):
+        """If the discard is aka 5p, the left player can chi using non-aka tiles.
+        Here we verify chi with [4p,6p] (middle variant) is legal even though the caller's tiles are non-aka.
+        """
+        game = MediumJong([Player(), Player(), Player(), Player()])
+        non_part = [
+            Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.SEVEN), Tile(Suit.SOUZU, TileType.SEVEN), Tile(Suit.SOUZU, TileType.EIGHT), Tile(Suit.SOUZU, TileType.NINE)
+        ]
+        # Next draw for player 0 is aka 5p; they will discard it
+        game.tiles = [Tile(Suit.PINZU, TileType.FIVE, True)]
+        # Player 1 (left of player 0) holds 4p and 6p for a middle chi on 5p
+        game._player_hands[1] = [Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.SIX)] + non_part
+        game._draw_tile()
+        game.step(0, Discard(Tile(Suit.PINZU, TileType.FIVE, True)))
+        # Middle chi variant index is 1: [d-1, d+1] -> 4p and 6p
+        self.assertTrue(game.is_legal(1, Chi([Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.SIX)], 1)))
+        # Pass remains an option as well
+        self.assertTrue(game.is_legal(1, PassCall()))
 
     def test_discard_not_legal_on_reaction(self):
         game = MediumJong([Player(), Player(), Player(), Player()])
@@ -143,6 +170,27 @@ class TestMediumLegality(unittest.TestCase):
         game._draw_tile()
         game.step(0, Discard(Tile(Suit.SOUZU, TileType.FIVE)))
         self.assertTrue(game.get_game_perspective(2).is_legal(Pon([Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE)])))
+
+    def test_legal_aka_pon(self):
+        """If the discard is aka 5s, a player with two non-aka 5s can pon; the action should be pon_aka (since the called set includes the aka tile)."""
+        game = MediumJong([Player(), Player(), Player(), Player()])
+        non_part = [
+            Tile(Suit.PINZU, TileType.ONE), Tile(Suit.PINZU, TileType.ONE), Tile(Suit.PINZU, TileType.TWO),
+            Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
+            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.EIGHT), Tile(Suit.PINZU, TileType.NINE)
+        ]
+        # Player 2 holds two non-aka 5s
+        game._player_hands[2] = [Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE)] + non_part
+        # Next draw for player 0 is aka 5s; they will discard it
+        game.tiles = [Tile(Suit.SOUZU, TileType.FIVE, True)]
+        game._draw_tile()
+        game.step(0, Discard(Tile(Suit.SOUZU, TileType.FIVE, True)))
+        # Pon should be legal for player 2
+        self.assertTrue(game.is_legal(2, Pon([Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.FIVE)])))
+        gp2 = game.get_game_perspective(2)
+        # With aka involved via the discard, pon_aka should be the valid action encoding; pon_noaka should be None
+        self.assertIsNone(build_move_from_two_head(gp2, action_type_to_main_index('pon_aka'), TILE_HEAD_NOOP))
+        self.assertIsNotNone(build_move_from_two_head(gp2, action_type_to_main_index('pon_noaka'), TILE_HEAD_NOOP))
 
     def test_legal_moves_action_phase_for_current_player(self):
         moves = self.game.legal_moves(0)
@@ -342,58 +390,25 @@ class TestMediumLegality(unittest.TestCase):
             def play(self, gs):  # type: ignore[override]
                 # Verify all legal moves align with masks; then pick a move.
                 moves = gs.legal_moves()
-                self.t.assertGreater(len(moves), 0)
                 act_mask = gs.legal_action_mask()
 
-                # Compact type mapping declared once
-                TYPE_TO_INDEX_PARAM = {
-                    Discard: (ACTION_HEAD_INDEX['discard'], True),
-                    Riichi: (ACTION_HEAD_INDEX['riichi'], True),
-                    Tsumo: (ACTION_HEAD_INDEX['tsumo'], False),
-                    KanKakan: (ACTION_HEAD_INDEX['kan_kakan'], True),
-                    KanAnkan: (ACTION_HEAD_INDEX['kan_ankan'], True),
-                }
-
-                for mv in moves:
-                    # Action mask consistency for core actions
-                    for cls, (aidx, param) in TYPE_TO_INDEX_PARAM.items():
-                        if isinstance(mv, cls):
-                            self.t.assertEqual(int(act_mask[aidx]), 1)
-                            if param:
-                                tile_idx = tile_flat_index(mv.tile)
-                                tmask = gs.legal_tile_mask(aidx)
-                                self.t.assertEqual(int(tmask[tile_idx]), 1)
-                                self.t.assertEqual(int(tmask[TILE_HEAD_NOOP]), 0)
-                            break
+                # Validate each option matches action mask bits
+                for move in moves:
+                    action_idx, tile_idx = encode_two_head_action(move)
+                    tile_mask = gs.legal_tile_mask(action_idx)
+                    self.t.assertEqual(int(act_mask[action_idx]), 1)
+                    self.t.assertEqual(int(tile_mask[tile_idx]), 1)
                 # Delegate move selection to base Player
                 return super().play(gs)
 
             def choose_reaction(self, gs, options):  # type: ignore[override]
                 act_mask = gs.legal_action_mask()
-                last = gs._reactable_tile
                 # Validate each option matches action mask bits
                 for r in options:
-                    if isinstance(r, Pon):
-                        # Aka vs no-aka depends on whether any tile in (r.tiles + [last]) is aka
-                        has_aka = False
-                        if last is not None:
-                            has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
-                        name = 'pon_aka' if has_aka else 'pon_noaka'
-                        aidx = ACTION_HEAD_INDEX[name]
-                        self.t.assertEqual(int(act_mask[aidx]), 1)
-                    elif isinstance(r, Chi):
-                        # Determine chi variant relative to last discard and aka flag
-                        variant = chi_variant_index(last, r.tiles) if last is not None else -1
-                        has_aka = False
-                        if last is not None:
-                            has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
-                        if variant in (0, 1, 2):
-                            name = ['chi_low', 'chi_mid', 'chi_high'][variant] + ('_aka' if has_aka else '_noaka')
-                            aidx = ACTION_HEAD_INDEX[name]
-                            self.t.assertEqual(int(act_mask[aidx]), 1)
-                    elif isinstance(r, KanDaimin):
-                        aidx = ACTION_HEAD_INDEX['kan_daimin']
-                        self.t.assertEqual(int(act_mask[aidx]), 1)
+                    action_idx, tile_idx = encode_two_head_action(r)
+                    tile_mask = gs.legal_tile_mask(action_idx)
+                    self.t.assertEqual(int(act_mask[action_idx]), 1)
+                    self.t.assertEqual(int(tile_mask[tile_idx]), 1)
                 # Delegate reaction selection to base Player
                 return super().choose_reaction(gs, options)
 

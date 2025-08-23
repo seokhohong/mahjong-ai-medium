@@ -117,8 +117,7 @@ def main() -> int:
     advantages = data["advantages"] if "advantages" in data.files else None
     action_idx = data["action_idx"]
     tile_idx = data["tile_idx"]
-    action_log_probs = data["action_log_probs"] if "action_log_probs" in data.files else None
-    tile_log_probs = data["tile_log_probs"] if "tile_log_probs" in data.files else None
+    joint_log_probs = data["joint_log_probs"] if "joint_log_probs" in data.files else None
     get_state_row = make_npz_state_row_getter(data)
     outcomes_arr = data["game_outcomes_obj"] if "game_outcomes_obj" in data.files else None
 
@@ -159,15 +158,12 @@ def main() -> int:
             adv = (float(advantages[i]) if advantages is not None else None)
             actor = int(actor_ids[i])
             step = int(step_ids[i])
-            # Probability of chosen action from stored two-head log-probs (show both heads and joint)
+            # Probability of chosen action from stored joint log-prob (if present)
             prob_s = ""
-            if action_log_probs is not None and tile_log_probs is not None:
-                a_lp = float(action_log_probs[i])
-                t_lp = float(tile_log_probs[i])
-                a_p = float(np.exp(a_lp))
-                t_p = float(np.exp(t_lp))
-                joint_p = float(np.exp(a_lp + t_lp))
-                prob_s = f" | action_p={a_p:.4f} | tile_p={t_p:.4f} | joint_p={joint_p:.4f}"
+            if joint_log_probs is not None:
+                j_lp = float(joint_log_probs[i])
+                joint_p = float(np.exp(j_lp))
+                prob_s = f" | joint_p={joint_p:.4f}"
             if adv is not None:
                 print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | advantage={adv:+.3f} | {prob_s}")
             else:

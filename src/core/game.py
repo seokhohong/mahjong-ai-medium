@@ -5,7 +5,7 @@ from enum import Enum
 from typing import List, Optional, Dict, Any, Union, Tuple
 import numpy as np
 
-from src.core.learn.ac_constants import chi_variant_index, ACTION_HEAD_INDEX, ACTION_HEAD_ORDER, TILE_HEAD_NOOP
+from src.core.learn.ac_constants import chi_variant_index, ACTION_HEAD_INDEX, ACTION_HEAD_ORDER, TILE_HEAD_NOOP, TILE_HEAD_SIZE
 from .constants import (
     NUM_PLAYERS as MC_NUM_PLAYERS,
     DEALER_ID_START,
@@ -44,7 +44,7 @@ from .constants import (
     DEALER_RON_MULTIPLIER,
     NON_DEALER_RON_MULTIPLIER,
 )
-from .learn.policy_utils import _flat_tile_index
+from .learn.policy_utils import _flat_tile_index, encode_two_head_action
 
 # Tile enums, dataclass, and helpers moved to dedicated module
 from .tile import (
@@ -749,29 +749,6 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
     return fu, han, dora_han
 
 
-def tile_flat_index(tile: Tile) -> int:
-    """Map a Tile to a compact 0..36 index for action masks (37 slots).
-    Per-suit blocks:
-    - Manzu: 0..9  (0m for aka five, 1m..9m -> 1..9)
-    - Pinzu: 10..19 (0p -> 10, 1p..9p -> 11..19)
-    - Souzu: 20..29 (0s -> 20, 1s..9s -> 21..29)
-    - Honors: 30..36 (E,S,W,N,Wh,G,R)
-    """
-    if tile.suit == Suit.MANZU:
-        if tile.tile_type == TileType.FIVE and tile.aka:
-            return 0
-        return int(tile.tile_type.value)
-    if tile.suit == Suit.PINZU:
-        if tile.tile_type == TileType.FIVE and tile.aka:
-            return 10
-        return 10 + int(tile.tile_type.value)
-    if tile.suit == Suit.SOUZU:
-        if tile.tile_type == TileType.FIVE and tile.aka:
-            return 20
-        return 20 + int(tile.tile_type.value)
-    # Honors 30..36
-    return 29 + int(tile.tile_type.value)
-
 
 def _chi_variant_index(last_discarded_tile: Optional[Tile], tiles: List[Tile]) -> int:
     # 0: [d-2, d-1], 1: [d-1, d+1], 2: [d+1, d+2]; -1 otherwise
@@ -859,54 +836,10 @@ class GamePerspective:
         """
         import numpy as _np
         m = _np.zeros((len(ACTION_HEAD_ORDER),), dtype=_np.float64)
-        moves = self.legal_moves()
-        # Presence flags
-        has = {name: False for name in ACTION_HEAD_ORDER}
-        last = self._reactable_tile
-        # Pre-compute reaction options (flat list)
-        reaction_opts: List[Reaction] = self.get_call_options() if self.state is Reaction else []
-        # Chi variants
-        for r in reaction_opts:
-            if isinstance(r, Chi):
-                has_aka = False
-                if last is not None:
-                    has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
-                variant = getattr(r, 'chi_variant_index', None)
-                if variant == 0:
-                    has['chi_low_aka' if has_aka else 'chi_low_noaka'] = True
-                elif variant == 1:
-                    has['chi_mid_aka' if has_aka else 'chi_mid_noaka'] = True
-                elif variant == 2:
-                    has['chi_high_aka' if has_aka else 'chi_high_noaka'] = True
-        # Pon variants
-        for r in reaction_opts:
-            if isinstance(r, Pon):
-                has_aka = False
-                if last is not None:
-                    has_aka = any(getattr(t, 'aka', False) for t in (r.tiles + [last]))
-                has['pon_aka' if has_aka else 'pon_noaka'] = True
-        # Daiminkan present
-        if any(isinstance(r, KanDaimin) for r in reaction_opts):
-            has['kan_daimin'] = True
-        # Iterate legal moves for other actions
-        for mv in moves:
-            if isinstance(mv, Discard):
-                has['discard'] = True
-            elif isinstance(mv, Riichi):
-                has['riichi'] = True
-            elif isinstance(mv, Tsumo):
-                has['tsumo'] = True
-            elif isinstance(mv, Ron):
-                has['ron'] = True
-            elif isinstance(mv, KanKakan):
-                has['kan_kakan'] = True
-            elif isinstance(mv, KanAnkan):
-                has['kan_ankan'] = True
-            elif isinstance(mv, PassCall):
-                has['pass'] = True
-        for name, ok in has.items():
-            if name in ACTION_HEAD_INDEX and ok:
-                m[ACTION_HEAD_INDEX[name]] = 1.0
+        for mv in self.legal_moves():
+            ai, _ti = encode_two_head_action(mv)
+            if isinstance(ai, int) and 0 <= ai < len(ACTION_HEAD_ORDER):
+                m[ai] = 1.0
         return m
 
     def legal_tile_mask(self, action_idx: int) -> np.ndarray:
@@ -917,34 +850,26 @@ class GamePerspective:
         """
         import numpy as _np
         name = ACTION_HEAD_ORDER[action_idx] if 0 <= action_idx < len(ACTION_HEAD_ORDER) else None
-        m = _np.zeros((38,), dtype=_np.float64)
+        m = _np.zeros((TILE_HEAD_SIZE,), dtype=_np.float64)
         if name is None:
             return m
         # Non-parameterized -> no-op only
         if name in ('tsumo', 'ron', 'pass', 'kan_daimin') or name.startswith('chi_') or name.startswith('pon_'):
             m[TILE_HEAD_NOOP] = 1.0
             return m
-        # Collect legal tiles per action
-        cand: list[int] = []
-        if name == 'discard' or name == 'riichi':
-            for mv in self.legal_moves():
-                if (name == 'discard' and isinstance(mv, Discard)) or (name == 'riichi' and isinstance(mv, Riichi)):
-                    cand.append(tile_flat_index(mv.tile))
-        elif name == 'kan_kakan':
-            for mv in self.legal_moves():
-                if isinstance(mv, KanKakan):
-                    cand.append(tile_flat_index(mv.tile))
-        elif name == 'kan_ankan':
-            for mv in self.legal_moves():
-                if isinstance(mv, KanAnkan):
-                    cand.append(tile_flat_index(mv.tile))
-        # Populate mask
-        if cand:
-            for idx in cand:
-                if 0 <= idx <= 36:
-                    m[idx] = 1.0
-        else:
-            # If no legal instantiation detected, still allow no-op to avoid invalid sampling
+        # Parameterized actions: collect tile indices from concrete legal moves that match action_idx
+        any_set = False
+        for mv in self.legal_moves():
+            ai, ti = encode_two_head_action(mv)
+            if isinstance(ai, int) and ai == action_idx:
+                if ti == TILE_HEAD_NOOP:
+                    m[TILE_HEAD_NOOP] = 1.0
+                    any_set = True
+                elif isinstance(ti, int) and 0 <= ti < TILE_HEAD_SIZE:
+                    m[ti] = 1.0
+                    any_set = True
+        # If nothing matched, allow no-op to avoid degenerate sampling
+        if not any_set:
             m[TILE_HEAD_NOOP] = 1.0
         return m
 

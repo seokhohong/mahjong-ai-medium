@@ -294,6 +294,8 @@ def train_ppo(
         try:
             player = ACPlayer.from_directory(init_model)
             net = player.network
+            # Ensure loaded network is moved to the correct device
+            net.to(dev)
             model = net.torch_module
             ds = ACDataset(dataset_path, net, fit_scaler=False) # in the future we can always fit scaler to fit new distribution
             print(f"Loaded initial weights from {init_model}")

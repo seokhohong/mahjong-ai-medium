@@ -7,6 +7,7 @@ import argparse
 from typing import Optional
 
 from run.create_dataset import build_ac_dataset, save_dataset
+from run.create_dataset_parallel import create_dataset_parallel
 from run.train_model import train_ppo
 
 
@@ -21,6 +22,7 @@ def run_train_loop(
     initial_model_dir: Optional[str],
     # dataset params
     games_per_gen: int,
+    num_processes: int,
     seed: Optional[int],
     temperature: float,
     n_step: int,
@@ -49,20 +51,40 @@ def run_train_loop(
         print(f"\n=== Generation {gen+1}/{generations} ===")
         # 1) Build dataset (heuristic disabled per request)
         use_heuristic = False
-        print(f"[Gen {gen}] Building dataset | games={games_per_gen} | use_heuristic={use_heuristic} | model={current_model_dir}")
-        built = build_ac_dataset(
-            games=games_per_gen,
-            seed=(None if seed is None else int(seed) + gen),
-            temperature=temperature,
-            zero_network_reward=False,
-            n_step=n_step,
-            gamma=gamma,
-            use_heuristic=False,
-            model_path=current_model_dir,
-        )
+        print(f"[Gen {gen}] Building dataset | games={games_per_gen} | procs={num_processes} | use_heuristic={use_heuristic} | model={current_model_dir}")
         ds_name = _default_out_name(f"ac_gen{gen}")
         ds_path = os.path.join(os.getcwd(), 'training_data', f"{ds_name}.npz")
-        save_dataset(built, ds_path)
+        if int(num_processes) > 1:
+            # Parallel path writes directly to ds_path
+            _ = create_dataset_parallel(
+                games=games_per_gen,
+                num_processes=int(num_processes),
+                seed=(None if seed is None else int(seed) + gen),
+                temperature=temperature,
+                zero_network_reward=False,
+                n_step=n_step,
+                gamma=gamma,
+                out=os.path.basename(ds_path),
+                use_heuristic=False,
+                model=current_model_dir,
+                chunk_size=250,
+                keep_partials=False,
+                stream_combine=True,
+                verbose_memory=False,
+                restart_every_chunks=0,
+            )
+        else:
+            built = build_ac_dataset(
+                games=games_per_gen,
+                seed=(None if seed is None else int(seed) + gen),
+                temperature=temperature,
+                zero_network_reward=False,
+                n_step=n_step,
+                gamma=gamma,
+                use_heuristic=False,
+                model_path=current_model_dir,
+            )
+            save_dataset(built, ds_path)
 
         # 2) Train PPO starting from current model (if any)
         print(f"[Gen {gen}] Training model on {ds_path} | init={current_model_dir}")
@@ -78,11 +100,10 @@ def run_train_loop(
             patience=patience,
             val_split=val_split,
             init_model=current_model_dir,
-            warm_up_acc=None,
             warm_up_max_epochs=warm_up_max_epochs,
             hidden_size=hidden_size,
             embedding_dim=embedding_dim,
-            negative_reward_weight=1.0,
+            kl_threshold=0.0
         )
         # train_ppo returns a model file path; use its directory for next gen
         new_model_dir = os.path.dirname(model_pt_path)
@@ -102,6 +123,7 @@ def main() -> str:
 
     # Dataset generation
     ap.add_argument('--games', type=int, default=2000, help='Games per generation')
+    ap.add_argument('--num_processes', type=int, default=1, help='Parallel workers for dataset creation (1 = serial)')
     ap.add_argument('--seed', type=int, default=None, help='Base random seed; gen index is added each generation')
     ap.add_argument('--temperature', type=float, default=0.1)
     ap.add_argument('--n_step', type=int, default=3)
@@ -129,6 +151,7 @@ def main() -> str:
         generations=args.generations,
         initial_model_dir=args.model,
         games_per_gen=args.games,
+        num_processes=args.num_processes,
         seed=args.seed,
         temperature=args.temperature,
         n_step=args.n_step,

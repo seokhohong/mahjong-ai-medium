@@ -375,6 +375,50 @@ class TestMediumLegality(unittest.TestCase):
         # Expect a Riichi action object present among legal moves list
         self.assertTrue(any(isinstance(m, Riichi) for m in moves))
 
+    def test_riichi_legal_for_specific_hand_configuration(self):
+        """Verify that the given closed hand can legally declare Riichi.
+
+        Hand tiles (14): 1m,2m,3m,0m,7m,8m, 0p,6p,7p, 3s,4s,5s,6s,6s
+        where 0m/0p are red fives (aka). We loop over each of these tiles as the
+        last drawn tile to simulate the draw and assert that at least one Riichi
+        action is present in legal moves for player 0.
+        """
+        g = MediumJong([Player(), Player(), Player(), Player()])
+
+        hand = [
+            Tile(Suit.MANZU, TileType.ONE),
+            Tile(Suit.MANZU, TileType.TWO),
+            Tile(Suit.MANZU, TileType.THREE),
+            Tile(Suit.MANZU, TileType.FIVE, True),  # 0m aka
+            Tile(Suit.MANZU, TileType.SEVEN),
+            Tile(Suit.MANZU, TileType.EIGHT),
+            Tile(Suit.PINZU, TileType.FIVE, True),  # 0p aka
+            Tile(Suit.PINZU, TileType.SIX),
+            Tile(Suit.PINZU, TileType.SEVEN),
+            Tile(Suit.SOUZU, TileType.THREE),
+            Tile(Suit.SOUZU, TileType.FOUR),
+            Tile(Suit.SOUZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.SOUZU, TileType.SIX),
+        ]
+
+        # Set deterministic closed hand and action state for player 0
+        g._player_hands[0] = list(hand)
+        g._player_called_sets[0] = []
+        g.current_player_idx = 0
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
+        g.riichi_declared[0] = False
+
+        # Test across each tile as the last drawn tile
+        for drawn in hand:
+            g.last_drawn_tile = drawn
+            moves = g.legal_moves(0)
+            self.assertTrue(
+                any(isinstance(m, Riichi) for m in moves),
+                msg=f"Riichi not found in legal moves when last_drawn_tile={drawn}"
+            )
+
     def test_tile_legality(self):
         """Run a full round using a LegalityCheckPlayer that verifies action/tile
         legality and masks for both actions and reactions. The game loop is

@@ -9,6 +9,7 @@ import importlib.util
 import multiprocessing as mp
 import gc
 import psutil
+import queue as pyqueue
 from contextlib import contextmanager
 from typing import Dict, Any, List, Tuple
 
@@ -41,10 +42,7 @@ _spec.loader.exec_module(_cd_mod)  # type: ignore[arg-type]
 build_ac_dataset = getattr(_cd_mod, 'build_ac_dataset')
 save_dataset = getattr(_cd_mod, 'save_dataset')
 
-# Import player classes to construct reusable players per worker
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from core.learn.recording_ac_player import RecordingACPlayer, RecordingHeuristicACPlayer
-from core.learn.ac_player import ACPlayer  # type: ignore
+# No direct player imports needed here; players are managed inside build_ac_dataset
 
 
 @contextmanager
@@ -121,37 +119,6 @@ def _worker_build_with_cleanup(games: int,
 
     # Aggressive cleanup after building
     _aggressive_cleanup()
-    return result
-
-
-def _efficient_array_concat(parts: List[np.ndarray], dtype: Any) -> np.ndarray:
-    """More memory-efficient array concatenation"""
-    if not parts:
-        return np.array([], dtype=dtype)
-
-    # Calculate total size first
-    total_size = sum(len(part) for part in parts)
-    if total_size == 0:
-        return np.array([], dtype=dtype)
-
-    # Pre-allocate result array
-    if dtype == object:
-        result = np.empty(total_size, dtype=object)
-    else:
-        result = np.empty(total_size, dtype=dtype)
-
-    # Fill the result array and delete parts as we go
-    offset = 0
-    for i, part in enumerate(parts):
-        if len(part) > 0:
-            result[offset:offset + len(part)] = part
-            offset += len(part)
-
-        # Clear the part immediately to free memory
-        parts[i] = None
-        if i % 5 == 0:  # Periodic cleanup
-            gc.collect()
-
     return result
 
 
@@ -287,114 +254,102 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     log_memory("Save complete")
 
 
-def run_worker_optimized(rank: int,
-                         games_for_rank: int,
-                         seed_base: int | None,
-                         temperature: float,
-                         zero_network_reward: bool,
-                         n_step: int,
-                         gamma: float,
-                         use_heuristic: bool,
-                         model_path: str | None,
-                         reporter_rank: int,
-                         queue: mp.Queue,
-                         run_id: str,
-                         chunk_size: int = 500,
-                         reuse_players: bool = False,
-                         batch_idx: int = 0) -> None:
-    """Memory-optimized worker that aggressively cleans up after each chunk"""
+def run_chunk_process(rank: int,
+                      games_for_chunk: int,
+                      seed: int | None,
+                      temperature: float,
+                      zero_network_reward: bool,
+                      n_step: int,
+                      gamma: float,
+                      use_heuristic: bool,
+                      model_path: str | None,
+                      reporter_rank: int,
+                      queue: mp.Queue,
+                      run_id: str,
+                      chunk_index: int) -> None:
+    """Run a single chunk in its own process and exit.
 
-    # Derive per-process seed base
-    seed0 = None if seed_base is None else int(seed_base)
+    This isolates Python memory arenas so RSS drops once the process terminates.
+    """
+
+    # Silence non-reporter
     silence = (rank != reporter_rank)
 
-    # Prepare per-worker temp directory
+    # Prepare per-chunk temp directory
     base_dir = os.path.abspath(os.getcwd())
-    tmp_dir = os.path.join(base_dir, 'training_data', 'tmp_parallel', f'run_{run_id}', f'rank_{rank}', f'batch_{batch_idx}')
+    tmp_dir = os.path.join(base_dir, 'training_data', 'tmp_parallel', f'run_{run_id}', f'chunkproc_{rank}')
     os.makedirs(tmp_dir, exist_ok=True)
 
-    players = None
-    if reuse_players:
-        # Build reusable players once per worker to avoid repeated model loads
-        if use_heuristic:
-            players = [RecordingHeuristicACPlayer(random_exploration=temperature) for _ in range(4)]
-        else:
-            if not model_path:
-                raise ValueError("model_path must be provided when not using heuristic")
-            net = ACPlayer.from_directory(model_path, temperature=temperature).network
-            try:
-                import torch  # type: ignore
-                # Ensure model is on CPU and not holding GPU memory
-                net = net.to(torch.device('cpu'))
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-            players = [RecordingACPlayer(net, temperature=temperature, zero_network_reward=bool(zero_network_reward)) for _ in range(4)]
+    # Build dataset for this chunk (no player reuse across chunks, process will exit)
+    built = _worker_build_with_cleanup(
+        games=int(max(1, games_for_chunk)),
+        seed=seed,
+        temperature=temperature,
+        zero_network_reward=bool(zero_network_reward),
+        n_step=int(n_step),
+        gamma=float(gamma),
+        use_heuristic=bool(use_heuristic),
+        model_path=model_path,
+        silence_io=silence,
+        prebuilt_players=None,
+    )
 
-    remaining = int(max(0, games_for_rank))
-    chunk_idx = 0
-    file_paths: List[str] = []
+    out_path = os.path.join(tmp_dir, f'chunk_{chunk_index:06d}.npz')
+    save_dataset(built, out_path)
 
-    while remaining > 0:
-        this_chunk = int(min(chunk_size, remaining))
-        # Each chunk uses an incremented seed (when provided) for determinism across chunks
-        seed = None if seed0 is None else seed0 + int(rank) + chunk_idx
-
-        built = _worker_build_with_cleanup(
-            games=this_chunk,
-            seed=seed,
-            temperature=temperature,
-            zero_network_reward=bool(zero_network_reward),
-            n_step=int(n_step),
-            gamma=float(gamma),
-            use_heuristic=bool(use_heuristic),
-            model_path=model_path,
-            silence_io=silence,
-            prebuilt_players=players if reuse_players else None,
-        )
-
-        out_path = os.path.join(tmp_dir, f'chunk_{chunk_idx:04d}.npz')
-        save_dataset(built, out_path)
-
-        # Explicitly delete and clean up
+    # Drop references aggressively just before exit
+    try:
         del built
-        _aggressive_cleanup()
+    except Exception:
+        pass
+    _aggressive_cleanup()
 
-        file_paths.append(out_path)
-        remaining -= this_chunk
-        chunk_idx += 1
-
-    # Clean up players at the end
-    if players:
-        del players
-        _aggressive_cleanup()
-
-    queue.put((rank, file_paths))
+    queue.put((rank, [out_path]))
 
 
-def main():
-    ap = argparse.ArgumentParser(description='Memory-optimized parallel AC dataset creation')
-    ap.add_argument('--games', type=int, default=10, help='Total number of games to simulate')
-    ap.add_argument('--num_processes', type=int, default=1, help='Number of parallel worker processes')
-    ap.add_argument('--seed', type=int, default=None, help='Base random seed')
-    ap.add_argument('--temperature', type=float, default=0.1)
-    ap.add_argument('--zero_network_reward', action='store_true')
-    ap.add_argument('--n_step', type=int, default=3, help='N for n-step returns')
-    ap.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
-    ap.add_argument('--out', type=str, default=None, help='Output .npz path')
-    ap.add_argument('--use_heuristic', action='store_true')
-    ap.add_argument('--model', type=str, default=None, help='Path to AC network')
-    ap.add_argument('--chunk_size', type=int, default=250, help='Smaller chunks to reduce memory')
-    ap.add_argument('--keep_partials', action='store_true')
-    # expert injection removed
-    ap.add_argument('--stream_combine', action='store_true',
-                    help='Use streaming combination to reduce memory usage')
-    ap.add_argument('--verbose_memory', action='store_true',
-                    help='Print detailed memory usage information')
-    ap.add_argument('--restart_every_chunks', type=int, default=0,
-                    help='Nuclear mode: restart worker processes after this many chunks per worker (0 disables)')
-    args = ap.parse_args()
+def create_dataset_parallel(*,
+                            games: int,
+                            num_processes: int = 1,
+                            seed: int | None = None,
+                            temperature: float = 0.1,
+                            zero_network_reward: bool = False,
+                            n_step: int = 3,
+                            gamma: float = 0.99,
+                            out: str | None = None,
+                            use_heuristic: bool = False,
+                            model: str | None = None,
+                            chunk_size: int = 250,
+                            keep_partials: bool = False,
+                            stream_combine: bool = True,
+                            verbose_memory: bool = False) -> str:
+    """Programmatic API to build a dataset in parallel and save it to disk.
+
+    Returns the output .npz path.
+    """
+    # Ensure a safe start method for Windows and memory isolation
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        # Already set by parent; ignore
+        pass
+    class _Args:
+        pass
+    args = _Args()
+    args.games = games
+    args.num_processes = num_processes
+    args.seed = seed
+    args.temperature = temperature
+    args.zero_network_reward = zero_network_reward
+    args.n_step = n_step
+    args.gamma = gamma
+    args.out = out
+    args.use_heuristic = use_heuristic
+    args.model = model
+    args.chunk_size = chunk_size
+    args.keep_partials = keep_partials
+    args.stream_combine = stream_combine
+    args.verbose_memory = verbose_memory
+    
 
     log_memory("Starting main process", args.verbose_memory)
 
@@ -406,6 +361,7 @@ def main():
     rem = total_games % num_procs
     games_splits = [base + (1 if i < rem else 0) for i in range(num_procs)]
 
+    # We'll dynamically ensure there is always one alive reporter emitting tqdm
     reporter_rank = next((i for i, g in enumerate(games_splits) if g > 0), 0)
 
     # Prepare run id and temp base directory
@@ -413,79 +369,85 @@ def main():
     tmp_base = os.path.join(os.path.abspath(os.getcwd()), 'training_data', 'tmp_parallel', f'run_{run_id}')
     os.makedirs(tmp_base, exist_ok=True)
 
-    # Batch-based launching (nuclear restarts)
+    # New: per-chunk process scheduling so memory is freed after each chunk
     queue: mp.Queue = mp.Queue()
     collected: Dict[int, List[str]] = {}
 
-    # Remaining games per rank
-    remaining_per_rank: List[int] = list(games_splits)
-    batch_idx = 0
+    # Build a list of chunk tasks (rank_id, games_in_chunk, seed, chunk_index)
+    chunk_tasks: List[Tuple[int, int, int | None, int]] = []
+    chunk_index = 0
+    for rank, games_for_rank in enumerate(games_splits):
+        remaining = int(games_for_rank)
+        while remaining > 0:
+            this_chunk = int(min(args.chunk_size, remaining))
+            # Derive seed per chunk if provided
+            seed_for_chunk = None if args.seed is None else int(args.seed) + int(rank) + int(chunk_index)
+            chunk_tasks.append((rank, this_chunk, seed_for_chunk, chunk_index))
+            remaining -= this_chunk
+            chunk_index += 1
 
-    restart_every_chunks = max(0, int(getattr(args, 'restart_every_chunks', 0)))
-    per_proc_batch_games = None
-    if restart_every_chunks > 0:
-        per_proc_batch_games = int(max(1, args.chunk_size)) * restart_every_chunks
+    # Launch up to num_processes concurrent chunk processes
+    # Track processes along with their ranks so we can manage the reporter
+    procs: List[Tuple[mp.Process, int]] = []
+    current_reporter: int | None = None
+    next_task_idx = 0
+    total_tasks = len(chunk_tasks)
 
-    while any(g > 0 for g in remaining_per_rank):
-        procs: List[mp.Process] = []
+    log_memory(f"Scheduling {total_tasks} chunk processes (concurrency={num_procs})", args.verbose_memory)
 
-        # Determine reporter for this batch
-        try:
-            reporter_rank = next(i for i, g in enumerate(remaining_per_rank) if g > 0)
-        except StopIteration:
-            break
-
-        log_memory(f"Launching worker processes for batch {batch_idx}", args.verbose_memory)
-
-        launched = 0
-        for i, remaining_games in enumerate(remaining_per_rank):
-            if remaining_games <= 0:
-                continue
-            if per_proc_batch_games is None:
-                games_this_spawn = remaining_games
-            else:
-                games_this_spawn = min(remaining_games, per_proc_batch_games)
+    while next_task_idx < total_tasks or procs:
+        # Start new processes while we have capacity
+        while next_task_idx < total_tasks and len(procs) < num_procs:
+            rank_id, games_in_chunk, seed_for_chunk, cidx = chunk_tasks[next_task_idx]
+            # Ensure exactly one reporter at a time; if none alive, make this one the reporter
+            reporter = current_reporter if current_reporter is not None else rank_id
 
             p = mp.Process(
-                target=run_worker_optimized,
+                target=run_chunk_process,
                 args=(
-                    i, int(games_this_spawn), args.seed, args.temperature, bool(args.zero_network_reward),
-                    int(args.n_step), float(args.gamma), bool(args.use_heuristic),
-                    args.model, reporter_rank, queue, run_id,
-                    int(max(1, args.chunk_size)), True,  # reuse_players=True
-                    int(batch_idx)
+                    rank_id, int(games_in_chunk), seed_for_chunk, args.temperature, bool(args.zero_network_reward),
+                    int(args.n_step), float(args.gamma), bool(args.use_heuristic), args.model,
+                    reporter, queue, run_id, int(cidx)
                 ),
             )
             p.daemon = False
             p.start()
-            procs.append(p)
-            launched += 1
+            procs.append((p, rank_id))
+            # If we just assigned this as reporter, remember it
+            if current_reporter is None:
+                current_reporter = rank_id
+            next_task_idx += 1
 
-        # Collect for this batch
-        remaining_to_collect = launched
-        while remaining_to_collect > 0:
-            r_rank, r_paths = queue.get()
-            if int(r_rank) not in collected:
-                collected[int(r_rank)] = []
-            collected[int(r_rank)].extend(list(r_paths))
-            remaining_to_collect -= 1
-
-        log_memory("Workers completed, joining processes", args.verbose_memory)
-
-        for p in procs:
-            p.join()
-
-        # Update remaining and advance batch
-        for i, remaining_games in enumerate(remaining_per_rank):
-            if remaining_games <= 0:
-                continue
-            if per_proc_batch_games is None:
-                consumed = remaining_games
+        # Reap finished processes first to avoid waiting unnecessarily
+        alive_procs: List[Tuple[mp.Process, int]] = []
+        reporter_alive = False
+        for p, rnk in procs:
+            if p.is_alive():
+                alive_procs.append((p, rnk))
+                if current_reporter is not None and rnk == current_reporter:
+                    reporter_alive = True
             else:
-                consumed = min(remaining_games, per_proc_batch_games)
-            remaining_per_rank[i] = max(0, remaining_games - consumed)
+                try:
+                    p.join(timeout=0.1)
+                except Exception:
+                    pass
+        procs = alive_procs
+        # If reporter has exited, clear so the next starter becomes reporter
+        if not reporter_alive:
+            current_reporter = None
 
-        batch_idx += 1
+        # Drain any available results without blocking
+        while True:
+            try:
+                r_rank, r_paths = queue.get_nowait()
+            except pyqueue.Empty:
+                break
+            except Exception:
+                break
+            else:
+                if int(r_rank) not in collected:
+                    collected[int(r_rank)] = []
+                collected[int(r_rank)].extend(list(r_paths))
 
     log_memory("All processes joined, starting combination", args.verbose_memory)
 
@@ -499,26 +461,20 @@ def main():
         ts = time.strftime('%Y%m%d_%H%M%S')
         out_path = os.path.join(out_dir, f'ac_parallel_{ts}.npz')
 
-    # Combine results using streaming approach if requested
-    if args.stream_combine:
-        # Collect all file paths in order
-        all_file_paths = []
-        for r in sorted(collected.keys()):
-            all_file_paths.extend(collected[r])
+    # Ensure the queue is properly closed to avoid background thread hangs on Windows
+    try:
+        queue.close()
+        queue.join_thread()
+    except Exception:
+        pass
 
-        _stream_combine_results(all_file_paths, out_path)
-    else:
-        # Original approach but with more aggressive cleanup
-        all_dicts: List[Dict[str, Any]] = []
-        for r in sorted(collected.keys()):
-            for pth in collected[r]:
-                all_dicts.append(_load_npz_as_dict(pth))
-                if len(all_dicts) % 10 == 0:  # Periodic cleanup
-                    _aggressive_cleanup()
+    # Combine results using streaming approach (single supported path)
+    # Collect all file paths in order
+    all_file_paths = []
+    for r in sorted(collected.keys()):
+        all_file_paths.extend(collected[r])
 
-        log_memory("All chunks loaded, combining", args.verbose_memory)
-        combined = _combine_results_optimized(all_dicts)
-        save_dataset(combined, out_path)
+    _stream_combine_results(all_file_paths, out_path)
 
     log_memory("Dataset saved", args.verbose_memory)
 
@@ -543,104 +499,45 @@ def main():
     return out_path
 
 
-def _combine_results_optimized(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Memory-optimized version of _combine_results"""
+def main():
+    ap = argparse.ArgumentParser(description='Memory-optimized parallel AC dataset creation')
+    ap.add_argument('--games', type=int, default=10, help='Total number of games to simulate')
+    ap.add_argument('--num_processes', type=int, default=1, help='Number of parallel worker processes')
+    ap.add_argument('--seed', type=int, default=None, help='Base random seed')
+    ap.add_argument('--temperature', type=float, default=0.1)
+    ap.add_argument('--zero_network_reward', action='store_true')
+    ap.add_argument('--n_step', type=int, default=3, help='N for n-step returns')
+    ap.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    ap.add_argument('--out', type=str, default=None, help='Output .npz path')
+    ap.add_argument('--use_heuristic', action='store_true')
+    ap.add_argument('--model', type=str, default=None, help='Path to AC network')
+    ap.add_argument('--chunk_size', type=int, default=250, help='Smaller chunks to reduce memory')
+    ap.add_argument('--keep_partials', action='store_true')
+    ap.add_argument('--stream_combine', action='store_true',
+                    help='Use streaming combination to reduce memory usage (kept for compatibility, streaming is always used)')
+    ap.add_argument('--verbose_memory', action='store_true',
+                    help='Print detailed memory usage information')
+    args = ap.parse_args()
 
-    # Compute offsets
-    game_counts = [int(len(r.get('game_outcomes_obj', []))) for r in results]
-    offsets = []
-    acc = 0
-    for cnt in game_counts:
-        offsets.append(acc)
-        acc += cnt
-
-    # Process in chunks to avoid memory spikes
-    chunk_size = 50  # Process 50 files at a time
-
-    final_parts = {
-        'hand_idx': [], 'disc_idx': [], 'called_idx': [], 'game_state': [],
-        'called_discards': [],
-        'action_idx': [], 'tile_idx': [],
-        'returns': [], 'advantages': [],
-        'joint_log_probs': [],
-        'game_ids': [], 'step_ids': [], 'actor_ids': [],
-        'game_outcomes_obj': []
-    }
-
-    for chunk_start in range(0, len(results), chunk_size):
-        chunk_end = min(chunk_start + chunk_size, len(results))
-        chunk_results = results[chunk_start:chunk_end]
-
-        # Process this chunk
-        chunk_parts = {key: [] for key in final_parts.keys()}
-
-        for i, r in enumerate(chunk_results):
-            actual_i = chunk_start + i
-
-            chunk_parts['hand_idx'].append(np.asarray(r['hand_idx'], dtype=object))
-            chunk_parts['disc_idx'].append(np.asarray(r['disc_idx'], dtype=object))
-            chunk_parts['called_idx'].append(np.asarray(r['called_idx'], dtype=object))
-            chunk_parts['game_state'].append(np.asarray(r['game_state'], dtype=object))
-            chunk_parts['called_discards'].append(np.asarray(r['called_discards'], dtype=object))
-            chunk_parts['action_idx'].append(np.asarray(r['action_idx'], dtype=np.int64))
-            chunk_parts['tile_idx'].append(np.asarray(r['tile_idx'], dtype=np.int64))
-            chunk_parts['returns'].append(np.asarray(r['returns'], dtype=np.float32))
-            chunk_parts['advantages'].append(np.asarray(r['advantages'], dtype=np.float32))
-            chunk_parts['joint_log_probs'].append(np.asarray(r['joint_log_probs'], dtype=np.float32))
-
-            # Apply offset to game_ids
-            gid = np.asarray(r['game_ids'], dtype=np.int32) + np.int32(offsets[actual_i])
-            chunk_parts['game_ids'].append(gid)
-
-            chunk_parts['step_ids'].append(np.asarray(r['step_ids'], dtype=np.int32))
-            chunk_parts['actor_ids'].append(np.asarray(r['actor_ids'], dtype=np.int32))
-            chunk_parts['game_outcomes_obj'].append(np.asarray(r['game_outcomes_obj'], dtype=object))
-
-        # Combine this chunk and add to final parts
-        for key in final_parts.keys():
-            if key in ['action_idx', 'tile_idx', 'returns', 'advantages', 'joint_log_probs', 'game_ids', 'step_ids', 'actor_ids']:
-                combined_chunk = _efficient_array_concat(
-                    chunk_parts[key],
-                    np.int64 if ('idx' in key or 'ids' in key) else np.float32
-                )
-            else:
-                combined_chunk = np.concat(chunk_parts[key])
-
-            final_parts[key].append(combined_chunk)
-
-        # Clear chunk data
-        del chunk_results, chunk_parts
-        _aggressive_cleanup()
-
-    # Final combination
-    result = {}
-    for key in final_parts.keys():
-        result[key] = np.concat(final_parts[key])
-
-    return result
+    return create_dataset_parallel(
+        games=args.games,
+        num_processes=args.num_processes,
+        seed=args.seed,
+        temperature=args.temperature,
+        zero_network_reward=bool(args.zero_network_reward),
+        n_step=args.n_step,
+        gamma=args.gamma,
+        out=args.out,
+        use_heuristic=bool(args.use_heuristic),
+        model=args.model,
+        chunk_size=int(max(1, args.chunk_size)),
+        keep_partials=bool(args.keep_partials),
+        stream_combine=bool(args.stream_combine),
+        verbose_memory=bool(args.verbose_memory),
+    )
 
 
-def _load_npz_as_dict(path: str) -> Dict[str, Any]:
-    """Load NPZ file and immediately return data dict to avoid keeping file handle open"""
-    data = np.load(path, allow_pickle=True)
-    result = {
-        'hand_idx': data['hand_idx'],
-        'disc_idx': data['disc_idx'],
-        'called_idx': data['called_idx'],
-        'game_state': data['game_state'],
-        'called_discards': data['called_discards'],
-        'action_idx': data['action_idx'],
-        'tile_idx': data['tile_idx'],
-        'returns': data['returns'],
-        'advantages': data['advantages'],
-        'joint_log_probs': data['joint_log_probs'],
-        'game_ids': data['game_ids'],
-        'step_ids': data['step_ids'],
-        'actor_ids': data['actor_ids'],
-        'game_outcomes_obj': data['game_outcomes_obj'],
-    }
-    data.close()  # Explicitly close the file
-    return result
+# Removed legacy worker and combination helpers; streaming combine is the single code path
 
 
 if __name__ == '__main__':

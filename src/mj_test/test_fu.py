@@ -2,8 +2,9 @@
 import unittest
 
 from core.game import MediumJong, Player, CalledSet
-from core.action import Discard, Tsumo
+from core.action import Discard, Tsumo, KanAnkan
 from core.tile import Tile, TileType, Suit, Honor
+from mj_test.test_utils import NoReactionPlayer
 
 
 class TsumoIfPossible(Player):
@@ -96,7 +97,7 @@ class TestFuScoring(unittest.TestCase):
                 if t in gs.player_hand:
                     return Discard(t)
                 return Discard(gs.player_hand[0])
-        g = MediumJong([DiscardFiveMan(), Player(), Player(), Player()])
+        g = MediumJong([DiscardFiveMan(), Player(), NoReactionPlayer(), NoReactionPlayer()])
         # Player 1 waits KANCHAN on 5m for 4-5-6m
         g._player_hands[1] = [
             Tile(Suit.MANZU, TileType.FOUR), Tile(Suit.MANZU, TileType.SIX),  # kanchan
@@ -106,8 +107,7 @@ class TestFuScoring(unittest.TestCase):
             Tile(Suit.SOUZU, TileType.SEVEN), Tile(Suit.SOUZU, TileType.SEVEN),
         ]
         self._reset_env(g)
-        g._player_hands[0][0] = Tile(Suit.MANZU, TileType.FIVE)
-        g.tiles = [Tile(Suit.MANZU, TileType.TWO)]
+        g.tiles = [Tile(Suit.MANZU, TileType.FIVE)]
         g.play_turn()
         s = g._score_hand(1, win_by_tsumo=False)
         self.assertEqual(s['fu'], 40)
@@ -151,7 +151,7 @@ class TestFuScoring(unittest.TestCase):
                 if t in gs.player_hand:
                     return Discard(t)
                 return Discard(gs.player_hand[0])
-        g = MediumJong([DiscardThreeMan(), Player(), Player(), Player()])
+        g = MediumJong([DiscardThreeMan(), NoReactionPlayer(), Player(), Player()])
         # Triplet of 2m closed; rest sequences; ryanmen ron on 3m
         g._player_hands[1] = [
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.TWO),
@@ -169,7 +169,17 @@ class TestFuScoring(unittest.TestCase):
 
     def test_fu_closed_ankan_honor_tsumo_rounds_60(self):
         # Closed ankan of honors (e.g., NORTH): 32 fu, tsumo +2, base 20 -> 54 -> 60
-        g = MediumJong([TsumoIfPossible(), Player(), Player(), Player()])
+        class AnkanThenTsumo(Player):
+            def play(self, gs):  # type: ignore[override]
+                # Force Ankan if available, else Tsumo if available, else discard first
+                for m in gs.legal_moves():
+                    if isinstance(m, KanAnkan):
+                        return m
+                if gs.can_tsumo():
+                    return Tsumo()
+                return Discard(gs.player_hand[0])
+
+        g = MediumJong([AnkanThenTsumo(), Player(), Player(), Player()])
         # Start with four NORTH for immediate ankan; rest sequences to avoid other fu
         g._player_hands[0] = [
             Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.NORTH),
@@ -177,7 +187,7 @@ class TestFuScoring(unittest.TestCase):
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
             Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR),
             Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE),
-            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.EIGHT),
+            Tile(Suit.PINZU, TileType.SEVEN), Tile(Suit.PINZU, TileType.SEVEN),
         ]
         # Arrange dead wall so rinshan draw completes a sequence without adding fu besides +2 tsumo
         self._reset_env(g)
@@ -197,7 +207,7 @@ class TestFuScoring(unittest.TestCase):
                 if t in gs.player_hand:
                     return Discard(t)
                 return Discard(gs.player_hand[0])
-        g = MediumJong([DiscardThreeSou(), Player(), Player(), Player()])
+        g = MediumJong([DiscardThreeSou(), NoReactionPlayer(), Player(), Player()])
         g._player_hands[1] = [
             Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
             Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),

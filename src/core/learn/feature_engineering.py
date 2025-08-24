@@ -147,11 +147,11 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
         called_discards_rows.append(mask)
     called_discards = np.stack(called_discards_rows, axis=0)
 
-    # Game state vector (compact, fixed-length):
+    # Game state vector (compact, fixed-length base + legal action mask):
     # [remaining_tiles, last_discard_idx, last_discard_player,
     #  is_action_state(0/1), can_call(0/1), last_drawn_idx,
     #  round_wind(1..4), seat_winds[0..3] (1..4), riichi_flags[0..3] (0/1),
-    #  can_ron(0/1), can_tsumo(0/1)]
+    #  legal_action_mask[0..ACTION_HEAD_SIZE-1] (0/1)]
     def tile_idx_or_zero(t):
         return 0 if t is None else tile_to_index(t)
 
@@ -160,8 +160,13 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
     riichi_flags = [1 if gp.riichi_declared.get(i, False) else 0 for i in range(4)]
 
     # direct featurization risks overfitting on player indices, but we're going to keep it for now to avoid risk of bugs
-    can_ron_flag = 1 if gp.can_ron() else 0
-    can_tsumo_flag = 1 if gp.can_tsumo() else 0
+    # Extend with legal action mask from perspective to avoid separate can_ron/can_tsumo flags
+    lam = gp.legal_action_mask()
+    try:
+        lam_list = [int(x) for x in lam.tolist()]
+    except Exception:
+        # Fallback in unlikely cases
+        lam_list = [int(v) for v in np.asarray(lam).astype(np.int32).tolist()]
     game_state_list: List[int] = [
         int(gp.remaining_tiles),
         int(tile_idx_or_zero(gp._reactable_tile)),
@@ -172,8 +177,7 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
         round_wind_val,
         *seat_winds_vals,
         *riichi_flags,
-        can_ron_flag,
-        can_tsumo_flag,
+        *lam_list,
     ]
     game_state = np.asarray(game_state_list, dtype=np.int32)
     # Note: store current_player_idx is not directly available from perspective; infer via is_current_turn + players' turns is outside scope.

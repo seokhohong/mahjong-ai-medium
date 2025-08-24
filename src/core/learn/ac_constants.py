@@ -4,9 +4,9 @@ from __future__ import annotations
 # Action head enumerates core actions, including fully enumerated Chi (6) and Pon (2) variants.
 # Tile head enumerates tiles plus a no-op index.
 
-# Action head order (size = 16)
-# - Singletons (not parameterized by tile head): tsumo, ron, pass, kan_daimin
-# - Tile-parameterized (use tile head): discard, riichi, kan_kakan, kan_ankan
+# Action head order (size = 14)
+# - Singletons (not parameterized by tile head): tsumo, ron, pass
+# - Tile-parameterized (use tile head): discard, riichi, kan
 # - Chi variants (6): low/mid/high x no-aka/aka
 # - Pon variants (2): no-aka, aka
 ACTION_HEAD_ORDER: list[str] = [
@@ -15,9 +15,7 @@ ACTION_HEAD_ORDER: list[str] = [
     'tsumo',
     'ron',
     'pass',
-    'kan_daimin',
-    'kan_kakan',     # uses tile head
-    'kan_ankan',     # uses tile head
+    'kan',           # uses tile head (kakan/ankan pass tile; daiminkan uses no-op)
     'chi_low_noaka',
     'chi_mid_noaka',
     'chi_high_noaka',

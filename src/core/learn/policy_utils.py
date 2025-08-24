@@ -66,13 +66,16 @@ def encode_two_head_action(action: Any) -> tuple[int, int]:
         return ACTION_HEAD_INDEX['ron'], TILE_HEAD_NOOP
     if isinstance(action, PassCall):
         return ACTION_HEAD_INDEX['pass'], TILE_HEAD_NOOP
+    # Unified Kan head
     if isinstance(action, KanDaimin):
-        return ACTION_HEAD_INDEX['kan_daimin'], TILE_HEAD_NOOP
-    # Tile-parameterized Kans
+        # Reaction: encoded as kan with no-op tile parameter
+        return ACTION_HEAD_INDEX['kan'], TILE_HEAD_NOOP
     if isinstance(action, KanKakan):
-        return ACTION_HEAD_INDEX['kan_kakan'], to_tile_head_idx(action.tile)
+        # Upgrade existing pon -> requires tile parameter
+        return ACTION_HEAD_INDEX['kan'], to_tile_head_idx(action.tile)
     if isinstance(action, KanAnkan):
-        return ACTION_HEAD_INDEX['kan_ankan'], to_tile_head_idx(action.tile)
+        # Concealed kan -> requires tile parameter
+        return ACTION_HEAD_INDEX['kan'], to_tile_head_idx(action.tile)
     # Chi (fully enumerated in action head)
     if isinstance(action, Chi):
         has_aka = False
@@ -128,15 +131,29 @@ def build_move_from_two_head(gs, action_idx: int, tile_idx: int):
         return Ron()
     if name == 'pass':
         return PassCall()
-    if name == 'kan_daimin':
-        # Select first available daiminkan from flat reactions (only one should be available)
-        for r in gs.get_call_options():
-            if isinstance(r, KanDaimin):
-                return r if gs.is_legal(r) else None
-        return None
+    # Unified Kan head decoding
+    if name == 'kan':
+        # If no tile parameter -> daiminkan (reaction to discard)
+        if tile_idx == TILE_HEAD_NOOP:
+            for r in gs.get_call_options():
+                if isinstance(r, KanDaimin):
+                    return r if gs.is_legal(r) else None
+            return None
+        # With tile parameter -> try kakan then ankan
+        flat_idx = from_tile_head_idx(tile_idx)
+        if flat_idx < 0:
+            return None
+        t = find_hand_tile_by_flat(flat_idx)
+        if t is None:
+            return None
+        cand = KanKakan(t)
+        if gs.is_legal(cand):
+            return cand
+        cand2 = KanAnkan(t)
+        return cand2 if gs.is_legal(cand2) else None
 
     # Tile-parameterized via tile head
-    if name in ('discard', 'riichi', 'kan_kakan', 'kan_ankan'):
+    if name in ('discard', 'riichi'):
         flat_idx = from_tile_head_idx(tile_idx)
         if flat_idx < 0:
             return None
@@ -145,12 +162,8 @@ def build_move_from_two_head(gs, action_idx: int, tile_idx: int):
             return None
         if name == 'discard':
             m = Discard(t)
-        elif name == 'riichi':
-            m = Riichi(t)
-        elif name == 'kan_kakan':
-            m = KanKakan(t)
         else:
-            m = KanAnkan(t)
+            m = Riichi(t)
         return m if gs.is_legal(m) else None
 
     # Chi variants

@@ -59,6 +59,10 @@ class LoggingPlayer(Player):
     def __init__(self, inner: Player):
         super().__init__()
         self.inner = inner
+        self._abs_player_id: Any = '?'
+
+    def set_abs_player_id(self, pid: int) -> None:
+        self._abs_player_id = pid
 
     def play(self, gs):  # type: ignore[override]
         move = self.inner.play(gs)
@@ -66,7 +70,7 @@ class LoggingPlayer(Player):
         # GamePerspective is rotated so that index 0 is always the current (self) player
         actor = 0  # local index in perspective
         # Prefer engine-provided player_id on the perspective when available
-        abs_pid = getattr(gs, 'player_id', '?')
+        abs_pid = self._abs_player_id
         hand_s = '[' + ', '.join(_fmt_tile(t) for t in sorted(gs.player_hand, key=lambda t: (t.suit.value, int(t.tile_type.value)))) + ']'
         called_s = {pid: _fmt_called_sets(gs.called_sets.get(pid, [])) for pid in range(4)}
         disc_s = {pid: '[' + ', '.join(_fmt_tile(t) for t in gs.player_discards.get(pid, [])) + ']' for pid in range(4)}
@@ -83,7 +87,7 @@ class LoggingPlayer(Player):
         move = self.inner.choose_reaction(gs, options)
         # Pretty print reaction decision
         actor = 0
-        abs_pid = '?'
+        abs_pid = self._abs_player_id
         last_discard = _fmt_tile(gs._reactable_tile) if gs._reactable_tile is not None else 'None'
         # Format options succinctly
         def _fmt_opts():
@@ -137,6 +141,13 @@ def main() -> int:
 
     players = build_players(args.model, float(args.temperature))
     game = MediumJong(players)
+    # Initialize absolute player ids on loggers now that the game exists
+    for p in game.players:
+        if isinstance(p, LoggingPlayer):
+            try:
+                p.set_abs_player_id(game.get_player_id(p))
+            except Exception:
+                pass
 
     # Print winds at start
     print("=" * 80)

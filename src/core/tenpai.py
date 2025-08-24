@@ -237,7 +237,6 @@ def _can_form_standard_hand(tiles) -> bool:
 
 def hand_is_tenpai_for_tiles(tiles) -> bool:
     """Optimized tenpai checking for exactly 13 tiles"""
-    from .game import Suit, TileType, Tile, Honor
     
     if len(tiles) != 13:
         return False
@@ -283,27 +282,28 @@ def hand_is_tenpai_for_tiles(tiles) -> bool:
         if base_counts[i] == 2:
             candidates_set.add(i)
         
-        # For numbered tiles, check sequences
+        # For numbered tiles, check sequences strictly within suit boundaries
         if i < 27:
-            tile_num = i % 9
-            # Patterns using local neighbors
-            # If we have consecutive tiles, endpoints can wait
-            if tile_num >= 1 and base_counts[i-1] > 0:
-                # Having i-1 and i -> candidate i-2 (if valid) and i+1
-                if tile_num >= 2:
+            suit_start = i - (i % 9)
+            suit_end = suit_start + 9
+            tile_pos = i - suit_start  # 0..8 within suit
+            # If consecutive tiles exist, endpoints can wait
+            if tile_pos >= 1 and base_counts[i-1] > 0:
+                # Having i-1 and i -> candidate i-2 (if valid) and i+1 (if valid)
+                if tile_pos >= 2:
                     candidates_set.add(i-2)
-                if tile_num <= 7:
+                if i + 1 < suit_end:
                     candidates_set.add(i+1)
-            if tile_num <= 7 and base_counts[i+1] > 0:
-                # Having i and i+1 -> candidate i-1 and i+2
-                if tile_num >= 1:
+            if tile_pos <= 7 and i + 1 < suit_end and base_counts[i+1] > 0:
+                # Having i and i+1 -> candidate i-1 (if valid) and i+2 (if valid)
+                if tile_pos >= 1:
                     candidates_set.add(i-1)
-                if tile_num <= 6:
+                if i + 2 < suit_end:
                     candidates_set.add(i+2)
-            # If we have a gap of 2 (like 2 and 4), the middle tile completes a sequence
-            if tile_num <= 6 and base_counts[i+2] > 0:
+            # If gap of 2 (like 2 and 4), the middle completes a sequence
+            if tile_pos <= 6 and i + 2 < suit_end and base_counts[i+2] > 0:
                 candidates_set.add(i+1)
-            if tile_num >= 2 and base_counts[i-2] > 0:
+            if tile_pos >= 2 and base_counts[i-2] > 0:
                 candidates_set.add(i-1)
     
     # Test each candidate
@@ -337,7 +337,7 @@ def hand_is_tenpai(hand, called_sets: List[CalledSet] = None) -> bool:
 
     For open hands, chiitoi is invalid; we only check standard hand with calls.
     """
-    from .game import Suit, TileType, Tile, Honor
+    # Types imported at module scope; no local imports needed
     
     if called_sets:
         # Effective total should be 14 after adding one tile (3 per called meld)
@@ -378,7 +378,7 @@ def hand_is_tenpai_with_calls(concealed_tiles: List[Tile], called_sets: List[Cal
 
 def waits_for_tiles(tiles):
     """Find all tiles that complete the hand (optimized)"""
-    from .game import Suit, TileType, Tile, Honor
+    # Types imported at module scope; no local imports needed
     
     waits: List[Tile] = []
     if len(tiles) != 13:

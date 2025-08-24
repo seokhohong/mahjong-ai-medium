@@ -123,6 +123,21 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
         advantages, returns,
     )
 
+def safe_entropy_calculation(probs, min_prob=1e-8):
+    """
+    Compute entropy safely, avoiding NaN from 0 * log(0) cases.
+
+    Standard entropy: H = -sum(p * log(p))
+    Safe entropy: H = -sum(p * log(max(p, epsilon)))
+    """
+    # Clamp probabilities to avoid log(0)
+    probs_safe = probs.clamp_min(min_prob)
+
+    # Compute entropy: -sum(p * log(p))
+    # Use the original probs for weighting, but safe probs for log
+    entropy = -(probs * probs_safe.log()).sum(dim=1).mean()
+
+    return entropy
 
 def _compute_losses(
         model: torch.nn.Module,
@@ -196,37 +211,20 @@ def _compute_losses(
         policy_loss_a = F.nll_loss(log_a, action_idx.to(dtype=torch.long, device=a_pp.device))
         policy_loss_t = F.nll_loss(log_t, tile_idx.to(dtype=torch.long, device=t_pp.device))
         policy_loss = policy_loss_a + policy_loss_t
-        value_loss = F.mse_loss(val.view_as(returns), returns)
 
         # Add entropy even in BC mode to maintain exploration
-        entropy_loss_a = -(a_pp * log_a).sum(dim=1).mean()
-        entropy_loss_t = -(t_pp * log_t).sum(dim=1).mean()
-        entropy_loss = entropy_loss_a + entropy_loss_t
+        entropy_a = safe_entropy_calculation(a_pp)
+        entropy_t = safe_entropy_calculation(t_pp)
+        entropy = entropy_a + entropy_t
 
-        total = policy_loss + value_coeff * value_loss - entropy_coeff * entropy_loss
-        return total, policy_loss, value_loss, batch_size_curr, dbg
+        total = policy_loss - entropy_coeff * entropy
+        return total, policy_loss, torch.zeros_like(policy_loss), batch_size_curr, dbg
 
     clipped_ratio = torch.clamp(ratio_joint, 1 - epsilon, 1 + epsilon)
     policy_loss = -torch.min(
         ratio_joint * advantages,
         clipped_ratio * advantages
     ).mean()
-
-    def safe_entropy_calculation(probs, min_prob=1e-8):
-        """
-        Compute entropy safely, avoiding NaN from 0 * log(0) cases.
-
-        Standard entropy: H = -sum(p * log(p))
-        Safe entropy: H = -sum(p * log(max(p, epsilon)))
-        """
-        # Clamp probabilities to avoid log(0)
-        probs_safe = probs.clamp_min(min_prob)
-
-        # Compute entropy: -sum(p * log(p))
-        # Use the original probs for weighting, but safe probs for log
-        entropy = -(probs * probs_safe.log()).sum(dim=1).mean()
-
-        return entropy
 
     value_loss = F.mse_loss(val, returns)
     entropy_a = safe_entropy_calculation(a_pp)
@@ -520,7 +518,7 @@ def train_ppo(
             a_var = max(0.0, (dbg_adv_sumsq / dbg_count) - a_mean * a_mean)
             a_std = math.sqrt(a_var)
             clip_rate = dbg_clipped / max(1, dbg_count)
-            print(f"Epoch {epoch + 1}/{epochs} [train dbg] - ratio_mean={r_mean:.4f} | ratio_std={r_std:.4f} | clipped={clip_rate:.3f} | adv_mean={a_mean:.6f} | adv_std={a_std:.6f}")
+            print(f"Epoch {epoch + 1}/{epochs} [train dbg] - ratio_mean={r_mean:.4f} | ratio_std={r_std:.4f} | clipped={clip_rate:.3f}")
 
         # Evaluate on holdout set
         if dl_val is not None:
@@ -581,7 +579,6 @@ def train_ppo(
             v_avg = val_total / vden
             v_avg_pol = val_pol / vden
             v_avg_val = val_val / vden
-            v_avg_pol_main = val_pol_main / vden
             # Finalize current epoch's concatenated validation probs for next epoch
             curr_val_action_probs = torch.cat(curr_action_probs_chunks, dim=0) if curr_action_probs_chunks else None
             curr_val_tile_probs = torch.cat(curr_tile_probs_chunks, dim=0) if curr_tile_probs_chunks else None

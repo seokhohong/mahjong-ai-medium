@@ -531,8 +531,8 @@ class TestScoring(unittest.TestCase):
         pts = g.get_points()
         self.assertIsNotNone(pts)
         self.assertEqual(len(pts), 4)
-        self.assertTrue(g.get_game_outcome().outcome_type(0), OutcomeType.DEAL_IN)
-        self.assertTrue(g.get_game_outcome().outcome_type(1), OutcomeType.RON)
+        self.assertEqual(g.get_game_outcome().outcome_type(0), OutcomeType.DEAL_IN)
+        self.assertEqual(g.get_game_outcome().outcome_type(1), OutcomeType.RON)
 
     def test_dealer_ron_points_conservation(self):
         # Dealer (P0) wins by ron from non-dealer P1's discard; total points should conserve to 0
@@ -1050,10 +1050,7 @@ class TestGameOutcome(unittest.TestCase):
             b = round_trip.players[pid]
             self.assertEqual(a.player_id, b.player_id)
             self.assertEqual((None if a.outcome_type is None else a.outcome_type.value), (None if b.outcome_type is None else b.outcome_type.value))
-            self.assertEqual(a.won, b.won)
-            self.assertEqual(a.lost, b.lost)
-            self.assertEqual(a.tenpai, b.tenpai)
-            self.assertEqual(a.noten, b.noten)
+            # boolean fields removed; outcome_type is the single source of truth
             self.assertEqual(a.points_delta, b.points_delta)
 
     def test_serialize_deserialize_win(self):
@@ -1091,10 +1088,6 @@ class TestGameOutcome(unittest.TestCase):
             b = round_trip.players[pid]
             self.assertEqual(a.player_id, b.player_id)
             self.assertEqual((None if a.outcome_type is None else a.outcome_type.value), (None if b.outcome_type is None else b.outcome_type.value))
-            self.assertEqual(a.won, b.won)
-            self.assertEqual(a.lost, b.lost)
-            self.assertEqual(a.tenpai, b.tenpai)
-            self.assertEqual(a.noten, b.noten)
             self.assertEqual(a.points_delta, b.points_delta)
 
 if __name__ == '__main__':

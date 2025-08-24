@@ -108,7 +108,8 @@ def build_ac_dataset(
             assert net is not None
             players = [RecordingACPlayer(net, temperature=temperature, zero_network_reward=bool(zero_network_reward)) for i in range(4)]
 
-    for gi in tqdm(range(max(1, int(games)))):
+    # Use robust tqdm settings so progress continues to render in long runs
+    for gi in tqdm(range(max(1, int(games))), dynamic_ncols=True, mininterval=0.1, miniters=1, leave=True):
         game = MediumJong(players, tile_copies=constants.TILE_COPIES_DEFAULT)
         game.play_round()
 

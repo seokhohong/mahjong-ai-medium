@@ -42,7 +42,7 @@ from .constants import (
     NON_DEALER_TSUMO_DEALER_MULTIPLIER,
     NON_DEALER_TSUMO_OTHERS_MULTIPLIER,
     DEALER_RON_MULTIPLIER,
-    NON_DEALER_RON_MULTIPLIER,
+    NON_DEALER_RON_MULTIPLIER, NUM_PLAYERS,
 )
 from .learn.policy_utils import _flat_tile_index, encode_two_head_action
 
@@ -99,20 +99,12 @@ class OutcomeType(Enum):
 class PlayerOutcome:
     player_id: int
     outcome_type: Optional[OutcomeType]
-    won: bool
-    lost: bool
-    tenpai: bool
-    noten: bool
     points_delta: int
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             'player_id': int(self.player_id),
             'outcome_type': None if self.outcome_type is None else str(self.outcome_type.value),
-            'won': bool(self.won),
-            'lost': bool(self.lost),
-            'tenpai': bool(self.tenpai),
-            'noten': bool(self.noten),
             'points_delta': int(self.points_delta),
         }
 
@@ -135,11 +127,7 @@ class PlayerOutcome:
         return PlayerOutcome(
             player_id=int(data['player_id']),
             outcome_type=ot,
-            won=bool(data['won']),
-            lost=bool(data['lost']),
-            tenpai=bool(data['tenpai']),
-            noten=bool(data['noten']),
-            points_delta=int(data['points_delta']),
+            points_delta=int(data.get('points_delta', 0)),
         )
 
 
@@ -173,10 +161,6 @@ class GameOutcome:
                 players[pid] = PlayerOutcome(
                     player_id=pid,
                     outcome_type=None,
-                    won=False,
-                    lost=False,
-                    tenpai=False,
-                    noten=False,
                     points_delta=0,
                 )
         return GameOutcome(
@@ -202,7 +186,7 @@ class GameOutcome:
                 continue
             otype = '-' if po.outcome_type is None else po.outcome_type.value
             lines.append(
-                f"  P{pid}: type={otype}, won={po.won}, lost={po.lost}, tenpai={po.tenpai}, noten={po.noten}, points={po.points_delta}"
+                f"  P{pid}: type={otype}, points={po.points_delta}"
             )
         return "\n".join(lines)
 
@@ -854,7 +838,7 @@ class GamePerspective:
         if name is None:
             return m
         # Non-parameterized -> no-op only
-        if name in ('tsumo', 'ron', 'pass', 'kan_daimin') or name.startswith('chi_') or name.startswith('pon_'):
+        if name in ('tsumo', 'ron', 'pass') or name.startswith('chi_') or name.startswith('pon_'):
             m[TILE_HEAD_NOOP] = 1.0
             return m
         # Parameterized actions: collect tile indices from concrete legal moves that match action_idx
@@ -1803,51 +1787,26 @@ class MediumJong:
         if is_draw:
             # Determine tenpai from current hands to be robust even when 0 or 4 tenpai
             tenpai_flags: Dict[int, bool] = {}
-            for pid in range(4):
+            for pid in range(NUM_PLAYERS):
                 tenpai_flags[pid] = hand_is_tenpai(self._player_hands[pid])
-            for pid in range(4):
-                is_tenpai = bool(tenpai_flags.get(pid, False))
-                players[pid] = PlayerOutcome(
-                    player_id=pid,
-                    outcome_type=OutcomeType.TENPAI if is_tenpai else OutcomeType.NOTEN,
-                    won=False,
-                    lost=False,
-                    tenpai=is_tenpai,
-                    noten=not is_tenpai,
-                    points_delta=int(hand_points[pid]),
-                )
-            return GameOutcome(players=players, winners=list(self.winners), loser=self.loser, is_draw=True)
-
-        # Win occurred (tsumo or ron); support multi-ron
-        ron = False
-        tsumo = False
-        if self.winners:
-            # If loser is None, it's tsumo; otherwise ron
-            ron = self.loser is not None
-            tsumo = not ron
-        for pid in range(4):
-            won = pid in self.winners
-            lost = False
+        for pid in range(NUM_PLAYERS):
             otype: Optional[OutcomeType] = None
-            if won:
-                otype = OutcomeType.RON if ron else OutcomeType.TSUMO
+            if is_draw:
+                otype = OutcomeType.TENPAI if tenpai_flags.get(pid, False) else OutcomeType.NOTEN
             else:
-                if ron and self.loser == pid:
-                    lost = True
-                    otype = OutcomeType.DEAL_IN  # discarder lost on ron
-                elif tsumo:
-                    # All non-winners paid on tsumo
-                    lost = True
+                if pid in self.winners:
+                    otype = OutcomeType.RON if getattr(self, 'winner_win_type', 'ron') == 'ron' else OutcomeType.TSUMO
+                elif self.loser is not None and pid == self.loser:
+                    otype = OutcomeType.DEAL_IN
+                else:
+                    # Non-winner on tsumo: leave outcome_type None; points_delta encodes payment
+                    pass
             players[pid] = PlayerOutcome(
                 player_id=pid,
                 outcome_type=otype,
-                won=won,
-                lost=lost,
-                tenpai=False,
-                noten=False if otype is None else (otype == OutcomeType.NOTEN),
                 points_delta=int(hand_points[pid]),
             )
-        return GameOutcome(players=players, winners=list(self.winners), loser=self.loser, is_draw=False)
+        return GameOutcome(players=players, winners=list(self.winners), loser=self.loser, is_draw=is_draw)
 
     def get_game_outcome(self) -> 'GameOutcome':
         if not self.game_over:

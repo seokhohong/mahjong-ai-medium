@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -20,6 +21,10 @@ from tqdm import tqdm  # type: ignore
 from core.learn.ac_player import ACPlayer
 from core.learn.ac_network import ACNetwork
 from sklearn.preprocessing import StandardScaler  # type: ignore
+from run.os_runtime import (
+    _apply_runtime_config,
+    _resolve_loader_defaults,
+)
 
 # not using called discards yet
 class ACDataset(Dataset):
@@ -255,8 +260,34 @@ def train_ppo(
     embedding_dim: int = 16,
     kl_threshold: float | None = 0.008,
     patience: int = 0,
+    # Runtime/loader tuning
+    os_hint: str | None = None,
+    start_method: str | None = None,
+    torch_threads: int | None = None,
+    interop_threads: int | None = None,
+    dl_workers: int | None = None,
+    pin_memory: bool | None = None,
+    prefetch_factor: int | None = None,
+    persistent_workers: bool | None = None,
 ) -> str:
-    dev = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+    # Choose device: prefer CUDA, then macOS MPS, else CPU
+    if device is None:
+        if torch.cuda.is_available():
+            dev = torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            dev = torch.device('mps')
+        else:
+            dev = torch.device('cpu')
+    else:
+        dev = torch.device(device)
+
+    # Configure multiprocessing and thread settings for platform
+    _apply_runtime_config(
+        os_hint=os_hint,
+        start_method=start_method,
+        torch_threads=torch_threads,
+        interop_threads=interop_threads,
+    )
 
 
     if init_model:
@@ -290,8 +321,37 @@ def train_ppo(
     else:
         ds_train = ds
         ds_val = None
-    dl = DataLoader(ds_train, batch_size=batch_size, shuffle=True, drop_last=False)
-    dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, drop_last=False) if ds_val is not None else None
+    # Determine DataLoader worker defaults based on platform if not provided
+    resolved = _resolve_loader_defaults(
+        os_hint=os_hint,
+        dl_workers=dl_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+    )
+    dl = DataLoader(
+        ds_train,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=resolved['dl_workers'],
+        pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
+        prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
+        persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
+    )
+    dl_val = (
+        DataLoader(
+            ds_val,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=resolved['dl_workers'],
+            pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
+            prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
+            persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
+        )
+        if ds_val is not None else None
+    )
     model.train()
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -649,6 +709,15 @@ def main():
     ap.add_argument('--warm_up_max_epochs', type=int, default=50, help='Maximum warm-up epochs before switching even if threshold not reached')
     ap.add_argument('--hidden_size', type=int, default=128, help='Hidden size for ACNetwork')
     ap.add_argument('--embedding_dim', type=int, default=16, help='Embedding dimension for ACNetwork')
+    # Cross-platform/runtime tuning
+    ap.add_argument('--os', dest='os_hint', type=str, default='auto', choices=['auto', 'windows', 'mac', 'linux'], help='Target OS to tune runtime defaults (auto-detect by default)')
+    ap.add_argument('--start_method', type=str, default=None, choices=['spawn', 'fork', 'forkserver'], help='Multiprocessing start method override')
+    ap.add_argument('--torch_threads', type=int, default=None, help='Torch intra-op threads')
+    ap.add_argument('--interop_threads', type=int, default=None, help='Torch inter-op threads')
+    ap.add_argument('--dl_workers', type=int, default=None, help='DataLoader workers')
+    ap.add_argument('--pin_memory', type=str, default=None, choices=['true', 'false'], help='Enable pin_memory for DataLoader (true/false)')
+    ap.add_argument('--prefetch_factor', type=int, default=None, help='Prefetch factor per worker for DataLoader (>0)')
+    ap.add_argument('--persistent_workers', type=str, default=None, choices=['true', 'false'], help='Keep DataLoader workers alive between epochs')
     args = ap.parse_args()
 
     train_ppo(
@@ -667,6 +736,14 @@ def main():
         embedding_dim=args.embedding_dim,
         kl_threshold=args.kl_threshold,
         patience=args.patience,
+        os_hint=None if args.os_hint == 'auto' else args.os_hint,
+        start_method=args.start_method,
+        torch_threads=args.torch_threads,
+        interop_threads=args.interop_threads,
+        dl_workers=args.dl_workers,
+        pin_memory=(None if args.pin_memory is None else (args.pin_memory.lower() == 'true')),
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=(None if args.persistent_workers is None else (args.persistent_workers.lower() == 'true')),
     )
 
 

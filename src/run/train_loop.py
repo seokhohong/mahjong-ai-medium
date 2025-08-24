@@ -40,6 +40,16 @@ def run_train_loop(
     warm_up_max_epochs: int,
     hidden_size: int,
     embedding_dim: int,
+    # runtime/train tuning
+    device: Optional[str] = None,
+    os_hint: Optional[str] = None,
+    start_method: Optional[str] = None,
+    torch_threads: Optional[int] = None,
+    interop_threads: Optional[int] = None,
+    dl_workers: Optional[int] = None,
+    pin_memory: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    persistent_workers: Optional[bool] = None,
 ) -> str:
     os.makedirs(os.path.join(os.getcwd(), 'training_data'), exist_ok=True)
     os.makedirs(os.path.join(os.getcwd(), 'models'), exist_ok=True)
@@ -70,8 +80,7 @@ def run_train_loop(
                 chunk_size=250,
                 keep_partials=False,
                 stream_combine=True,
-                verbose_memory=False,
-                restart_every_chunks=0,
+                verbose_memory=False
             )
         else:
             built = build_ac_dataset(
@@ -96,14 +105,23 @@ def run_train_loop(
             epsilon=epsilon,
             value_coeff=value_coeff,
             entropy_coeff=entropy_coeff,
-            device=None,
+            device=device,
             patience=patience,
             val_split=val_split,
             init_model=current_model_dir,
             warm_up_max_epochs=warm_up_max_epochs,
             hidden_size=hidden_size,
             embedding_dim=embedding_dim,
-            kl_threshold=0.0
+            kl_threshold=0.0,
+            # runtime/train tuning
+            os_hint=os_hint,
+            start_method=start_method,
+            torch_threads=torch_threads,
+            interop_threads=interop_threads,
+            dl_workers=dl_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
         # train_ppo returns a model file path; use its directory for next gen
         new_model_dir = os.path.dirname(model_pt_path)
@@ -142,6 +160,16 @@ def main() -> str:
     ap.add_argument('--warm_up_max_epochs', type=int, default=50)
     ap.add_argument('--hidden_size', type=int, default=128)
     ap.add_argument('--embedding_dim', type=int, default=16)
+    # Runtime/train tuning
+    ap.add_argument('--device', type=str, default=None, help='Force device (cpu/cuda/mps)')
+    ap.add_argument('--os', dest='os_hint', type=str, default='auto', choices=['auto', 'windows', 'mac', 'linux'], help='Target OS to tune runtime defaults (auto)')
+    ap.add_argument('--start_method', type=str, default=None, choices=['spawn', 'fork', 'forkserver'])
+    ap.add_argument('--torch_threads', type=int, default=None)
+    ap.add_argument('--interop_threads', type=int, default=None)
+    ap.add_argument('--dl_workers', type=int, default=None)
+    ap.add_argument('--pin_memory', type=str, default=None, choices=['true', 'false'])
+    ap.add_argument('--prefetch_factor', type=int, default=None)
+    ap.add_argument('--persistent_workers', type=str, default=None, choices=['true', 'false'])
 
     args = ap.parse_args()
 
@@ -168,6 +196,15 @@ def main() -> str:
         warm_up_max_epochs=args.warm_up_max_epochs,
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
+        device=args.device,
+        os_hint=None if args.os_hint == 'auto' else args.os_hint,
+        start_method=args.start_method,
+        torch_threads=args.torch_threads,
+        interop_threads=args.interop_threads,
+        dl_workers=args.dl_workers,
+        pin_memory=(None if args.pin_memory is None else (args.pin_memory.lower() == 'true')),
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=(None if args.persistent_workers is None else (args.persistent_workers.lower() == 'true')),
     )
 
 

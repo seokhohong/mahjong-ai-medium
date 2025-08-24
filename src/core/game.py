@@ -33,11 +33,25 @@ from .constants import (
     MENZEN_TSUMO_HAN,
     IPPATSU_HAN,
     MANGAN_HAN_THRESHOLD,
+    HANEMAN_MIN_HAN,
+    HANEMAN_MAX_HAN,
+    BAIMAN_MIN_HAN,
+    BAIMAN_MAX_HAN,
     MANGAN_DEALER_TSUMO_PAYMENT_EACH,
     MANGAN_NON_DEALER_TSUMO_DEALER_PAYMENT,
     MANGAN_NON_DEALER_TSUMO_OTHERS_PAYMENT,
     MANGAN_DEALER_RON_POINTS,
     MANGAN_NON_DEALER_RON_POINTS,
+    HANEMAN_DEALER_TSUMO_PAYMENT_EACH,
+    HANEMAN_NON_DEALER_TSUMO_DEALER_PAYMENT,
+    HANEMAN_NON_DEALER_TSUMO_OTHERS_PAYMENT,
+    HANEMAN_DEALER_RON_POINTS,
+    HANEMAN_NON_DEALER_RON_POINTS,
+    BAIMAN_DEALER_TSUMO_PAYMENT_EACH,
+    BAIMAN_NON_DEALER_TSUMO_DEALER_PAYMENT,
+    BAIMAN_NON_DEALER_TSUMO_OTHERS_PAYMENT,
+    BAIMAN_DEALER_RON_POINTS,
+    BAIMAN_NON_DEALER_RON_POINTS,
     DEALER_TSUMO_TOTAL_MULTIPLIER,
     NON_DEALER_TSUMO_DEALER_MULTIPLIER,
     NON_DEALER_TSUMO_OTHERS_MULTIPLIER,
@@ -532,13 +546,18 @@ def _is_pinfu(all_tiles: List[Tile], called_sets: List[CalledSet], seat_wind: Ho
 def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
                       winner_id: int, dealer_id: int, win_by_tsumo: bool,
                       riichi_declared: bool, seat_wind: Honor, round_wind: Honor,
-                      dora_indicators: List[Tile], ura_indicators: List[Tile]) -> Tuple[int, int, int]:
+                      dora_indicators: List[Tile], ura_indicators: List[Tile],
+                      winning_tile: Optional[Tile]) -> Tuple[int, int, int]:
     # Returns (fu, han, han_from_dora)
-    all_tiles = concealed_tiles + [t for cs in called_sets for t in cs.tiles]
+    # Build completed 14 tiles for evaluation, including winning tile on ron
+    concealed_for_eval: List[Tile] = list(concealed_tiles)
+    if (not win_by_tsumo) and (winning_tile is not None):
+        concealed_for_eval = concealed_for_eval + [winning_tile]
+    all_tiles = concealed_for_eval + [t for cs in called_sets for t in cs.tiles]
 
     # Yaku detection (subset, enough for tests)
     han = 0
-    chiitoi = _is_chiitoi(concealed_tiles, called_sets)
+    chiitoi = _is_chiitoi(concealed_for_eval, called_sets)
     if chiitoi:
         han += 2
         fu = FU_CHIITOI
@@ -586,9 +605,10 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
                     fu += 4
 
         # 3) Pair fu (yakuhai pair)
-        # Detect any pair in concealed tiles that is dragon or seat/round wind
+        # Detect any pair in completed concealed tiles (including ron tile) that is dragon or seat/round wind
         pair_fu_added = False
-        for (suit, val), c in cnt.items():
+        cnt_completed = _count_tiles(concealed_for_eval)
+        for (suit, val), c in cnt_completed.items():
             if c >= 2 and suit == Suit.HONORS:
                 try:
                     h = Honor(val)  # type: ignore[arg-type]
@@ -600,36 +620,49 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
                     break
 
         # 4) Wait fu (+2 for kanchan, penchan, tanki)
-        # Infer winning tile by removing one tile that was likely just added and checking waits
+        # Prefer explicit winning_tile if provided; otherwise fall back to inference
         def _infer_win_tile_and_wait_fu() -> int:
             from .tenpai import waits_for_tiles as _waits_13
             # Build unique tile kinds from concealed hand
             kinds: List[Tile] = []
             seen = set()
-            for t in concealed_tiles:
+            base_tiles = list(concealed_tiles)
+            # If we have explicit winning tile and this is tsumo, remove one instance to form 13
+            explicit_cand: Optional[Tile] = None
+            if winning_tile is not None:
+                explicit_cand = winning_tile
+            for t in base_tiles:
                 key = (t.suit, int(t.tile_type.value))
                 if key not in seen:
                     seen.add(key)
                     kinds.append(t)
+            # If explicit tile provided, restrict to it
+            try_list = [explicit_cand] if explicit_cand is not None else kinds
             # Try each as the winning tile
-            for cand in kinds:
-                # Remove one cand -> 13 tiles
-                removed = False
-                hand13: List[Tile] = []
-                for t in concealed_tiles:
-                    if (not removed) and t.suit == cand.suit and t.tile_type == cand.tile_type:
-                        removed = True
-                        continue
-                    hand13.append(t)
-                if len(hand13) != len(concealed_tiles) - 1:
+            for cand in try_list:
+                if cand is None:
                     continue
+                # Build 13-tile base to evaluate waits
+                # If base_tiles already has 13 (ron case), use as-is. If it has 14 (tsumo case), remove one cand.
+                hand13: List[Tile] = []
+                if len(base_tiles) == 13:
+                    hand13 = list(base_tiles)
+                else:
+                    removed = False
+                    for t in base_tiles:
+                        if (not removed) and t.suit == cand.suit and t.tile_type == cand.tile_type:
+                            removed = True
+                            continue
+                        hand13.append(t)
+                    if len(hand13) != len(base_tiles) - 1:
+                        continue
                 waits = _waits_13(hand13)
                 # Check if cand is indeed a wait
                 if any(w.suit == cand.suit and w.tile_type == cand.tile_type for w in waits):
                     # Classify wait type for suits only
                     if cand.suit == Suit.HONORS:
                         # Honors cannot form sequences; only tanki or shanpon. Tanki if hand13 had exactly one of cand.
-                        if cnt.get((cand.suit, int(cand.tile_type.value)), 0) - 1 == 1:
+                        if _count_tiles(hand13).get((cand.suit, int(cand.tile_type.value)), 0) == 1:
                             return 2
                         return 0
                     v = int(cand.tile_type.value)
@@ -686,14 +719,16 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
         if _is_chinitsu(all_tiles):
             han += 5 if open_hand else 6
         # Chanta/Junchan
-        if _is_chanta(concealed_tiles + [t for cs in called_sets for t in cs.tiles]):
+        if _is_chanta(concealed_for_eval + [t for cs in called_sets for t in cs.tiles]):
             han += CHANTA_OPEN_HAN if open_hand else CHANTA_CLOSED_HAN
-        if _is_junchan(concealed_tiles + [t for cs in called_sets for t in cs.tiles]):
+        if _is_junchan(concealed_for_eval + [t for cs in called_sets for t in cs.tiles]):
             han += JUNCHAN_OPEN_HAN if open_hand else JUNCHAN_CLOSED_HAN
         # Yakuhai
-        han += _yakuhai_han(concealed_tiles, called_sets, seat_wind, round_wind)
+        han += _yakuhai_han(concealed_for_eval, called_sets, seat_wind, round_wind)
         # Sanankou
-        if _count_sanankou(concealed_tiles, called_sets) >= 3:
+        # Important: ron tile cannot complete a concealed triplet for Sanankou
+        concealed_for_sanankou = concealed_tiles if not win_by_tsumo else concealed_for_eval
+        if _count_sanankou(concealed_for_sanankou, called_sets) >= 3:
             han += SANANKOU_HAN
         # Sanshoku doujun
         # Sanshoku doujun: counts for both closed and open hands
@@ -703,7 +738,7 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
         if _has_ittsu(all_tiles):
             han += ITTSU_OPEN_HAN if open_hand else ITTSU_CLOSED_HAN
         # Iipeikou (closed only)
-        if not open_hand and _has_iipeikou(concealed_tiles):
+        if not open_hand and _has_iipeikou(concealed_for_eval):
             han += IIPEIKOU_HAN
         # Pinfu
         if _is_pinfu(all_tiles, called_sets, seat_wind, round_wind):
@@ -717,9 +752,9 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
         han += MENZEN_TSUMO_HAN
 
     # Dora (including aka) contribute to total han returned here; also return dora_han separately
-    dora_han = _calc_dora_han(concealed_tiles, called_sets, dora_indicators)
+    dora_han = _calc_dora_han(concealed_for_eval, called_sets, dora_indicators)
     if riichi_declared:
-        dora_han += _calc_dora_han(concealed_tiles, called_sets, ura_indicators)
+        dora_han += _calc_dora_han(concealed_for_eval, called_sets, ura_indicators)
     # Count red-5 (aka) as dora as well
     aka_han = _count_aka_han(all_tiles)
     han += dora_han + aka_han
@@ -1443,7 +1478,7 @@ class MediumJong:
     def _step_reactions(self, actor_id, move: Reaction):
         # Reactions to discard
         if isinstance(move, Ron):
-            self._on_win(actor_id, win_by_tsumo=False)
+            self._on_win(actor_id, win_by_tsumo=False, winning_tile=self._reactable_tile)
         if isinstance(move, Pon):
             # Any call cancels ippatsu
             self._on_any_call_side_effects()
@@ -1626,13 +1661,13 @@ class MediumJong:
             self.step(left, ch)
             return
 
-    def _on_win(self, winner_id: int, win_by_tsumo: bool) -> None:
+    def _on_win(self, winner_id: int, win_by_tsumo: bool, winning_tile: Optional[Tile] = None) -> None:
         self.winners = [winner_id]
         self.loser = None if win_by_tsumo else self._owner_of_reactable_tile
         self.game_over = True
         # Populate per-player points for this outcome
         deltas = [0, 0, 0, 0]
-        score = self._score_hand(winner_id, win_by_tsumo=win_by_tsumo)
+        score = self._score_hand(winner_id, win_by_tsumo=win_by_tsumo, winning_tile=winning_tile)
         if score.get('tsumo', False):
             # Winner gains total points; others pay according to split
             if winner_id == DEALER_ID_START:
@@ -1649,12 +1684,11 @@ class MediumJong:
                 from_dealer = int(payments.get('from_dealer', 0))
                 from_others = int(payments.get('from_others', 0))
                 for pid in range(4):
-                    if pid == winner_id:
-                        continue
-                    if pid == DEALER_ID_START:
-                        deltas[pid] -= from_dealer
-                    else:
-                        deltas[pid] -= from_others
+                    if pid != winner_id:
+                        if pid == DEALER_ID_START:
+                            deltas[pid] -= from_dealer
+                        else:
+                            deltas[pid] -= from_others
                 deltas[winner_id] += int(payments.get('total_from_all', from_dealer + 2 * from_others))
             # Add riichi sticks if present (pot already cleared in score_hand)
             rs = int(score.get('payments', {}).get('riichi_sticks', 0))
@@ -1690,7 +1724,7 @@ class MediumJong:
         self._owner_of_reactable_tile = discarder
         # Award riichi sticks only to the first winner per rule; order already set
         for idx, w in enumerate(winner_ids):
-            score = self._score_hand(w, win_by_tsumo=False)
+            score = self._score_hand(w, win_by_tsumo=False, winning_tile=self._reactable_tile)
             total = int(score['points'])
             deltas[discarder] -= total
             deltas[w] += total
@@ -1816,7 +1850,7 @@ class MediumJong:
         return self.game_outcome
 
     # Scoring API
-    def _score_hand(self, winner_id: int, win_by_tsumo: bool) -> Dict[str, Any]:
+    def _score_hand(self, winner_id: int, win_by_tsumo: bool, winning_tile: Optional[Tile] = None) -> Dict[str, Any]:
         concealed = list(self._player_hands[winner_id])
         cs = list(self._player_called_sets[winner_id])
         fu, han, dora_han = _score_fu_and_han(
@@ -1830,6 +1864,7 @@ class MediumJong:
             round_wind=self.round_wind,
             dora_indicators=self.dora_indicators,
             ura_indicators=self.ura_dora_indicators if self.riichi_declared[winner_id] else [],
+            winning_tile=winning_tile,
         )
         # Ippatsu: +1 han (yaku) if riichi declared, ippatsu active, and win occurs on next draw before any call or discard
         if self.riichi_declared[winner_id] and self.riichi_ippatsu_active.get(winner_id, False):
@@ -1842,19 +1877,49 @@ class MediumJong:
         # Apply simple mangan cap for limit hands (≥5 han)
         dealer = (winner_id == DEALER_ID_START)
         if han >= MANGAN_HAN_THRESHOLD:
+            # Fixed limit tiers: Mangan (5), Haneman (6-7), Baiman (8-10)
+            tier = 'mangan'
+            if HANEMAN_MIN_HAN <= han <= HANEMAN_MAX_HAN:
+                tier = 'haneman'
+            elif BAIMAN_MIN_HAN <= han <= BAIMAN_MAX_HAN:
+                tier = 'baiman'
             if win_by_tsumo:
                 if dealer:
-                    # Dealer tsumo mangan: 2000 each from three players
-                    total = MANGAN_DEALER_TSUMO_PAYMENT_EACH * 3
+                    if tier == 'mangan':
+                        total = MANGAN_DEALER_TSUMO_PAYMENT_EACH * 3
+                    elif tier == 'haneman':
+                        total = HANEMAN_DEALER_TSUMO_PAYMENT_EACH * 3
+                    else:
+                        total = BAIMAN_DEALER_TSUMO_PAYMENT_EACH * 3
                     payments = {'total_from_others': total}
                     return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': True, 'payments': payments}
                 else:
-                    # Non-dealer tsumo mangan: dealer 2000, others 1000 each
-                    payments = {'from_dealer': MANGAN_NON_DEALER_TSUMO_DEALER_PAYMENT, 'from_others': MANGAN_NON_DEALER_TSUMO_OTHERS_PAYMENT, 'total_from_all': MANGAN_NON_DEALER_TSUMO_DEALER_PAYMENT + 2 * MANGAN_NON_DEALER_TSUMO_OTHERS_PAYMENT}
+                    if tier == 'mangan':
+                        fd = MANGAN_NON_DEALER_TSUMO_DEALER_PAYMENT
+                        fo = MANGAN_NON_DEALER_TSUMO_OTHERS_PAYMENT
+                    elif tier == 'haneman':
+                        fd = HANEMAN_NON_DEALER_TSUMO_DEALER_PAYMENT
+                        fo = HANEMAN_NON_DEALER_TSUMO_OTHERS_PAYMENT
+                    else:
+                        fd = BAIMAN_NON_DEALER_TSUMO_DEALER_PAYMENT
+                        fo = BAIMAN_NON_DEALER_TSUMO_OTHERS_PAYMENT
+                    payments = {'from_dealer': fd, 'from_others': fo, 'total_from_all': fd + 2 * fo}
                     return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': payments['total_from_all'], 'tsumo': True, 'payments': payments}
             else:
-                # Ron mangan
-                total = MANGAN_DEALER_RON_POINTS if dealer else MANGAN_NON_DEALER_RON_POINTS
+                if dealer:
+                    if tier == 'mangan':
+                        total = MANGAN_DEALER_RON_POINTS
+                    elif tier == 'haneman':
+                        total = HANEMAN_DEALER_RON_POINTS
+                    else:
+                        total = BAIMAN_DEALER_RON_POINTS
+                else:
+                    if tier == 'mangan':
+                        total = MANGAN_NON_DEALER_RON_POINTS
+                    elif tier == 'haneman':
+                        total = HANEMAN_NON_DEALER_RON_POINTS
+                    else:
+                        total = BAIMAN_NON_DEALER_RON_POINTS
                 return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': False, 'from': self.loser}
 
         # Simplified rounding for non-limit hands

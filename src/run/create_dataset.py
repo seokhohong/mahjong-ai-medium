@@ -78,7 +78,16 @@ def build_ac_dataset(
 
         net = ACPlayer.from_directory(model_path, temperature=temperature).network
         import torch
-        net = net.to(torch.device('cpu'))
+        
+        # Choose device: prefer CUDA, then macOS MPS, else CPU
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        #elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        #    device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
+        
+        net = net.to(device)
 
     # Accumulate per-field arrays for compact storage
     hand_idx_list: List[np.ndarray] = []
@@ -107,7 +116,7 @@ def build_ac_dataset(
         else:
             assert net is not None
             players = [RecordingACPlayer(net, temperature=temperature, zero_network_reward=bool(zero_network_reward)) for i in range(4)]
-
+            #players = [RecordingACPlayer(net, temperature=temperature, zero_network_reward=bool(zero_network_reward))] * 4
     # Use robust tqdm settings so progress continues to render in long runs
     for gi in tqdm(range(max(1, int(games))), dynamic_ncols=True, mininterval=0.1, miniters=1, leave=True):
         game = MediumJong(players, tile_copies=constants.TILE_COPIES_DEFAULT)
@@ -131,27 +140,57 @@ def build_ac_dataset(
             # Use stored values from the experience buffer
             values: List[float] = [float(v) for v in p.experience.values]
             nstep, adv = compute_n_step_returns(rewards, n_step, gamma, values)
+            
+            # Collect all data for this player's episode in batches
+            player_hand_idx = []
+            player_disc_idx = []
+            player_called_idx = []
+            player_game_state = []
+            player_called_discards = []
+            player_action_idx = []
+            player_tile_idx = []
+            player_returns = []
+            player_advantages = []
+            player_joint_log_probs = []
+            player_game_ids = []
+            player_step_ids = []
+            player_actor_ids = []
+            
             for t in range(T):
                 gs = p.experience.states[t]
                 a_idx, t_idx = p.experience.actions[t]
                 # Extract raw indexed features per sample
-                hand_idx_list.append(np.asarray(gs['hand_idx'], dtype=np.int32))
-                disc_idx_list.append(np.asarray(gs['disc_idx'], dtype=np.int32))
-                called_idx_list.append(np.asarray(gs['called_idx'], dtype=np.int32))
-                game_state_list.append(np.asarray(gs['game_state'], dtype=np.float32))
-                called_discards_list.append(np.asarray(gs['called_discards'], dtype=np.int32))
-                action_idx_list.append(int(a_idx))
-                tile_idx_list.append(int(t_idx))
-                all_returns.append(float(nstep[t]))
-                all_advantages.append(float(adv[t]))
-                joint_log_probs.append(float(p.experience.joint_log_probs[t]))
-                all_game_ids.append(int(gi))
-                all_step_ids.append(int(t))
-                all_actor_ids.append(int(pid))
-        # Clear experience buffers for next game
-        for p in players:
-            if hasattr(p, 'experience') and p.experience is not None:
-                p.experience.clear()
+                player_hand_idx.append(np.asarray(gs['hand_idx'], dtype=np.int32))
+                player_disc_idx.append(np.asarray(gs['disc_idx'], dtype=np.int32))
+                player_called_idx.append(np.asarray(gs['called_idx'], dtype=np.int32))
+                player_game_state.append(np.asarray(gs['game_state'], dtype=np.float32))
+                player_called_discards.append(np.asarray(gs['called_discards'], dtype=np.int32))
+                player_action_idx.append(int(a_idx))
+                player_tile_idx.append(int(t_idx))
+                player_returns.append(float(nstep[t]))
+                player_advantages.append(float(adv[t]))
+                player_joint_log_probs.append(float(p.experience.joint_log_probs[t]))
+                player_game_ids.append(int(gi))
+                player_step_ids.append(int(t))
+                player_actor_ids.append(int(pid))
+            
+            # Use extend to add all player data at once
+            hand_idx_list.extend(player_hand_idx)
+            disc_idx_list.extend(player_disc_idx)
+            called_idx_list.extend(player_called_idx)
+            game_state_list.extend(player_game_state)
+            called_discards_list.extend(player_called_discards)
+            action_idx_list.extend(player_action_idx)
+            tile_idx_list.extend(player_tile_idx)
+            all_returns.extend(player_returns)
+            all_advantages.extend(player_advantages)
+            joint_log_probs.extend(player_joint_log_probs)
+            all_game_ids.extend(player_game_ids)
+            all_step_ids.extend(player_step_ids)
+            all_actor_ids.extend(player_actor_ids)
+            
+            # Clear experience buffers for next game
+            p.experience.clear()
 
 
 

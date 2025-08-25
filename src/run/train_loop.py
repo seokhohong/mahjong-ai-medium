@@ -40,6 +40,9 @@ def run_train_loop(
     warm_up_max_epochs: int,
     hidden_size: int,
     embedding_dim: int,
+    kl_threshold: Optional[float],
+    value_epochs: int,
+    low_mem_mode: bool,
     # runtime/train tuning
     device: Optional[str] = None,
     os_hint: Optional[str] = None,
@@ -97,6 +100,10 @@ def run_train_loop(
 
         # 2) Train PPO starting from current model (if any)
         print(f"[Gen {gen}] Training model on {ds_path} | init={current_model_dir}")
+        # Set value pretraining epochs via environment variable for train_ppo
+        if value_epochs > 0:
+            train_ppo._value_epochs_override = value_epochs
+        
         model_pt_path = train_ppo(
             dataset_path=ds_path,
             epochs=epochs,
@@ -112,7 +119,7 @@ def run_train_loop(
             warm_up_max_epochs=warm_up_max_epochs,
             hidden_size=hidden_size,
             embedding_dim=embedding_dim,
-            kl_threshold=0.0,
+            kl_threshold=kl_threshold,
             # runtime/train tuning
             os_hint=os_hint,
             start_method=start_method,
@@ -160,6 +167,8 @@ def main() -> str:
     ap.add_argument('--warm_up_max_epochs', type=int, default=50)
     ap.add_argument('--hidden_size', type=int, default=128)
     ap.add_argument('--embedding_dim', type=int, default=16)
+    ap.add_argument('--kl_threshold', type=float, default=0.008, help='KL divergence threshold for early stopping')
+    ap.add_argument('--value_epochs', type=int, default=0, help='Number of value-only pretraining epochs')
     # Runtime/train tuning
     ap.add_argument('--device', type=str, default=None, help='Force device (cpu/cuda/mps)')
     ap.add_argument('--os', dest='os_hint', type=str, default='auto', choices=['auto', 'windows', 'mac', 'linux'], help='Target OS to tune runtime defaults (auto)')
@@ -196,6 +205,9 @@ def main() -> str:
         warm_up_max_epochs=args.warm_up_max_epochs,
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
+        kl_threshold=args.kl_threshold,
+        value_epochs=args.value_epochs,
+        low_mem_mode=args.low_mem_mode,
         device=args.device,
         os_hint=None if args.os_hint == 'auto' else args.os_hint,
         start_method=args.start_method,

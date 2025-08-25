@@ -80,9 +80,9 @@ class ACNetwork:
                     nn.ReLU(),
                     nn.AdaptiveMaxPool1d(1),
                 )
-                # Shared trunk
+                # Separate trunks for policy and value
                 input_dim = (conv_ch2 * (1 + 2 * num_p)) + GSV
-                self.trunk = nn.Sequential(
+                self.policy_trunk = nn.Sequential(
                     nn.Linear(input_dim, outer.hidden_size),
                     nn.ReLU(),
                     nn.Dropout(0.3),
@@ -90,7 +90,15 @@ class ACNetwork:
                     nn.ReLU(),
                     nn.Dropout(0.3),
                 )
-                # Heads: new two-head policy (action, tile) + value
+                self.value_trunk = nn.Sequential(
+                    nn.Linear(input_dim, outer.hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(outer.hidden_size, outer.hidden_size // 2),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                )
+                # Heads: two-head policy (action, tile) + value
                 self.head_action = nn.Linear(outer.hidden_size // 2, int(ACTION_HEAD_SIZE))
                 self.head_tile = nn.Linear(outer.hidden_size // 2, int(TILE_HEAD_SIZE))
                 self.head_value = nn.Linear(outer.hidden_size // 2, 1)
@@ -109,12 +117,16 @@ class ACNetwork:
                 disc_features_per_player = self.disc_conv(disc_flat).squeeze(-1)
                 disc_features = disc_features_per_player.reshape(batch_size, num_players * disc_features_per_player.shape[1])
                 x = torch.cat([hand_features, calls_features, disc_features, gsv], dim=1)
-                z = self.trunk(x)
-                action_logits = self.head_action(z)
-                tile_logits = self.head_tile(z)
+                
+                # Process through separate trunks
+                policy_features = self.policy_trunk(x)
+                value_features = self.value_trunk(x)
+                
+                action_logits = self.head_action(policy_features)
+                tile_logits = self.head_tile(policy_features)
                 action_pp = F.softmax(action_logits, dim=-1)
                 tile_pp = F.softmax(tile_logits, dim=-1)
-                val = self.head_value(z)
+                val = self.head_value(value_features)
                 return action_pp, tile_pp, val
 
             def forward_two_head(self, hand_seq: torch.Tensor, calls_seq: torch.Tensor, disc_seq: torch.Tensor, gsv: torch.Tensor):
@@ -129,12 +141,16 @@ class ACNetwork:
                 disc_features_per_player = self.disc_conv(disc_flat).squeeze(-1)
                 disc_features = disc_features_per_player.reshape(batch_size, num_players * disc_features_per_player.shape[1])
                 x = torch.cat([hand_features, calls_features, disc_features, gsv], dim=1)
-                z = self.trunk(x)
-                action_logits = self.head_action(z)
-                tile_logits = self.head_tile(z)
+                
+                # Process through separate trunks
+                policy_features = self.policy_trunk(x)
+                value_features = self.value_trunk(x)
+                
+                action_logits = self.head_action(policy_features)
+                tile_logits = self.head_tile(policy_features)
                 action_pp = F.softmax(action_logits, dim=-1)
                 tile_pp = F.softmax(tile_logits, dim=-1)
-                val = self.head_value(z)
+                val = self.head_value(value_features)
                 return action_pp, tile_pp, val
 
         self._net = _ACModule(self)

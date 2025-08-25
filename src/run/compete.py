@@ -41,7 +41,7 @@ def build_players() -> List[Player]:
 
 	return [
         RecordingHeuristicACPlayer(),
-        ACPlayer.from_directory("models/ac_ppo_20250824_030321", temperature=0.2),
+        ACPlayer.from_directory("models/ac_ppo_20250824_182820", temperature=0.2),
         RecordingHeuristicACPlayer(),
         RecordingHeuristicACPlayer(),
 	]

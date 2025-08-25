@@ -253,6 +253,7 @@ def _compute_losses(
         epsilon: float = 0.2,
         value_coeff: float = 0.5,
         entropy_coeff: float = 0.01,
+        bc_fallback_ratio: float = 5.0,
         print_debug: bool = False,
 ):
     a_pp, t_pp, val = model(hand.float(), calls.float(), disc.float(), gsv.float())
@@ -315,7 +316,7 @@ def _compute_losses(
         return total, policy_loss, value_loss, batch_size_curr, dbg
 
     # Check for divergence earlier and more strictly based on joint ratio
-    if mode == 'bc' or ratio_joint.max().item() > 5.0:
+    if mode == 'bc' or mode == 'bc_policy_only' or ratio_joint.max().item() > bc_fallback_ratio:
         if mode == 'ppo' and print_debug:
             print(f"Switching to BC mode due to high joint ratio: {ratio_joint.max().item():.2f}")
 
@@ -330,8 +331,15 @@ def _compute_losses(
         entropy_t = safe_entropy_calculation(t_pp)
         entropy = entropy_a + entropy_t
 
-        total = policy_loss - entropy_coeff * entropy
-        return total, policy_loss, torch.zeros_like(policy_loss), batch_size_curr, dbg
+        # For bc_policy_only mode, exclude value loss completely
+        if mode == 'bc_policy_only':
+            total = policy_loss - entropy_coeff * entropy
+            return total, policy_loss, torch.zeros_like(policy_loss), batch_size_curr, dbg
+        else:
+            # Regular BC mode includes value loss
+            value_loss = F.mse_loss(val, returns)
+            total = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
+            return total, policy_loss, value_loss, batch_size_curr, dbg
 
     clipped_ratio = torch.clamp(ratio_joint, 1 - epsilon, 1 + epsilon)
     policy_loss = -torch.min(
@@ -349,141 +357,116 @@ def _compute_losses(
     return total, policy_loss, value_loss, batch_size_curr, dbg
 
 
-def train_ppo(
-    dataset_path: str,
-    epochs: int = 3,
-    batch_size: int = 256,
-    lr: float = 3e-4,
-    epsilon: float = 0.2,
-    value_coeff: float = 0.5,
-    entropy_coeff: float = 0.01,
-    device: str | None = None,
-    min_delta: float = 1e-4,
-    val_split: float = 0.1,
-    init_model: str | None = None,
-    warm_up_acc: float = 0.0,
-    warm_up_max_epochs: int = 50,
-    *,
-    hidden_size: int = 128,
-    embedding_dim: int = 16,
-    kl_threshold: float | None = 0.008,
-    patience: int = 0,
-    low_mem_mode: bool = False,
-    # Runtime/loader tuning
-    os_hint: str | None = None,
-    start_method: str | None = None,
-    torch_threads: int | None = None,
-    interop_threads: int | None = None,
-    dl_workers: int | None = None,
-    pin_memory: bool | None = None,
-    prefetch_factor: int | None = None,
-    persistent_workers: bool | None = None,
-) -> str:
-    # Choose device: prefer CUDA, then macOS MPS, else CPU
-    if device is None:
-        if torch.cuda.is_available():
-            dev = torch.device('cuda')
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            dev = torch.device('mps')
+def _run_value_pretraining(
+    model: torch.nn.Module,
+    dl: DataLoader,
+    dl_val: DataLoader | None,
+    dev: torch.device,
+    lr: float,
+    value_lr: float | None,
+    bc_fallback_ratio: float,
+) -> None:
+    """Run value-only pretraining for specified number of epochs."""
+    value_pre_epochs = int(os.environ.get('MJ_VALUE_EPOCHS', '0'))
+    if hasattr(train_ppo, '_value_epochs_override'):
+        value_pre_epochs = int(getattr(train_ppo, '_value_epochs_override'))
+    
+    if value_pre_epochs <= 0:
+        return
+    
+    # Use separate learning rate for value pretraining if specified
+    effective_value_lr = value_lr if value_lr is not None else lr
+    value_opt = torch.optim.Adam(model.parameters(), lr=effective_value_lr)
+    print(f"Starting value-only pretraining for {value_pre_epochs} epoch(s) with lr={effective_value_lr:.2e}...")
+    
+    for ve in range(value_pre_epochs):
+        total_v = 0.0
+        total_n = 0
+        progress = tqdm(dl, desc=f"ValuePre {ve+1}/{value_pre_epochs}", leave=False)
+        for batch in progress:
+            (
+                hand, calls, disc, gsv,
+                action_idx, tile_idx,
+                joint_old_log_probs,
+                advantages, returns,
+            ) = _prepare_batch_tensors(batch, dev)
+            total_loss_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
+                model,
+                hand, calls, disc, gsv,
+                action_idx, tile_idx,
+                joint_old_log_probs,
+                advantages, returns,
+                mode='value',
+                bc_fallback_ratio=bc_fallback_ratio,
+            )
+            value_opt.zero_grad(set_to_none=True)
+            total_loss_v.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            value_opt.step()
+            total_v += float(value_loss_v.item()) * bsz
+            total_n += int(bsz)
+            progress.set_postfix(value=f"{float(value_loss_v.item()):.4f}")
+        
+        train_value_loss = total_v / max(1, total_n)
+        
+        # Validation phase - for value pretraining, evaluate on ALL batches (no BC filtering)
+        validation_value_loss = None
+        if dl_val is not None:
+            model.eval()
+            validation_total_v = 0.0
+            validation_total_n = 0
+            with torch.no_grad():
+                for validation_batch in dl_val:
+                    (
+                        hand, calls, disc, gsv,
+                        action_idx, tile_idx,
+                        joint_old_log_probs,
+                        advantages, returns,
+                    ) = _prepare_batch_tensors(validation_batch, dev)
+                    
+                    # For value pretraining, use all batches regardless of BC mode
+                    _, _, value_loss_v, bsz, _ = _compute_losses(
+                        model,
+                        hand, calls, disc, gsv,
+                        action_idx, tile_idx,
+                        joint_old_log_probs,
+                        advantages, returns,
+                        mode='value',
+                        bc_fallback_ratio=bc_fallback_ratio,
+                    )
+                    validation_total_v += float(value_loss_v.item()) * bsz
+                    validation_total_n += int(bsz)
+            
+            validation_value_loss = validation_total_v / max(1, validation_total_n)
+            model.train()
+            print(f"ValuePre {ve+1}/{value_pre_epochs} - train: {train_value_loss:.4f} | validation: {validation_value_loss:.4f}")
         else:
-            dev = torch.device('cpu')
-    else:
-        dev = torch.device(device)
-
-    # Configure multiprocessing and thread settings for platform
-    _apply_runtime_config(
-        os_hint=os_hint,
-        start_method=start_method,
-        torch_threads=torch_threads,
-        interop_threads=interop_threads,
-    )
+            print(f"ValuePre {ve+1}/{value_pre_epochs} - train: {train_value_loss:.4f}")
 
 
-    if init_model:
-        try:
-            player = ACPlayer.from_directory(init_model)
-            net = player.network.to(dev)
-            model = net.torch_module
-            ds = ACDataset(
-                dataset_path,
-                net,
-                fit_scaler=False,
-                precompute_features=not low_mem_mode,
-                mmap=low_mem_mode,
-            )  # in the future we can always fit scaler to fit new distribution
-            print(f"Loaded initial weights from {init_model}")
-        except Exception as e:
-            raise ValueError(f"Warning: failed to load init model '{init_model}': {e}")
-    else:
-        gsv_scaler = StandardScaler()
-        # Initialize AC network first so we can use its feature extraction table and standard scaler for preprocessing
-        net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=hidden_size, embedding_dim=embedding_dim, temperature=0.05)
-        net = net.to(dev)
-        # Ensure the scaler we persist is the exact one used by the network during preprocessing
-        player = ACPlayer(gsv_scaler=gsv_scaler, network=net)
-
-        model = net.torch_module
-        ds = ACDataset(
-            dataset_path,
-            net,
-            fit_scaler=True,
-            precompute_features=not low_mem_mode,
-            mmap=low_mem_mode,
-        )
-    # Build train/validation split
-    n = len(ds)
-    k = int(max(0, min(n, round(float(val_split) * n))))
-    if k > 0 and n > 1:
-        idx = np.random.permutation(n)
-        val_idx = idx[:k].tolist()
-        train_idx = idx[k:].tolist()
-        ds_train = Subset(ds, train_idx) if len(train_idx) > 0 else ds
-        ds_val = Subset(ds, val_idx)
-    else:
-        ds_train = ds
-        ds_val = None
-    # Determine DataLoader worker defaults based on platform if not provided
-    resolved = _resolve_loader_defaults(
-        os_hint=os_hint,
-        dl_workers=dl_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=persistent_workers,
-    )
-    if low_mem_mode:
-        # Force conservative settings to minimize RAM
-        resolved['dl_workers'] = 0
-        resolved['pin_memory'] = False
-        resolved['prefetch_factor'] = 1
-        resolved['persistent_workers'] = False
-    dl = DataLoader(
-        ds_train,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=resolved['dl_workers'],
-        pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
-        prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
-        persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
-    )
-    dl_val = (
-        DataLoader(
-            ds_val,
-            batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=resolved['dl_workers'],
-            pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
-            prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
-            persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
-        )
-        if ds_val is not None else None
-    )
-    model.train()
-
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-
-    # Helper: compute top-1 policy accuracy on a given dataloader
+def _run_warmup_bc(
+    model: torch.nn.Module,
+    dl: DataLoader,
+    dl_val: DataLoader | None,
+    dev: torch.device,
+    opt: torch.optim.Optimizer,
+    warm_up_acc: float,
+    warm_up_max_epochs: int,
+    value_coeff: float,
+    bc_fallback_ratio: float,
+    lr: float,
+    value_lr: float | None,
+    warm_up_value: bool,
+) -> None:
+    """Run behavior cloning warm-up until accuracy threshold is met."""
+    if not warm_up_acc or warm_up_acc <= 0.0:
+        return
+    
+    # Use value_lr for warm-up if available, otherwise fallback to main lr
+    warmup_lr = value_lr if value_lr is not None else lr
+    warmup_opt = torch.optim.Adam(model.parameters(), lr=warmup_lr)
+    print(f"Warm-up BC using learning rate: {warmup_lr}, value training: {'enabled' if warm_up_value else 'disabled'}")
+    
     def _eval_policy_accuracy(dloader: DataLoader) -> float:
         model.eval()
         correct = 0
@@ -505,172 +488,157 @@ def train_ppo(
                 count += int(gsv.size(0))
         model.train()
         return float(correct) / float(max(1, count))
+    
+    threshold = float(max(0.0, min(1.0, warm_up_acc)))
+    # Pre-check: if current model already meets threshold on validation (or train) accuracy, skip warm-up
+    initial_acc = _eval_policy_accuracy(dl_val if dl_val is not None else dl)
+    if initial_acc >= threshold:
+        print(f"Skipping warm-up: initial accuracy {initial_acc:.4f} >= {threshold:.4f}")
+        return
+    
+    print(f"Starting warm-up until accuracy >= {threshold:.2f} (behavior cloning + value regression)...")
+    epoch = 0
+    reached = False
+    while initial_acc < threshold and epoch < int(max(1, warm_up_max_epochs)) and not reached:
+        total_loss = 0.0
+        total_examples = 0
+        pol_loss_acc = 0.0
+        value_loss_acc = 0.0
+        correct = 0
+        progress = tqdm(dl, desc=f"WarmUp {epoch+1}", leave=False)
+        for batch in progress:
+            (
+                hand, calls, disc, gsv,
+                action_idx, tile_idx,
+                joint_old_log_probs,
+                advantages,
+                returns,
+            ) = _prepare_batch_tensors(batch, dev)
 
-    # Optional value pretraining: optimize value-only for a few epochs before warm-up/PPO
-    value_pre_epochs = int(os.environ.get('MJ_VALUE_EPOCHS', '0'))  # default 0 unless set via CLI below
-    if hasattr(train_ppo, '_value_epochs_override'):
-        value_pre_epochs = int(getattr(train_ppo, '_value_epochs_override'))
-    if value_pre_epochs > 0:
-        print(f"Starting value-only pretraining for {value_pre_epochs} epoch(s)...")
-        for ve in range(value_pre_epochs):
-            total_v = 0.0
-            total_n = 0
-            progress = tqdm(dl, desc=f"ValuePre {ve+1}/{value_pre_epochs}", leave=False)
-            for batch in progress:
-                (
-                    hand, calls, disc, gsv,
-                    action_idx, tile_idx,
-                    joint_old_log_probs,
-                    advantages, returns,
-                ) = _prepare_batch_tensors(batch, dev)
-                total_loss_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
-                    model,
-                    hand, calls, disc, gsv,
-                    action_idx, tile_idx,
-                    joint_old_log_probs,
-                    advantages, returns,
-                    mode='value',
-                )
-                opt.zero_grad(set_to_none=True)
-                total_loss_v.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                opt.step()
-                total_v += float(value_loss_v.item()) * bsz
-                total_n += int(bsz)
-                progress.set_postfix(val=f"{float(value_loss_v.item()):.4f}")
-            print(f"ValuePre {ve+1}/{value_pre_epochs} - value: {total_v/max(1,total_n):.4f}")
+            # Choose mode based on warm_up_value setting
+            mode = 'bc' if warm_up_value else 'bc_policy_only'
+            loss, policy_loss, value_loss, _, _dbg = _compute_losses(
+                model,
+                hand, calls, disc, gsv,
+                action_idx, tile_idx,
+                joint_old_log_probs,
+                advantages,
+                returns,
+                mode=mode,
+                value_coeff=value_coeff if warm_up_value else 0.0,
+                bc_fallback_ratio=bc_fallback_ratio,
+            )
 
-    # Optional warm-up: behavior cloning on flat action index + value regression until accuracy threshold
-    if warm_up_acc and warm_up_acc > 0.0:
-        threshold = float(max(0.0, min(1.0, warm_up_acc)))
-        # Pre-check: if current model already meets threshold on validation (or train) accuracy, skip warm-up
-        initial_acc = _eval_policy_accuracy(dl_val if dl_val is not None else dl)
-        if initial_acc >= threshold:
-            print(f"Skipping warm-up: initial accuracy {initial_acc:.4f} >= {threshold:.4f}")
-        else:
-            print(f"Starting warm-up until accuracy >= {threshold:.2f} (behavior cloning + value regression)...")
-        epoch = 0
-        reached = False
-        while initial_acc < threshold and epoch < int(max(1, warm_up_max_epochs)) and not reached:
-            total_loss = 0.0
-            total_examples = 0
-            pol_loss_acc = 0.0
-            val_loss_acc = 0.0
-            correct = 0
-            progress = tqdm(dl, desc=f"WarmUp {epoch+1}", leave=False)
-            for batch in progress:
-                (
-                    hand, calls, disc, gsv,
-                    action_idx, tile_idx,
-                    joint_old_log_probs,
-                    advantages,
-                    returns,
-                ) = _prepare_batch_tensors(batch, dev)
+            warmup_opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            warmup_opt.step()
 
-                loss, policy_loss, value_loss, _, _dbg = _compute_losses(
-                    model,
-                    hand, calls, disc, gsv,
-                    action_idx, tile_idx,
-                    joint_old_log_probs,
-                    advantages,
-                    returns,
-                    mode='bc',
-                    value_coeff=value_coeff,
-                )
+            bsz = int(gsv.size(0))
+            total_examples += bsz
+            total_loss += float(loss.item()) * bsz
+            pol_loss_acc += float(policy_loss.item()) * bsz
+            value_loss_acc += float(value_loss.item()) * bsz
+            # Compute training accuracy in eval mode for parity with validation accuracy
+            with torch.no_grad():
+                was_training = model.training
+                model.eval()
+                a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                pred_a = torch.argmax(a_pp, dim=1)
+                pred_t = torch.argmax(t_pp, dim=1)
+                both = (pred_a == action_idx) & (pred_t == tile_idx)
+                correct += int(both.sum().item())
+                if was_training:
+                    model.train()
+            progress.set_postfix(loss=f"{float(loss.item()):.4f}", pol=f"{float(policy_loss.item()):.4f}", value=f"{float(value_loss.item()):.4f}")
 
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                opt.step()
+        # Calculate train accuracy
+        train_acc = (correct / max(1, total_examples))
 
-                bsz = int(gsv.size(0))
-                total_examples += bsz
-                total_loss += float(loss.item()) * bsz
-                pol_loss_acc += float(policy_loss.item()) * bsz
-                val_loss_acc += float(value_loss.item()) * bsz
-                # Compute training accuracy in eval mode for parity with validation accuracy
-                with torch.no_grad():
-                    was_training = model.training
-                    model.eval()
+        # Calculate validation accuracy if available
+        validation_acc = None
+        if dl_val is not None:
+            model.eval()
+            validation_total = validation_pol = validation_value = 0.0
+            validation_count = 0
+            validation_correct = 0
+            with torch.no_grad():
+                for vb in dl_val:
+                    (
+                        hand, calls, disc, gsv,
+                        action_idx, tile_idx,
+                        joint_old_log_probs,
+                        advantages,
+                        returns,
+                    ) = _prepare_batch_tensors(vb, dev)
+                    loss_v, policy_loss_v, value_loss_v, _, _ = _compute_losses(
+                        model,
+                        hand, calls, disc, gsv,
+                        action_idx, tile_idx,
+                        joint_old_log_probs,
+                        advantages,
+                        returns,
+                        mode='bc',
+                        value_coeff=value_coeff,
+                        bc_fallback_ratio=bc_fallback_ratio,
+                    )
+                    bsz = int(gsv.size(0))
+                    validation_total += float(loss_v.item()) * bsz
+                    validation_pol += float(policy_loss_v.item()) * bsz
+                    validation_value += float(value_loss_v.item()) * bsz
+                    validation_count += bsz
                     a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
                     pred_a = torch.argmax(a_pp, dim=1)
                     pred_t = torch.argmax(t_pp, dim=1)
                     both = (pred_a == action_idx) & (pred_t == tile_idx)
-                    correct += int(both.sum().item())
-                    if was_training:
-                        model.train()
-                progress.set_postfix(loss=f"{float(loss.item()):.4f}", pol=f"{float(policy_loss.item()):.4f}", val=f"{float(value_loss.item()):.4f}")
+                    validation_correct += int(both.sum().item())
+            validation_denominator = max(1, validation_count)
+            validation_acc = (validation_correct / max(1, validation_count))
+            print(f"\nWarmUp {epoch+1} [validation] - total: {validation_total/validation_denominator:.4f} | policy: {validation_pol/validation_denominator:.4f} | value: {validation_value/validation_denominator:.4f} | acc: {validation_acc:.4f}")
+            model.train()
 
-            # Calculate train accuracy
-            train_acc = (correct / max(1, total_examples))
+        # Display both train and validation accuracy
+        if validation_acc is not None:
+            print(f"WarmUp {epoch+1} [train] - acc: {train_acc:.4f}")
+            epoch_acc = validation_acc  # Use validation accuracy for threshold checking
+        else:
+            print(f"WarmUp {epoch+1} [train] - acc: {train_acc:.4f}")
+            epoch_acc = train_acc
 
-            # Calculate validation accuracy if available
-            val_acc = None
-            if dl_val is not None:
-                model.eval()
-                v_total = v_pol = v_val = 0.0
-                v_count = 0
-                v_correct = 0
-                with torch.no_grad():
-                    for vb in dl_val:
-                        (
-                            hand, calls, disc, gsv,
-                            action_idx, tile_idx,
-                            joint_old_log_probs,
-                            advantages,
-                            returns,
-                        ) = _prepare_batch_tensors(vb, dev)
-                        loss_v, policy_loss_v, value_loss_v, _, _ = _compute_losses(
-                            model,
-                            hand, calls, disc, gsv,
-                            action_idx, tile_idx,
-                            joint_old_log_probs,
-                            advantages,
-                            returns,
-                            mode='bc',
-                            value_coeff=value_coeff,
-                        )
-                        bsz = int(gsv.size(0))
-                        v_total += float(loss_v.item()) * bsz
-                        v_pol += float(policy_loss_v.item()) * bsz
-                        v_val += float(value_loss_v.item()) * bsz
-                        v_count += bsz
-                        a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                        pred_a = torch.argmax(a_pp, dim=1)
-                        pred_t = torch.argmax(t_pp, dim=1)
-                        both = (pred_a == action_idx) & (pred_t == tile_idx)
-                        v_correct += int(both.sum().item())
-                vden = max(1, v_count)
-                val_acc = (v_correct / max(1, v_count))
-                print(f"\nWarmUp {epoch+1} [val] - total: {v_total/vden:.4f} | policy: {v_pol/vden:.4f} | value: {v_val/vden:.4f} | acc: {val_acc:.4f}")
-                model.train()
+        if epoch_acc >= threshold:
+            reached = True
+            print(f"Warm-up threshold met: accuracy {epoch_acc:.4f} >= {threshold:.4f}. Switching to PPO.")
+        initial_acc = epoch_acc
+        epoch += 1
 
-            # Display both train and validation accuracy
-            if val_acc is not None:
-                print(f"WarmUp {epoch+1} [train] - acc: {train_acc:.4f}")
-                epoch_acc = val_acc  # Use validation accuracy for threshold checking
-            else:
-                print(f"WarmUp {epoch+1} [train] - acc: {train_acc:.4f}")
-                epoch_acc = train_acc
 
-            if epoch_acc >= threshold:
-                reached = True
-                print(f"Warm-up threshold met: accuracy {epoch_acc:.4f} >= {threshold:.4f}. Switching to PPO.")
-            initial_acc = epoch_acc
-            epoch += 1
-
+def _run_ppo_training(
+    model: torch.nn.Module,
+    dl: DataLoader,
+    dl_val: DataLoader | None,
+    dev: torch.device,
+    opt: torch.optim.Optimizer,
+    epochs: int,
+    epsilon: float,
+    value_coeff: float,
+    entropy_coeff: float,
+    kl_threshold: float | None,
+    patience: int,
+    bc_fallback_ratio: float,
+) -> str:
+    """Run main PPO training loop and return model path."""
+    import copy
+    import math
+    import time
+    
     best_loss = math.inf
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     epochs_no_improve = 0
-    # Store previous epoch's validation policy probabilities for BOTH heads to compute joint KL(prev || curr)
-    prev_val_action_probs: torch.Tensor | None = None
-    prev_val_tile_probs: torch.Tensor | None = None
     # Low-memory alternative: keep a single frozen copy of previous epoch's model on CPU
     prev_epoch_model_cpu: torch.nn.Module | None = None
     # Track consecutive epochs where joint KL(prev||curr) <= threshold (when enabled)
     kl_below_count: int = 0
-    # Latest computed validation joint KL (prev||curr) average for logging/ES
-    v_avg_joint_kl_prev_curr: float | None = None
+    
     for epoch in range(epochs):
         total_loss = 0.0
         total_examples = 0
@@ -704,6 +672,7 @@ def train_ppo(
                 epsilon=epsilon,
                 value_coeff=value_coeff,
                 entropy_coeff=entropy_coeff,
+                bc_fallback_ratio=bc_fallback_ratio,
                 print_debug=False,
             )
 
@@ -744,17 +713,17 @@ def train_ppo(
             print(f"Epoch {epoch + 1}/{epochs} [train dbg] - ratio_mean={r_mean:.4f} | ratio_std={r_std:.4f} | clipped={clip_rate:.3f}")
 
         # Evaluate on holdout set
+        validation_avg_joint_kl_prev_curr = None
         if dl_val is not None:
             model.eval()
-            val_total = val_pol = val_val = 0.0
-            val_pol_main = 0.0
-            val_count = 0
+            validation_total = validation_pol = validation_value = 0.0
+            validation_pol_main = 0.0
+            validation_count = 0
+            # Track value loss separately for non-BC batches only
+            validation_value_non_bc = 0.0
+            validation_count_non_bc = 0
             # Joint KL(prev || curr) across validation set
-            val_joint_kl_prev_curr_sum = 0.0
-            offset = 0
-            # Only maintain per-sample probability caches in normal mode; avoid in low_mem_mode
-            curr_action_probs_chunks: list[torch.Tensor] = [] if not low_mem_mode else []
-            curr_tile_probs_chunks: list[torch.Tensor] = [] if not low_mem_mode else []
+            validation_joint_kl_prev_curr_sum = 0.0
             with torch.no_grad():
                 for vb in dl_val:
                     tensors = _prepare_batch_tensors(vb, dev)
@@ -772,85 +741,71 @@ def train_ppo(
                         epsilon=epsilon,
                         value_coeff=value_coeff,
                         entropy_coeff=entropy_coeff,
+                        bc_fallback_ratio=bc_fallback_ratio,
                     )
 
-                    val_total += float(total_v.item()) * bsz
-                    val_pol += float(policy_loss_v.item()) * bsz
-                    val_val += float(value_loss_v.item()) * bsz
-                    val_pol_main += float(policy_loss_v.item()) * bsz
                     # Compute current probs
                     a_curr, t_curr, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                    if not low_mem_mode:
-                        # Normal mode: cache current probs to build prev for next epoch
-                        curr_action_probs_chunks.append(a_curr.detach().cpu())
-                        curr_tile_probs_chunks.append(t_curr.detach().cpu())
-                        # If previous epoch's probs are available, compute KL(prev||curr)
-                        if prev_val_action_probs is not None and prev_val_tile_probs is not None:
-                            prev_slice_a = prev_val_action_probs[offset:offset + bsz, :]
-                            prev_slice_t = prev_val_tile_probs[offset:offset + bsz, :]
-                            prev_a_safe = prev_slice_a.clamp_min(1e-8)
-                            curr_a_safe = a_curr.clamp_min(1e-8)
-                            prev_t_safe = prev_slice_t.clamp_min(1e-8)
-                            curr_t_safe = t_curr.clamp_min(1e-8)
-                            kl_a = (prev_a_safe * (prev_a_safe.log() - curr_a_safe.detach().cpu().log())).sum(dim=1)
-                            kl_t = (prev_t_safe * (prev_t_safe.log() - curr_t_safe.detach().cpu().log())).sum(dim=1)
-                            kl_joint = kl_a + kl_t
-                            val_joint_kl_prev_curr_sum += float(kl_joint.mean().item()) * bsz
-                        offset += bsz
-                    else:
-                        # Low memory mode: use a frozen previous-epoch model on CPU if available
-                        if prev_epoch_model_cpu is not None:
-                            # Move inputs to CPU for prev model
-                            hand_cpu = hand.float().to('cpu')
-                            calls_cpu = calls.float().to('cpu')
-                            disc_cpu = disc.float().to('cpu')
-                            gsv_cpu = gsv.float().to('cpu')
-                            a_prev, t_prev, _ = prev_epoch_model_cpu(hand_cpu, calls_cpu, disc_cpu, gsv_cpu)
-                            a_prev_safe = a_prev.clamp_min(1e-8)
-                            t_prev_safe = t_prev.clamp_min(1e-8)
-                            a_curr_safe = a_curr.clamp_min(1e-8).detach().cpu()
-                            t_curr_safe = t_curr.clamp_min(1e-8).detach().cpu()
-                            kl_a = (a_prev_safe * (a_prev_safe.log() - a_curr_safe.log())).sum(dim=1)
-                            kl_t = (t_prev_safe * (t_prev_safe.log() - t_curr_safe.log())).sum(dim=1)
-                            kl_joint = kl_a + kl_t
-                            val_joint_kl_prev_curr_sum += float(kl_joint.mean().item()) * bsz
+                    
+                    validation_total += float(total_v.item()) * bsz
+                    validation_pol += float(policy_loss_v.item()) * bsz
+                    validation_value += float(value_loss_v.item()) * bsz
+                    validation_pol_main += float(policy_loss_v.item()) * bsz
+                    
+                    # Check if this is a BC batch (ratio > bc_fallback_ratio) - if not, include in value loss tracking
+                    ratio_joint = torch.exp(joint_old_log_probs - (a_curr.log_softmax(dim=1).gather(1, action_idx.unsqueeze(1)).squeeze(1) + 
+                                                                   t_curr.log_softmax(dim=1).gather(1, tile_idx.unsqueeze(1)).squeeze(1)))
+                    if ratio_joint.max().item() <= bc_fallback_ratio:
+                        # Non-BC batch: include in value loss measurement
+                        validation_value_non_bc += float(value_loss_v.item()) * bsz
+                        validation_count_non_bc += bsz
+                    # Low memory mode: use a frozen previous-epoch model on CPU if available
+                    if prev_epoch_model_cpu is not None:
+                        # Move inputs to CPU for prev model
+                        hand_cpu = hand.float().to('cpu')
+                        calls_cpu = calls.float().to('cpu')
+                        disc_cpu = disc.float().to('cpu')
+                        gsv_cpu = gsv.float().to('cpu')
+                        a_prev, t_prev, _ = prev_epoch_model_cpu(hand_cpu, calls_cpu, disc_cpu, gsv_cpu)
+                        a_prev_safe = a_prev.clamp_min(1e-8)
+                        t_prev_safe = t_prev.clamp_min(1e-8)
+                        a_curr_safe = a_curr.clamp_min(1e-8).detach().cpu()
+                        t_curr_safe = t_curr.clamp_min(1e-8).detach().cpu()
+                        kl_a = (a_prev_safe * (a_prev_safe.log() - a_curr_safe.log())).sum(dim=1)
+                        kl_t = (t_prev_safe * (t_prev_safe.log() - t_curr_safe.log())).sum(dim=1)
+                        kl_joint = kl_a + kl_t
+                        validation_joint_kl_prev_curr_sum += float(kl_joint.mean().item()) * bsz
 
-                    val_count += bsz
-            vden = max(1, val_count)
-            v_avg = val_total / vden
-            v_avg_pol = val_pol / vden
-            v_avg_val = val_val / vden
-            # Finalize current epoch's concatenated validation probs for next epoch (normal mode only)
-            if not low_mem_mode:
-                curr_val_action_probs = torch.cat(curr_action_probs_chunks, dim=0) if curr_action_probs_chunks else None
-                curr_val_tile_probs = torch.cat(curr_tile_probs_chunks, dim=0) if curr_tile_probs_chunks else None
-                v_avg_joint_kl_prev_curr = (val_joint_kl_prev_curr_sum / vden) if (
-                    prev_val_action_probs is not None and prev_val_tile_probs is not None and vden > 0) else None
-            else:
-                curr_val_action_probs = None
-                curr_val_tile_probs = None
-                # In low memory mode, KL is computed on-the-fly if prev model exists, else N/A for first epoch
-                v_avg_joint_kl_prev_curr = (val_joint_kl_prev_curr_sum / vden) if (prev_epoch_model_cpu is not None and vden > 0) else None
+                    validation_count += bsz
+            validation_denominator = max(1, validation_count)
+            validation_avg = validation_total / validation_denominator
+            validation_avg_pol = validation_pol / validation_denominator
+            validation_avg_value = validation_value / validation_denominator
+            # Calculate value loss average for non-BC batches only
+            validation_avg_value_non_bc = validation_value_non_bc / max(1, validation_count_non_bc) if validation_count_non_bc > 0 else None
+            # In low memory mode, KL is computed on-the-fly if prev model exists, else N/A for first epoch
+            validation_avg_joint_kl_prev_curr = (validation_joint_kl_prev_curr_sum / validation_denominator) if (prev_epoch_model_cpu is not None and validation_denominator > 0) else None
+            
+            # Print validation results with separate value loss for non-BC batches
+            value_loss_display = f"{validation_avg_value:.4f}"
+            if validation_avg_value_non_bc is not None:
+                value_loss_display += f" (non-BC: {validation_avg_value_non_bc:.4f})"
+            
             print(
-                f"\nEpoch {epoch + 1}/{epochs} [val] - total: {v_avg:.4f} | policy: {v_avg_pol:.4f} | value: {v_avg_val:.4f}"
+                f"\nEpoch {epoch + 1}/{epochs} [validation] - total: {validation_avg:.4f} | policy: {validation_avg_pol:.4f} | value: {value_loss_display}"
                 + (
-                    f" | joint_kl(prev||curr): {v_avg_joint_kl_prev_curr:.4f}" if v_avg_joint_kl_prev_curr is not None else " | joint_kl(prev||curr): N/A")
+                    f" | joint_kl(prev||curr): {validation_avg_joint_kl_prev_curr:.4f}" if validation_avg_joint_kl_prev_curr is not None else " | joint_kl(prev||curr): N/A")
             )
-            # Update previous references for next epoch
-            if not low_mem_mode:
-                if curr_val_action_probs is not None and curr_val_tile_probs is not None:
-                    prev_val_action_probs = curr_val_action_probs
-                    prev_val_tile_probs = curr_val_tile_probs
-            else:
-                # Keep a frozen copy of the current model on CPU for next epoch KL
-                prev_epoch_model_cpu = copy.deepcopy(model).to('cpu').eval()
+            # Update previous references for next epoch (low memory mode)
+            # Keep a frozen copy of the current model on CPU for next epoch KL
+            prev_epoch_model_cpu = copy.deepcopy(model).to('cpu').eval()
             model.train()
 
         # Early stopping
         if dl_val is not None:
             # KL-based early stopping with patience: require joint KL(prev||curr) <= threshold for `patience` consecutive epochs
-            if kl_threshold is not None and v_avg_joint_kl_prev_curr is not None:
-                if v_avg_joint_kl_prev_curr <= float(kl_threshold):
+            if kl_threshold is not None and validation_avg_joint_kl_prev_curr is not None:
+                if validation_avg_joint_kl_prev_curr <= float(kl_threshold):
                     kl_below_count += 1
                 else:
                     kl_below_count = 0
@@ -859,6 +814,154 @@ def train_ppo(
                         f"Early stopping triggered: joint KL(prev||curr) <= {float(kl_threshold):.6f} for {kl_below_count} consecutive epoch(s) (patience={int(patience)})"
                     )
                     break
+
+    return timestamp
+
+
+def train_ppo(
+    dataset_path: str,
+    epochs: int = 3,
+    batch_size: int = 256,
+    lr: float = 3e-4,
+    value_lr: float | None = None,
+    epsilon: float = 0.2,
+    value_coeff: float = 0.5,
+    entropy_coeff: float = 0.01,
+    bc_fallback_ratio: float = 5.0,
+    device: str | None = None,
+    min_delta: float = 1e-4,
+    val_split: float = 0.1,
+    init_model: str | None = None,
+    warm_up_acc: float = 0.0,
+    warm_up_max_epochs: int = 50,
+    warm_up_value: bool = False,
+    *,
+    hidden_size: int = 128,
+    embedding_dim: int = 16,
+    kl_threshold: float | None = 0.008,
+    patience: int = 0,
+    # low_mem_mode is now always enabled for better memory efficiency
+    # Runtime/loader tuning
+    os_hint: str | None = None,
+    start_method: str | None = None,
+    torch_threads: int | None = None,
+    interop_threads: int | None = None,
+    dl_workers: int | None = None,
+    pin_memory: bool | None = None,
+    prefetch_factor: int | None = None,
+    persistent_workers: bool | None = None,
+) -> str:
+    # Choose device: prefer CUDA, then macOS MPS, else CPU
+    if device is None:
+        if torch.cuda.is_available():
+            dev = torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            dev = torch.device('mps')
+        else:
+            dev = torch.device('cpu')
+    else:
+        dev = torch.device(device)
+
+    # Configure multiprocessing and thread settings for platform
+    _apply_runtime_config(
+        os_hint=os_hint,
+        start_method=start_method,
+        torch_threads=torch_threads,
+        interop_threads=interop_threads,
+    )
+
+
+    if init_model:
+        try:
+            player = ACPlayer.from_directory(init_model)
+            net = player.network.to(dev)
+            model = net.torch_module
+            ds = ACDataset(
+                dataset_path,
+                net,
+                fit_scaler=False,
+                precompute_features=False,
+                mmap=True,
+            )  # in the future we can always fit scaler to fit new distribution
+            print(f"Loaded initial weights from {init_model}")
+        except Exception as e:
+            raise ValueError(f"Warning: failed to load init model '{init_model}': {e}")
+    else:
+        gsv_scaler = StandardScaler()
+        # Initialize AC network first so we can use its feature extraction table and standard scaler for preprocessing
+        net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=hidden_size, embedding_dim=embedding_dim, temperature=0.05)
+        net = net.to(dev)
+        # Ensure the scaler we persist is the exact one used by the network during preprocessing
+        player = ACPlayer(gsv_scaler=gsv_scaler, network=net)
+
+        model = net.torch_module
+        ds = ACDataset(
+            dataset_path,
+            net,
+            fit_scaler=True,
+            precompute_features=False,
+            mmap=True,
+        )
+    # Build train/validation split
+    n = len(ds)
+    k = int(max(0, min(n, round(float(val_split) * n))))
+    if k > 0 and n > 1:
+        idx = np.random.permutation(n)
+        val_idx = idx[:k].tolist()
+        train_idx = idx[k:].tolist()
+        ds_train = Subset(ds, train_idx) if len(train_idx) > 0 else ds
+        ds_val = Subset(ds, val_idx)
+    else:
+        ds_train = ds
+        ds_val = None
+    # Determine DataLoader worker defaults based on platform if not provided
+    resolved = _resolve_loader_defaults(
+        os_hint=os_hint,
+        dl_workers=dl_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+    )
+    # Always use conservative settings to minimize RAM (low_mem_mode always enabled)
+    resolved['dl_workers'] = 0
+    resolved['pin_memory'] = False
+    resolved['prefetch_factor'] = 1
+    resolved['persistent_workers'] = False
+    dl = DataLoader(
+        ds_train,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=resolved['dl_workers'],
+        pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
+        prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
+        persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
+    )
+    dl_val = (
+        DataLoader(
+            ds_val,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=resolved['dl_workers'],
+            pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
+            prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
+            persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
+        )
+        if ds_val is not None else None
+    )
+    model.train()
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Optional value pretraining: optimize value-only for a few epochs before warm-up/PPO
+    _run_value_pretraining(model, dl, dl_val, dev, lr, value_lr, bc_fallback_ratio)
+
+    # Optional warm-up: behavior cloning on flat action index + value regression until accuracy threshold
+    _run_warmup_bc(model, dl, dl_val, dev, opt, warm_up_acc, warm_up_max_epochs, value_coeff, bc_fallback_ratio, lr, value_lr, warm_up_value)
+
+    # Main PPO training loop
+    timestamp = _run_ppo_training(model, dl, dl_val, dev, opt, epochs, epsilon, value_coeff, entropy_coeff, kl_threshold, patience, bc_fallback_ratio)
 
     # Save trained weights and scaler
     out_dir = os.path.join(os.getcwd(), 'models')
@@ -888,6 +991,8 @@ def main():
     ap.add_argument('--epochs', type=int, default=3)
     ap.add_argument('--batch_size', type=int, default=256)
     ap.add_argument('--lr', type=float, default=3e-4)
+    ap.add_argument('--value_lr', type=float, default=None, help='Learning rate for value pretraining (defaults to --lr if not specified)')
+    ap.add_argument('--bc_fallback_ratio', type=float, default=5.0, help='Ratio threshold for falling back to BC mode during PPO training')
     ap.add_argument('--epsilon', type=float, default=0.2)
     ap.add_argument('--value_coeff', type=float, default=0.5)
     ap.add_argument('--entropy_coeff', type=float, default=0.01)
@@ -898,9 +1003,9 @@ def main():
     ap.add_argument('--init', type=str, default=None, help='Path to initial AC model weights/module to load')
     ap.add_argument('--warm_up_acc', type=float, default=0.0, help='Accuracy threshold to reach with behavior cloning before switching to PPO (0 disables)')
     ap.add_argument('--warm_up_max_epochs', type=int, default=50, help='Maximum warm-up epochs before switching even if threshold not reached')
+    ap.add_argument('--warm_up_value', action='store_true', help='Enable value network training during warm-up BC phase')
     ap.add_argument('--hidden_size', type=int, default=128, help='Hidden size for ACNetwork')
     ap.add_argument('--embedding_dim', type=int, default=16, help='Embedding dimension for ACNetwork')
-    ap.add_argument('--low_mem_mode', action='store_true', help='Reduce RAM usage: no precompute, memmap dataset, workers=0, no pin_memory/persistence, prefetch=1')
     # DataLoader tuning
     ap.add_argument('--dl_workers', type=int, default=None, help='Number of DataLoader workers (overrides platform defaults)')
     ap.add_argument('--prefetch_factor', type=int, default=None, help='DataLoader prefetch_factor when workers>0 (overrides platform defaults)')
@@ -913,18 +1018,20 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        value_lr=args.value_lr,
         epsilon=args.epsilon,
         value_coeff=args.value_coeff,
         entropy_coeff=args.entropy_coeff,
+        bc_fallback_ratio=args.bc_fallback_ratio,
         min_delta=float(args.min_delta),
         init_model=args.init,
         warm_up_acc=args.warm_up_acc,
         warm_up_max_epochs=args.warm_up_max_epochs,
+        warm_up_value=args.warm_up_value,
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
         kl_threshold=args.kl_threshold,
         patience=args.patience,
-        low_mem_mode=bool(args.low_mem_mode),
         dl_workers=args.dl_workers,
         prefetch_factor=args.prefetch_factor,
     )

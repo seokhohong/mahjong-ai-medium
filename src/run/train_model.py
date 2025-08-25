@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import copy
 import math
 import time
 import argparse
@@ -197,15 +198,22 @@ def batch_to_tensors(batch: Dict[str, Any], device: torch.device) -> Tuple[torch
 
 
 def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
+    def _to_dev(x, dtype):
+        if isinstance(x, torch.Tensor):
+            return x.to(device=dev, dtype=dtype)
+        return torch.as_tensor(x, dtype=dtype, device=dev)
+
     hand = torch.from_numpy(np.stack(batch['hand'])).to(dev)
     calls = torch.from_numpy(np.stack(batch['calls'])).to(dev)
     disc = torch.from_numpy(np.stack(batch['disc'])).to(dev)
     gsv = torch.from_numpy(np.stack(batch['gsv'])).to(dev)
-    action_idx = torch.tensor(batch['action_idx'], dtype=torch.long, device=dev)
-    tile_idx = torch.tensor(batch['tile_idx'], dtype=torch.long, device=dev)
-    joint_old_log_probs = torch.tensor(batch['joint_old_log_prob'], dtype=torch.float32, device=dev)
-    advantages = torch.tensor(batch['advantage'], dtype=torch.float32, device=dev)
-    returns = torch.tensor(batch['return'], dtype=torch.float32, device=dev)
+
+    action_idx = _to_dev(batch['action_idx'], torch.long)
+    tile_idx = _to_dev(batch['tile_idx'], torch.long)
+    joint_old_log_probs = _to_dev(batch['joint_old_log_prob'], torch.float32)
+    advantages = _to_dev(batch['advantage'], torch.float32)
+    returns = _to_dev(batch['return'], torch.float32)
+
     return (
         hand, calls, disc, gsv,
         action_idx, tile_idx,
@@ -608,6 +616,8 @@ def train_ppo(
     # Store previous epoch's validation policy probabilities for BOTH heads to compute joint KL(prev || curr)
     prev_val_action_probs: torch.Tensor | None = None
     prev_val_tile_probs: torch.Tensor | None = None
+    # Low-memory alternative: keep a single frozen copy of previous epoch's model on CPU
+    prev_epoch_model_cpu: torch.nn.Module | None = None
     # Track consecutive epochs where joint KL(prev||curr) <= threshold (when enabled)
     kl_below_count: int = 0
     # Latest computed validation joint KL (prev||curr) average for logging/ES
@@ -648,7 +658,7 @@ def train_ppo(
                 print_debug=False,
             )
 
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
@@ -690,11 +700,12 @@ def train_ppo(
             val_total = val_pol = val_val = 0.0
             val_pol_main = 0.0
             val_count = 0
-            # Joint KL(prev || curr) across validation set (available from epoch >= 1)
+            # Joint KL(prev || curr) across validation set
             val_joint_kl_prev_curr_sum = 0.0
             offset = 0
-            curr_action_probs_chunks: list[torch.Tensor] = []
-            curr_tile_probs_chunks: list[torch.Tensor] = []
+            # Only maintain per-sample probability caches in normal mode; avoid in low_mem_mode
+            curr_action_probs_chunks: list[torch.Tensor] = [] if not low_mem_mode else []
+            curr_tile_probs_chunks: list[torch.Tensor] = [] if not low_mem_mode else []
             with torch.no_grad():
                 for vb in dl_val:
                     tensors = _prepare_batch_tensors(vb, dev)
@@ -718,46 +729,72 @@ def train_ppo(
                     val_pol += float(policy_loss_v.item()) * bsz
                     val_val += float(value_loss_v.item()) * bsz
                     val_pol_main += float(policy_loss_v.item()) * bsz
-                    # Collect current policy probabilities for this batch for BOTH heads
+                    # Compute current probs
                     a_curr, t_curr, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
-                    curr_action_probs_chunks.append(a_curr.detach().cpu())
-                    curr_tile_probs_chunks.append(t_curr.detach().cpu())
-                    # If previous epoch's probs are available, compute joint KL(prev || curr) = KL_a + KL_t
-                    if prev_val_action_probs is not None and prev_val_tile_probs is not None:
-                        prev_slice_a = prev_val_action_probs[offset:offset + bsz, :]
-                        prev_slice_t = prev_val_tile_probs[offset:offset + bsz, :]
-                        # Numerical stability
-                        prev_a_safe = prev_slice_a.clamp_min(1e-8)
-                        curr_a_safe = a_curr.clamp_min(1e-8)
-                        prev_t_safe = prev_slice_t.clamp_min(1e-8)
-                        curr_t_safe = t_curr.clamp_min(1e-8)
-                        # KL(prev||curr) per sample for both heads
-                        kl_a = (prev_a_safe * (prev_a_safe.log() - curr_a_safe.detach().cpu().log())).sum(dim=1)
-                        kl_t = (prev_t_safe * (prev_t_safe.log() - curr_t_safe.detach().cpu().log())).sum(dim=1)
-                        kl_joint = kl_a + kl_t
-                        val_joint_kl_prev_curr_sum += float(kl_joint.mean().item()) * bsz
-                    offset += bsz
+                    if not low_mem_mode:
+                        # Normal mode: cache current probs to build prev for next epoch
+                        curr_action_probs_chunks.append(a_curr.detach().cpu())
+                        curr_tile_probs_chunks.append(t_curr.detach().cpu())
+                        # If previous epoch's probs are available, compute KL(prev||curr)
+                        if prev_val_action_probs is not None and prev_val_tile_probs is not None:
+                            prev_slice_a = prev_val_action_probs[offset:offset + bsz, :]
+                            prev_slice_t = prev_val_tile_probs[offset:offset + bsz, :]
+                            prev_a_safe = prev_slice_a.clamp_min(1e-8)
+                            curr_a_safe = a_curr.clamp_min(1e-8)
+                            prev_t_safe = prev_slice_t.clamp_min(1e-8)
+                            curr_t_safe = t_curr.clamp_min(1e-8)
+                            kl_a = (prev_a_safe * (prev_a_safe.log() - curr_a_safe.detach().cpu().log())).sum(dim=1)
+                            kl_t = (prev_t_safe * (prev_t_safe.log() - curr_t_safe.detach().cpu().log())).sum(dim=1)
+                            kl_joint = kl_a + kl_t
+                            val_joint_kl_prev_curr_sum += float(kl_joint.mean().item()) * bsz
+                        offset += bsz
+                    else:
+                        # Low memory mode: use a frozen previous-epoch model on CPU if available
+                        if prev_epoch_model_cpu is not None:
+                            # Move inputs to CPU for prev model
+                            hand_cpu = hand.float().to('cpu')
+                            calls_cpu = calls.float().to('cpu')
+                            disc_cpu = disc.float().to('cpu')
+                            gsv_cpu = gsv.float().to('cpu')
+                            a_prev, t_prev, _ = prev_epoch_model_cpu(hand_cpu, calls_cpu, disc_cpu, gsv_cpu)
+                            a_prev_safe = a_prev.clamp_min(1e-8)
+                            t_prev_safe = t_prev.clamp_min(1e-8)
+                            a_curr_safe = a_curr.clamp_min(1e-8).detach().cpu()
+                            t_curr_safe = t_curr.clamp_min(1e-8).detach().cpu()
+                            kl_a = (a_prev_safe * (a_prev_safe.log() - a_curr_safe.log())).sum(dim=1)
+                            kl_t = (t_prev_safe * (t_prev_safe.log() - t_curr_safe.log())).sum(dim=1)
+                            kl_joint = kl_a + kl_t
+                            val_joint_kl_prev_curr_sum += float(kl_joint.mean().item()) * bsz
 
                     val_count += bsz
             vden = max(1, val_count)
             v_avg = val_total / vden
             v_avg_pol = val_pol / vden
             v_avg_val = val_val / vden
-            # Finalize current epoch's concatenated validation probs for next epoch
-            curr_val_action_probs = torch.cat(curr_action_probs_chunks, dim=0) if curr_action_probs_chunks else None
-            curr_val_tile_probs = torch.cat(curr_tile_probs_chunks, dim=0) if curr_tile_probs_chunks else None
-            # Compute joint KL(prev||curr) average if prev exists; otherwise mark as None
-            v_avg_joint_kl_prev_curr = (val_joint_kl_prev_curr_sum / vden) if (
-                        prev_val_action_probs is not None and prev_val_tile_probs is not None and vden > 0) else None
+            # Finalize current epoch's concatenated validation probs for next epoch (normal mode only)
+            if not low_mem_mode:
+                curr_val_action_probs = torch.cat(curr_action_probs_chunks, dim=0) if curr_action_probs_chunks else None
+                curr_val_tile_probs = torch.cat(curr_tile_probs_chunks, dim=0) if curr_tile_probs_chunks else None
+                v_avg_joint_kl_prev_curr = (val_joint_kl_prev_curr_sum / vden) if (
+                    prev_val_action_probs is not None and prev_val_tile_probs is not None and vden > 0) else None
+            else:
+                curr_val_action_probs = None
+                curr_val_tile_probs = None
+                # In low memory mode, KL is computed on-the-fly if prev model exists, else N/A for first epoch
+                v_avg_joint_kl_prev_curr = (val_joint_kl_prev_curr_sum / vden) if (prev_epoch_model_cpu is not None and vden > 0) else None
             print(
                 f"\nEpoch {epoch + 1}/{epochs} [val] - total: {v_avg:.4f} | policy: {v_avg_pol:.4f} | value: {v_avg_val:.4f}"
                 + (
                     f" | joint_kl(prev||curr): {v_avg_joint_kl_prev_curr:.4f}" if v_avg_joint_kl_prev_curr is not None else " | joint_kl(prev||curr): N/A")
             )
-            # Update previous epoch validation policy probabilities for next epoch
-            if curr_val_action_probs is not None and curr_val_tile_probs is not None:
-                prev_val_action_probs = curr_val_action_probs
-                prev_val_tile_probs = curr_val_tile_probs
+            # Update previous references for next epoch
+            if not low_mem_mode:
+                if curr_val_action_probs is not None and curr_val_tile_probs is not None:
+                    prev_val_action_probs = curr_val_action_probs
+                    prev_val_tile_probs = curr_val_tile_probs
+            else:
+                # Keep a frozen copy of the current model on CPU for next epoch KL
+                prev_epoch_model_cpu = copy.deepcopy(model).to('cpu').eval()
             model.train()
 
         # Early stopping
@@ -814,6 +851,9 @@ def main():
     ap.add_argument('--hidden_size', type=int, default=128, help='Hidden size for ACNetwork')
     ap.add_argument('--embedding_dim', type=int, default=16, help='Embedding dimension for ACNetwork')
     ap.add_argument('--low_mem_mode', action='store_true', help='Reduce RAM usage: no precompute, memmap dataset, workers=0, no pin_memory/persistence, prefetch=1')
+    # DataLoader tuning
+    ap.add_argument('--dl_workers', type=int, default=None, help='Number of DataLoader workers (overrides platform defaults)')
+    ap.add_argument('--prefetch_factor', type=int, default=None, help='DataLoader prefetch_factor when workers>0 (overrides platform defaults)')
     args = ap.parse_args()
 
     train_ppo(
@@ -833,6 +873,8 @@ def main():
         kl_threshold=args.kl_threshold,
         patience=args.patience,
         low_mem_mode=bool(args.low_mem_mode),
+        dl_workers=args.dl_workers,
+        prefetch_factor=args.prefetch_factor,
     )
 
 

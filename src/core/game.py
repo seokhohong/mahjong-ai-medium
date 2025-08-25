@@ -1876,13 +1876,41 @@ class MediumJong:
         base_points = fu * (2 ** (BASE_POINTS_EXPONENT_OFFSET + han))
         # Apply simple mangan cap for limit hands (≥5 han)
         dealer = (winner_id == DEALER_ID_START)
-        if han >= MANGAN_HAN_THRESHOLD:
+        
+        # --- Local helpers to simplify flow and avoid repetition ---
+        def _limit_tier_from_fu_han(h: int, f: int) -> Optional[str]:
+            """Return 'mangan' | 'haneman' | 'baiman' if hand hits a limit tier, else None.
+            Uses han ranges for higher limits and a dealer-agnostic base-points check for mangan.
+            """
+            # Higher limits are determined solely by han ranges
+            if HANEMAN_MIN_HAN <= h <= HANEMAN_MAX_HAN:
+                return 'haneman'
+            if BAIMAN_MIN_HAN <= h <= BAIMAN_MAX_HAN:
+                return 'baiman'
+            # Mangan by han
+            if h >= MANGAN_HAN_THRESHOLD:
+                return 'mangan'
+            # Mangan by fu/han rounding: compare base points to mangan base threshold
+            mangan_base_threshold = MANGAN_NON_DEALER_RON_POINTS // NON_DEALER_RON_MULTIPLIER
+            base_pts = f * (2 ** (BASE_POINTS_EXPONENT_OFFSET + h))
+            if base_pts >= mangan_base_threshold:
+                return 'mangan'
+            return None
+
+        def _award_riichi_on_tsumo(payments: Dict[str, Any]) -> None:
+            # Winner collects riichi sticks pot on any tsumo
+            if self.riichi_sticks_pot > 0:
+                payments['riichi_sticks'] = self.riichi_sticks_pot
+                self.riichi_sticks_pot = 0
+
+        def _award_riichi_on_ron(payments: Dict[str, Any]) -> None:
+            # Riichi sticks are awarded on ron except when the winning tile is the riichi discard
+            if self.riichi_sticks_pot > 0 and not self.last_discard_was_riichi:
+                payments['riichi_sticks'] = self.riichi_sticks_pot
+                self.riichi_sticks_pot = 0
+        tier = _limit_tier_from_fu_han(han, fu)
+        if tier is not None:
             # Fixed limit tiers: Mangan (5), Haneman (6-7), Baiman (8-10)
-            tier = 'mangan'
-            if HANEMAN_MIN_HAN <= han <= HANEMAN_MAX_HAN:
-                tier = 'haneman'
-            elif BAIMAN_MIN_HAN <= han <= BAIMAN_MAX_HAN:
-                tier = 'baiman'
             if win_by_tsumo:
                 if dealer:
                     if tier == 'mangan':
@@ -1892,6 +1920,7 @@ class MediumJong:
                     else:
                         total = BAIMAN_DEALER_TSUMO_PAYMENT_EACH * 3
                     payments = {'total_from_others': total}
+                    _award_riichi_on_tsumo(payments)
                     return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': True, 'payments': payments}
                 else:
                     if tier == 'mangan':
@@ -1904,6 +1933,7 @@ class MediumJong:
                         fd = BAIMAN_NON_DEALER_TSUMO_DEALER_PAYMENT
                         fo = BAIMAN_NON_DEALER_TSUMO_OTHERS_PAYMENT
                     payments = {'from_dealer': fd, 'from_others': fo, 'total_from_all': fd + 2 * fo}
+                    _award_riichi_on_tsumo(payments)
                     return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': payments['total_from_all'], 'tsumo': True, 'payments': payments}
             else:
                 if dealer:
@@ -1920,7 +1950,9 @@ class MediumJong:
                         total = HANEMAN_NON_DEALER_RON_POINTS
                     else:
                         total = BAIMAN_NON_DEALER_RON_POINTS
-                return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': False, 'from': self.loser}
+                payments: Dict[str, Any] = {'from': self.loser}
+                _award_riichi_on_ron(payments)
+                return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': False, **payments}
 
         # Simplified rounding for non-limit hands
         def round_up_100(x: int) -> int:
@@ -1930,19 +1962,14 @@ class MediumJong:
             if dealer:
                 total = round_up_100(base_points * DEALER_TSUMO_TOTAL_MULTIPLIER)
                 payments = {'total_from_others': total}
-                # Winner collects riichi sticks pot on win
-                if self.riichi_sticks_pot > 0:
-                    payments['riichi_sticks'] = self.riichi_sticks_pot
-                    self.riichi_sticks_pot = 0
+                _award_riichi_on_tsumo(payments)
             else:
                 # Non-dealer split: dealer pays 2x, others 1x
                 dealer_pay = round_up_100(base_points * NON_DEALER_TSUMO_DEALER_MULTIPLIER)
                 non_dealer_pay = round_up_100(base_points * NON_DEALER_TSUMO_OTHERS_MULTIPLIER)
                 total = dealer_pay + 2 * non_dealer_pay
                 payments = {'from_dealer': dealer_pay, 'from_others': non_dealer_pay, 'total_from_all': total}
-                if self.riichi_sticks_pot > 0:
-                    payments['riichi_sticks'] = self.riichi_sticks_pot
-                    self.riichi_sticks_pot = 0
+                _award_riichi_on_tsumo(payments)
             return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': True, 'payments': payments}
         else:
             # Ron
@@ -1951,10 +1978,7 @@ class MediumJong:
             else:
                 total = round_up_100(base_points * NON_DEALER_RON_MULTIPLIER)
             payments: Dict[str, Any] = {'from': self.loser}
-            # Riichi sticks are awarded on ron only if the winning tile is not the riichi declaration discard
-            if self.riichi_sticks_pot > 0 and not self.last_discard_was_riichi:
-                payments['riichi_sticks'] = self.riichi_sticks_pot
-                self.riichi_sticks_pot = 0
+            _award_riichi_on_ron(payments)
             return {'fu': fu, 'han': han, 'dora_han': dora_han, 'points': total, 'tsumo': False, **payments}
 
 

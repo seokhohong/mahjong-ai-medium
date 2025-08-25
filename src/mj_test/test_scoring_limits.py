@@ -39,11 +39,9 @@ class TestLimitScoring(unittest.TestCase):
         # Configure loser context (ron)
         g._owner_of_reactable_tile = 0
         g.loser = 0
-        pts = g.get_points()
-        self.assertIsNotNone(pts)
-        # Winner gains exactly HANEMAN non-dealer ron points
-        self.assertEqual(pts[1], HANEMAN_NON_DEALER_RON_POINTS)
-        self.assertEqual(pts[0], -HANEMAN_NON_DEALER_RON_POINTS)
+        s = g._score_hand(1, win_by_tsumo=False)
+        self.assertEqual(s['tsumo'], False)
+        self.assertEqual(s['points'], HANEMAN_NON_DEALER_RON_POINTS)
 
     def test_haneman_non_dealer_tsumo_split(self):
         # Non-dealer tsumo with 6 han -> split per Haneman constants
@@ -57,10 +55,11 @@ class TestLimitScoring(unittest.TestCase):
         # Force tsumo
         g.play_turn()
         self.assertTrue(g.is_game_over())
-        pts = g.get_points()
-        self.assertIsNotNone(pts)
-        # Non-dealer tsumo split: dealer pays X, others Y -> winner total X + 2Y
-        self.assertEqual(pts[1], HANEMAN_NON_DEALER_TSUMO_DEALER_PAYMENT + 2 * HANEMAN_NON_DEALER_TSUMO_OTHERS_PAYMENT)
+        s = g._score_hand(1, win_by_tsumo=True)
+        self.assertTrue(s['tsumo'])
+        self.assertIn('payments', s)
+        self.assertEqual(s['payments']['from_dealer'], HANEMAN_NON_DEALER_TSUMO_DEALER_PAYMENT)
+        self.assertEqual(s['payments']['from_others'], HANEMAN_NON_DEALER_TSUMO_OTHERS_PAYMENT)
 
     def test_baiman_dealer_tsumo_total(self):
         # Dealer tsumo with 8 han (tanyao 1 + 7 dora) -> BAIMAN dealer tsumo each * 3
@@ -73,9 +72,9 @@ class TestLimitScoring(unittest.TestCase):
         g.tiles = [Tile(Suit.MANZU, TileType.SEVEN)]
         g.play_turn()
         self.assertTrue(g.is_game_over())
-        pts = g.get_points()
-        self.assertIsNotNone(pts)
-        self.assertEqual(pts[0], BAIMAN_DEALER_TSUMO_PAYMENT_EACH * 3)
+        s = g._score_hand(0, win_by_tsumo=True)
+        self.assertTrue(s['tsumo'])
+        self.assertEqual(s['points'], BAIMAN_DEALER_TSUMO_PAYMENT_EACH * 3)
 
     def test_baiman_dealer_ron_points(self):
         # Dealer ron with 8 han -> BAIMAN dealer ron points
@@ -84,9 +83,9 @@ class TestLimitScoring(unittest.TestCase):
         g.dora_indicators = [Tile(Suit.PINZU, TileType.FOUR) for _ in range(7)]
         g._owner_of_reactable_tile = 1
         g.loser = 1
-        pts = g.get_points()
-        self.assertIsNotNone(pts)
-        self.assertEqual(pts[0], BAIMAN_DEALER_RON_POINTS)
+        s = g._score_hand(0, win_by_tsumo=False)
+        self.assertFalse(s['tsumo'])
+        self.assertEqual(s['points'], BAIMAN_DEALER_RON_POINTS)
 
 
 if __name__ == '__main__':

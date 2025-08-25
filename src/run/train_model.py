@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -21,27 +20,85 @@ from tqdm import tqdm  # type: ignore
 from core.learn.ac_player import ACPlayer
 from core.learn.ac_network import ACNetwork
 from sklearn.preprocessing import StandardScaler  # type: ignore
-from run.os_runtime import (
-    _apply_runtime_config,
-    _resolve_loader_defaults,
-)
+
+# ---- Helpers: runtime/loader configuration ----
+def _detect_os_from_env(os_hint: str | None) -> str:
+    if os_hint in ('windows', 'mac', 'linux'):
+        return os_hint
+    plat = os.sys.platform
+    if plat.startswith('win'):
+        return 'windows'
+    if plat == 'darwin':
+        return 'mac'
+    return 'linux'
+
+
+def _apply_runtime_config(*, os_hint: str | None, start_method: str | None, torch_threads: int | None, interop_threads: int | None) -> None:
+    # Set multiprocessing start method if specified or if platform needs it
+    resolved_os = _detect_os_from_env(os_hint)
+    try:
+        import torch.multiprocessing as mp
+        if start_method is None:
+            # Defaults: mac/windows -> spawn; linux -> leave default (often fork)
+            if resolved_os in ('mac', 'windows'):
+                if mp.get_start_method(allow_none=True) is None:
+                    mp.set_start_method('spawn', force=True)
+        else:
+            if mp.get_start_method(allow_none=True) != start_method:
+                mp.set_start_method(start_method, force=True)
+    except Exception:
+        pass
+
+    # Torch intra/inter-op threads
+    try:
+        if torch_threads is not None and torch_threads > 0:
+            torch.set_num_threads(int(torch_threads))
+        if interop_threads is not None and interop_threads > 0:
+            torch.set_num_interop_threads(int(interop_threads))
+    except Exception:
+        pass
+
+
+def _resolve_loader_defaults(*, os_hint: str | None, dl_workers: int | None, pin_memory: bool | None, prefetch_factor: int | None, persistent_workers: bool | None) -> Dict[str, Any]:
+    resolved_os = _detect_os_from_env(os_hint)
+    cpu_count = max(1, (os.cpu_count() or 1))
+    # Reasonable defaults per-OS
+    if dl_workers is None:
+        if resolved_os == 'mac':
+            # macOS often benefits from a few workers; avoid oversubscription
+            dl_workers = min(8, max(0, cpu_count // 2))
+        elif resolved_os == 'windows':
+            dl_workers = min(8, max(0, cpu_count // 2))
+        else:  # linux
+            dl_workers = min(16, max(0, cpu_count - 2))
+    if pin_memory is None:
+        pin_memory = (resolved_os != 'mac')  # Pinned memory less impactful for MPS
+    if prefetch_factor is None:
+        prefetch_factor = 2
+    if persistent_workers is None:
+        persistent_workers = True
+    return {
+        'dl_workers': int(max(0, dl_workers)),
+        'pin_memory': bool(pin_memory),
+        'prefetch_factor': int(max(1, prefetch_factor)),
+        'persistent_workers': bool(persistent_workers),
+    }
 
 # not using called discards yet
 class ACDataset(Dataset):
-    def __init__(self, npz_path: str, net: ACNetwork, fit_scaler = True):
-        data = np.load(npz_path, allow_pickle=True)
+    def __init__(self, npz_path: str, net: ACNetwork, fit_scaler: bool = True, *, precompute_features: bool = True, mmap: bool = False):
+        # Use memory-mapped loading if requested to reduce peak RAM
+        data = np.load(npz_path, allow_pickle=True, mmap_mode=('r' if mmap else None))
         # New compact format fields
-        hand_arr = data['hand_idx']
-        disc_arr = data['disc_idx']
-        called_arr = data['called_idx']
-        gsv_arr = data['game_state']
+        self._hand_idx = data['hand_idx']
+        self._disc_idx = data['disc_idx']
+        self._called_idx = data['called_idx']
+        self._gsv = data['game_state']
         self.action_idx = data['action_idx']
         self.tile_idx = data['tile_idx']
         # Load returns/advantages
-        returns = data['returns'].astype(np.float32)
-        advantages = data['advantages'].astype(np.float32)
-        self.returns = returns
-        self.advantages = advantages
+        self.returns = data['returns'].astype(np.float32)
+        self.advantages = data['advantages'].astype(np.float32)
         if 'joint_log_probs' in data.files:
             self.joint_old_log_probs = data['joint_log_probs'].astype(np.float32)
         else:
@@ -50,41 +107,69 @@ class ACDataset(Dataset):
             t_lp = data['tile_log_probs'].astype(np.float32)
             self.joint_old_log_probs = (a_lp + t_lp).astype(np.float32)
 
-        # fit the standard scaler so we can properly use extract_features
+        # Fit the standard scaler so we can properly use extract_features
         if fit_scaler:
-            net.fit_scaler(gsv_arr)
+            # StandardScaler handles memmap arrays; this may stream from disk when mmap=True
+            net.fit_scaler(self._gsv)
 
-        # Pre-extract indexed states and transform to embedded sequences once
-        hand_list = []
-        calls_list = []
-        disc_list = []
-        gsv_list = []
-        N = len(hand_arr)
-        for i in range(N):
-            h, c, d, g = net.extract_features_from_indexed(
-                np.asarray(hand_arr[i], dtype=np.int32),
-                np.asarray(disc_arr[i], dtype=np.int32),
-                np.asarray(called_arr[i], dtype=np.int32),
-                np.asarray(gsv_arr[i], dtype=np.float32),
-            )
-            hand_list.append(h.astype(np.float32))
-            calls_list.append(c.astype(np.float32))
-            disc_list.append(d.astype(np.float32))
-            gsv_list.append(g.astype(np.float32))
-        self.hand = np.asarray(hand_list, dtype=np.float32)
-        self.calls = np.asarray(calls_list, dtype=np.float32)
-        self.disc = np.asarray(disc_list, dtype=np.float32)
-        self.gsv = np.asarray(gsv_list, dtype=np.float32)
+        self._net = net
+        self._precompute = bool(precompute_features)
+
+        if self._precompute:
+            # Pre-extract indexed states and transform to embedded sequences once
+            hand_list = []
+            calls_list = []
+            disc_list = []
+            gsv_list = []
+            N = len(self._hand_idx)
+            for i in range(N):
+                h, c, d, g = net.extract_features_from_indexed(
+                    np.asarray(self._hand_idx[i], dtype=np.int32),
+                    np.asarray(self._disc_idx[i], dtype=np.int32),
+                    np.asarray(self._called_idx[i], dtype=np.int32),
+                    np.asarray(self._gsv[i], dtype=np.float32),
+                )
+                hand_list.append(h.astype(np.float32))
+                calls_list.append(c.astype(np.float32))
+                disc_list.append(d.astype(np.float32))
+                gsv_list.append(g.astype(np.float32))
+            self.hand = np.asarray(hand_list, dtype=np.float32)
+            self.calls = np.asarray(calls_list, dtype=np.float32)
+            self.disc = np.asarray(disc_list, dtype=np.float32)
+            self.gsv = np.asarray(gsv_list, dtype=np.float32)
+        else:
+            # Defer feature extraction to __getitem__ to minimize resident memory
+            self.hand = None  # type: ignore
+            self.calls = None  # type: ignore
+            self.disc = None  # type: ignore
+            self.gsv = None  # type: ignore
 
     def __len__(self) -> int:
-        return self.hand.shape[0]
+        return int(len(self._hand_idx))
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self._precompute:
+            hand = self.hand[idx]
+            calls = self.calls[idx]
+            disc = self.disc[idx]
+            gsv = self.gsv[idx]
+        else:
+            # Compute features on demand to save RAM
+            h, c, d, g = self._net.extract_features_from_indexed(
+                np.asarray(self._hand_idx[idx], dtype=np.int32),
+                np.asarray(self._disc_idx[idx], dtype=np.int32),
+                np.asarray(self._called_idx[idx], dtype=np.int32),
+                np.asarray(self._gsv[idx], dtype=np.float32),
+            )
+            hand = h.astype(np.float32)
+            calls = c.astype(np.float32)
+            disc = d.astype(np.float32)
+            gsv = g.astype(np.float32)
         return {
-            'hand': self.hand[idx],
-            'calls': self.calls[idx],
-            'disc': self.disc[idx],
-            'gsv': self.gsv[idx],
+            'hand': hand,
+            'calls': calls,
+            'disc': disc,
+            'gsv': gsv,
             'action_idx': int(self.action_idx[idx]),
             'tile_idx': int(self.tile_idx[idx]),
             'return': float(self.returns[idx]),
@@ -260,6 +345,7 @@ def train_ppo(
     embedding_dim: int = 16,
     kl_threshold: float | None = 0.008,
     patience: int = 0,
+    low_mem_mode: bool = False,
     # Runtime/loader tuning
     os_hint: str | None = None,
     start_method: str | None = None,
@@ -294,8 +380,16 @@ def train_ppo(
         try:
             player = ACPlayer.from_directory(init_model)
             net = player.network
+            # Ensure loaded network is moved to the chosen device (cpu/cuda/mps)
+            net = net.to(dev)
             model = net.torch_module
-            ds = ACDataset(dataset_path, net, fit_scaler=False) # in the future we can always fit scaler to fit new distribution
+            ds = ACDataset(
+                dataset_path,
+                net,
+                fit_scaler=False,
+                precompute_features=not low_mem_mode,
+                mmap=low_mem_mode,
+            )  # in the future we can always fit scaler to fit new distribution
             print(f"Loaded initial weights from {init_model}")
         except Exception as e:
             raise ValueError(f"Warning: failed to load init model '{init_model}': {e}")
@@ -308,7 +402,13 @@ def train_ppo(
         player = ACPlayer(gsv_scaler=gsv_scaler, network=net)
 
         model = net.torch_module
-        ds = ACDataset(dataset_path, net, fit_scaler=True)
+        ds = ACDataset(
+            dataset_path,
+            net,
+            fit_scaler=True,
+            precompute_features=not low_mem_mode,
+            mmap=low_mem_mode,
+        )
     # Build train/validation split
     n = len(ds)
     k = int(max(0, min(n, round(float(val_split) * n))))
@@ -329,6 +429,12 @@ def train_ppo(
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
     )
+    if low_mem_mode:
+        # Force conservative settings to minimize RAM
+        resolved['dl_workers'] = 0
+        resolved['pin_memory'] = False
+        resolved['prefetch_factor'] = 1
+        resolved['persistent_workers'] = False
     dl = DataLoader(
         ds_train,
         batch_size=batch_size,
@@ -709,15 +815,7 @@ def main():
     ap.add_argument('--warm_up_max_epochs', type=int, default=50, help='Maximum warm-up epochs before switching even if threshold not reached')
     ap.add_argument('--hidden_size', type=int, default=128, help='Hidden size for ACNetwork')
     ap.add_argument('--embedding_dim', type=int, default=16, help='Embedding dimension for ACNetwork')
-    # Cross-platform/runtime tuning
-    ap.add_argument('--os', dest='os_hint', type=str, default='auto', choices=['auto', 'windows', 'mac', 'linux'], help='Target OS to tune runtime defaults (auto-detect by default)')
-    ap.add_argument('--start_method', type=str, default=None, choices=['spawn', 'fork', 'forkserver'], help='Multiprocessing start method override')
-    ap.add_argument('--torch_threads', type=int, default=None, help='Torch intra-op threads')
-    ap.add_argument('--interop_threads', type=int, default=None, help='Torch inter-op threads')
-    ap.add_argument('--dl_workers', type=int, default=None, help='DataLoader workers')
-    ap.add_argument('--pin_memory', type=str, default=None, choices=['true', 'false'], help='Enable pin_memory for DataLoader (true/false)')
-    ap.add_argument('--prefetch_factor', type=int, default=None, help='Prefetch factor per worker for DataLoader (>0)')
-    ap.add_argument('--persistent_workers', type=str, default=None, choices=['true', 'false'], help='Keep DataLoader workers alive between epochs')
+    ap.add_argument('--low_mem_mode', action='store_true', help='Reduce RAM usage: no precompute, memmap dataset, workers=0, no pin_memory/persistence, prefetch=1')
     args = ap.parse_args()
 
     train_ppo(
@@ -736,14 +834,7 @@ def main():
         embedding_dim=args.embedding_dim,
         kl_threshold=args.kl_threshold,
         patience=args.patience,
-        os_hint=None if args.os_hint == 'auto' else args.os_hint,
-        start_method=args.start_method,
-        torch_threads=args.torch_threads,
-        interop_threads=args.interop_threads,
-        dl_workers=args.dl_workers,
-        pin_memory=(None if args.pin_memory is None else (args.pin_memory.lower() == 'true')),
-        prefetch_factor=args.prefetch_factor,
-        persistent_workers=(None if args.persistent_workers is None else (args.persistent_workers.lower() == 'true')),
+        low_mem_mode=bool(args.low_mem_mode),
     )
 
 

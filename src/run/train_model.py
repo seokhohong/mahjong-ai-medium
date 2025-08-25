@@ -379,9 +379,7 @@ def train_ppo(
     if init_model:
         try:
             player = ACPlayer.from_directory(init_model)
-            net = player.network
-            # Ensure loaded network is moved to the chosen device (cpu/cuda/mps)
-            net = net.to(dev)
+            net = player.network.to(dev)
             model = net.torch_module
             ds = ACDataset(
                 dataset_path,

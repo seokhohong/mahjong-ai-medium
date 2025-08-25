@@ -299,6 +299,21 @@ def _compute_losses(
         print(f"Advantage stats: mean={a_mean:.6f}, std={a_std:.6f}")
         print(f"Joint clipped: {clip_rate:.3f}")
 
+    # Value-only path: train only the value head/trunk via value regression
+    if mode == 'value':
+        policy_loss = torch.zeros((), device=val.device, dtype=val.dtype)
+        value_loss = F.mse_loss(val, returns)
+        total = value_loss  # only value
+        dbg = {
+            'bsz': batch_size_curr,
+            'ratio_sum': 0.0,
+            'ratio_sumsq': 0.0,
+            'adv_sum': 0.0,
+            'adv_sumsq': 0.0,
+            'clipped_cnt': 0,
+        }
+        return total, policy_loss, value_loss, batch_size_curr, dbg
+
     # Check for divergence earlier and more strictly based on joint ratio
     if mode == 'bc' or ratio_joint.max().item() > 5.0:
         if mode == 'ppo' and print_debug:
@@ -490,6 +505,40 @@ def train_ppo(
                 count += int(gsv.size(0))
         model.train()
         return float(correct) / float(max(1, count))
+
+    # Optional value pretraining: optimize value-only for a few epochs before warm-up/PPO
+    value_pre_epochs = int(os.environ.get('MJ_VALUE_EPOCHS', '0'))  # default 0 unless set via CLI below
+    if hasattr(train_ppo, '_value_epochs_override'):
+        value_pre_epochs = int(getattr(train_ppo, '_value_epochs_override'))
+    if value_pre_epochs > 0:
+        print(f"Starting value-only pretraining for {value_pre_epochs} epoch(s)...")
+        for ve in range(value_pre_epochs):
+            total_v = 0.0
+            total_n = 0
+            progress = tqdm(dl, desc=f"ValuePre {ve+1}/{value_pre_epochs}", leave=False)
+            for batch in progress:
+                (
+                    hand, calls, disc, gsv,
+                    action_idx, tile_idx,
+                    joint_old_log_probs,
+                    advantages, returns,
+                ) = _prepare_batch_tensors(batch, dev)
+                total_loss_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
+                    model,
+                    hand, calls, disc, gsv,
+                    action_idx, tile_idx,
+                    joint_old_log_probs,
+                    advantages, returns,
+                    mode='value',
+                )
+                opt.zero_grad(set_to_none=True)
+                total_loss_v.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                opt.step()
+                total_v += float(value_loss_v.item()) * bsz
+                total_n += int(bsz)
+                progress.set_postfix(val=f"{float(value_loss_v.item()):.4f}")
+            print(f"ValuePre {ve+1}/{value_pre_epochs} - value: {total_v/max(1,total_n):.4f}")
 
     # Optional warm-up: behavior cloning on flat action index + value regression until accuracy threshold
     if warm_up_acc and warm_up_acc > 0.0:
@@ -842,6 +891,7 @@ def main():
     ap.add_argument('--epsilon', type=float, default=0.2)
     ap.add_argument('--value_coeff', type=float, default=0.5)
     ap.add_argument('--entropy_coeff', type=float, default=0.01)
+    ap.add_argument('--value_epochs', type=int, default=0, help='Run N epochs of value-only pretraining before warm-up/PPO')
     ap.add_argument('--patience', type=int, default=0, help='Early stopping patience (number of consecutive epochs validation KL(prev||curr) must be <= --kl_threshold to stop; 0 disables)')
     ap.add_argument('--min_delta', type=float, default=1e-4, help='(Legacy/unused) Reserved for potential val-loss patience; currently ignored when using KL-based early stopping')
     ap.add_argument('--kl_threshold', type=float, default=None, help='Early stop when KL(prev||curr) on validation <= this threshold (epoch >= 1)')
@@ -856,6 +906,8 @@ def main():
     ap.add_argument('--prefetch_factor', type=int, default=None, help='DataLoader prefetch_factor when workers>0 (overrides platform defaults)')
     args = ap.parse_args()
 
+    # Pass value_epochs via a temporary attribute to avoid altering the function signature in many places
+    setattr(train_ppo, '_value_epochs_override', int(args.value_epochs))
     train_ppo(
         dataset_path=args.data,
         epochs=args.epochs,

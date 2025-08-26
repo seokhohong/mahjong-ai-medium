@@ -55,3 +55,8 @@ node_modules/
 # IDE/editor
 .vscode/
 .idea/
+
+# Allow committing artifacts in the root models/ directory
+# This overrides earlier ignores like *.pt, *.pth, *.onnx, *.pkl, *.joblib
+!models/
+!models/**

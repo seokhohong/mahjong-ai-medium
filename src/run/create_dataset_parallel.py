@@ -40,16 +40,16 @@ def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuri
     # return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
 
     temperature = 1
-    net = ACPlayer.from_directory("models/ac_ppo_20250825_214046", temperature=temperature).network
+    net = ACPlayer.from_directory("models/ac_ppo_20250825_232213", temperature=temperature).network
     import torch
     device = torch.device('cpu')
     net = net.to(device)
 
     players = [
         RecordingACPlayer(net, temperature=0.2, zero_network_reward=False),
-        RecordingACPlayer(net, temperature=0.3, zero_network_reward=False),
         RecordingACPlayer(net, temperature=0.4, zero_network_reward=False),
-        RecordingACPlayer(net, temperature=0.5, zero_network_reward=False)
+        RecordingACPlayer(net, temperature=0.6, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False)
     ]
     return players
 

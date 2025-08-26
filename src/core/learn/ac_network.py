@@ -32,7 +32,7 @@ class ACNetwork:
     All heads share the same feature extractor from inputs to the pre-head layer.
     """
 
-    def __init__(self, gsv_scaler: StandardScaler | None, hidden_size: int = 128, embedding_dim: int = 4):
+    def __init__(self, gsv_scaler: StandardScaler | None, hidden_size: int = 128, embedding_dim: int = 16):
         self.hidden_size = hidden_size
         self.embedding_dim = embedding_dim
         if gsv_scaler is None:

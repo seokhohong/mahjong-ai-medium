@@ -31,18 +31,21 @@ def run_train_loop(
     epochs: int,
     batch_size: int,
     lr: float,
+    value_lr: Optional[float],
     epsilon: float,
     value_coeff: float,
     entropy_coeff: float,
+    bc_fallback_ratio: float,
     patience: int,
     min_delta: float,
     val_split: float,
+    warm_up_acc: float,
     warm_up_max_epochs: int,
+    warm_up_value: bool,
     hidden_size: int,
     embedding_dim: int,
     kl_threshold: Optional[float],
     value_epochs: int,
-    low_mem_mode: bool,
     # runtime/train tuning
     device: Optional[str] = None,
     os_hint: Optional[str] = None,
@@ -109,14 +112,18 @@ def run_train_loop(
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
+            value_lr=value_lr,
             epsilon=epsilon,
             value_coeff=value_coeff,
             entropy_coeff=entropy_coeff,
+            bc_fallback_ratio=bc_fallback_ratio,
             device=device,
             patience=patience,
             val_split=val_split,
             init_model=current_model_dir,
+            warm_up_acc=warm_up_acc,
             warm_up_max_epochs=warm_up_max_epochs,
+            warm_up_value=warm_up_value,
             hidden_size=hidden_size,
             embedding_dim=embedding_dim,
             kl_threshold=kl_threshold,
@@ -158,13 +165,17 @@ def main() -> str:
     ap.add_argument('--epochs', type=int, default=10)
     ap.add_argument('--batch_size', type=int, default=1024)
     ap.add_argument('--lr', type=float, default=3e-4)
+    ap.add_argument('--value_lr', type=float, default=None, help='Learning rate for value pretraining (defaults to --lr if not specified)')
     ap.add_argument('--epsilon', type=float, default=0.2)
     ap.add_argument('--value_coeff', type=float, default=0.5)
     ap.add_argument('--entropy_coeff', type=float, default=0.01)
+    ap.add_argument('--bc_fallback_ratio', type=float, default=5.0, help='Ratio threshold for falling back to BC mode during PPO training')
     ap.add_argument('--patience', type=int, default=5)
     ap.add_argument('--min_delta', type=float, default=1e-4)
     ap.add_argument('--val_split', type=float, default=0.1)
+    ap.add_argument('--warm_up_acc', type=float, default=0.0, help='Accuracy threshold to reach with behavior cloning before switching to PPO (0 disables)')
     ap.add_argument('--warm_up_max_epochs', type=int, default=50)
+    ap.add_argument('--warm_up_value', action='store_true', help='Enable value network training during warm-up BC phase')
     ap.add_argument('--hidden_size', type=int, default=128)
     ap.add_argument('--embedding_dim', type=int, default=16)
     ap.add_argument('--kl_threshold', type=float, default=0.008, help='KL divergence threshold for early stopping')
@@ -196,18 +207,21 @@ def main() -> str:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        value_lr=args.value_lr,
         epsilon=args.epsilon,
         value_coeff=args.value_coeff,
         entropy_coeff=args.entropy_coeff,
+        bc_fallback_ratio=args.bc_fallback_ratio,
         patience=args.patience,
         min_delta=float(args.min_delta),
         val_split=float(args.val_split),
+        warm_up_acc=args.warm_up_acc,
         warm_up_max_epochs=args.warm_up_max_epochs,
+        warm_up_value=args.warm_up_value,
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
         kl_threshold=args.kl_threshold,
         value_epochs=args.value_epochs,
-        low_mem_mode=args.low_mem_mode,
         device=args.device,
         os_hint=None if args.os_hint == 'auto' else args.os_hint,
         start_method=args.start_method,

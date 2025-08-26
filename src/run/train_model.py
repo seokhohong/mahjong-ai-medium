@@ -97,16 +97,11 @@ class ACDataset(Dataset):
         self._gsv = data['game_state']
         self.action_idx = data['action_idx']
         self.tile_idx = data['tile_idx']
+        self.game_ids = data['game_ids']
         # Load returns/advantages
         self.returns = data['returns'].astype(np.float32)
         self.advantages = data['advantages'].astype(np.float32)
-        if 'joint_log_probs' in data.files:
-            self.joint_old_log_probs = data['joint_log_probs'].astype(np.float32)
-        else:
-            # Backward compatibility with datasets that stored separate head log-probs
-            a_lp = data['action_log_probs'].astype(np.float32)
-            t_lp = data['tile_log_probs'].astype(np.float32)
-            self.joint_old_log_probs = (a_lp + t_lp).astype(np.float32)
+        self.joint_old_log_probs = data['joint_log_probs'].astype(np.float32)
 
         # Fit the standard scaler so we can properly use extract_features
         if fit_scaler:
@@ -144,6 +139,42 @@ class ACDataset(Dataset):
             self.calls = None  # type: ignore
             self.disc = None  # type: ignore
             self.gsv = None  # type: ignore
+
+    def train_val_subsets_by_game(self, val_frac: float, *, seed: int | None = None) -> tuple[Subset, Subset] | tuple[Subset, None]:
+        """Return train/validation Subset(s) grouped by game.
+
+        - Ensures that all samples from the same game_id are placed entirely in either train or validation.
+        - If `val_frac <= 0`, returns (train_subset, None).
+        - Requires that the dataset npz include a `game_ids` array; otherwise raises a ValueError.
+        """
+        import numpy as _np
+        if val_frac <= 0.0:
+            # No validation split requested
+            return Subset(self, list(range(len(self)))), None
+
+        if self.game_ids is None:
+            raise ValueError("ACDataset: game_ids not found in dataset; cannot split by game. Please regenerate dataset with 'game_ids'.")
+
+        game_ids_arr = _np.asarray(self.game_ids)
+        unique_games = _np.unique(game_ids_arr)
+        if unique_games.size == 0:
+            # Degenerate case; treat as no validation
+            return Subset(self, list(range(len(self)))), None
+
+        rng = _np.random.default_rng(seed)
+        perm_games = rng.permutation(unique_games)
+        k_val = int(round(float(unique_games.size) * float(max(0.0, min(1.0, val_frac)))))
+        k_val = int(max(0, min(unique_games.size, k_val)))
+
+        val_games = set(perm_games[:k_val].tolist()) if k_val > 0 else set()
+
+        train_indices = [int(i) for i, gid in enumerate(game_ids_arr) if gid not in val_games]
+        val_indices = [int(i) for i, gid in enumerate(game_ids_arr) if gid in val_games]
+        # removed guard against empty splits since we expect the dataset to be large enough
+
+        ds_train = Subset(self, train_indices)
+        ds_val = Subset(self, val_indices) if len(val_indices) > 0 else None
+        return ds_train, ds_val
 
     def __len__(self) -> int:
         return int(len(self._hand_idx))
@@ -237,6 +268,89 @@ def safe_entropy_calculation(probs, min_prob=1e-8):
 
     return entropy
 
+def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val, dev: torch.device, bc_fallback_ratio: float, description: str = ""):
+    """Evaluate model performance on the combined train+validation dataset with weighted averaging."""
+    model.eval()
+    
+    # Combine datasets with proper weighting
+    datasets = []
+    weights = []
+    
+    if dl_train is not None:
+        datasets.append(('train', dl_train))
+        weights.append(len(dl_train.dataset))
+    
+    if dl_val is not None:
+        datasets.append(('validation', dl_val))
+        weights.append(len(dl_val.dataset))
+    
+    if not datasets:
+        print(f"[{description}] No datasets available for evaluation")
+        return
+    
+    total_weight = sum(weights)
+    
+    # Accumulate metrics across all datasets
+    total_loss = total_policy_loss = total_value_loss = 0.0
+    total_samples = total_correct = 0
+    
+    with torch.no_grad():
+        for (dataset_name, dataloader), weight in zip(datasets, weights):
+            dataset_loss = dataset_policy = dataset_value = 0.0
+            dataset_samples = dataset_correct = 0
+            
+            for batch in dataloader:
+                (hand, calls, disc, gsv, action_idx, tile_idx, 
+                 joint_old_log_probs, advantages, returns) = _prepare_batch_tensors(batch, dev)
+                
+                # Compute losses
+                total_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
+                    model, hand, calls, disc, gsv, action_idx, tile_idx,
+                    joint_old_log_probs, advantages, returns,
+                    bc_fallback_ratio=bc_fallback_ratio,
+                    bc_weight=0.0, policy_weight=1.0,
+                )
+                
+                # Compute accuracy
+                a_logits, t_logits, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                pred_a = torch.argmax(a_logits, dim=1)
+                pred_t = torch.argmax(t_logits, dim=1)
+                both_correct = (pred_a == action_idx) & (pred_t == tile_idx)
+                
+                # Accumulate for this dataset
+                dataset_loss += float(total_v.item()) * bsz
+                dataset_policy += float(policy_loss_v.item()) * bsz
+                dataset_value += float(value_loss_v.item()) * bsz
+                dataset_samples += bsz
+                dataset_correct += int(both_correct.sum().item())
+            
+            # Weight this dataset's contribution
+            dataset_weight_factor = weight / total_weight
+            total_loss += (dataset_loss / max(1, dataset_samples)) * dataset_weight_factor
+            total_policy_loss += (dataset_policy / max(1, dataset_samples)) * dataset_weight_factor
+            total_value_loss += (dataset_value / max(1, dataset_samples)) * dataset_weight_factor
+            total_samples += dataset_samples
+            total_correct += dataset_correct
+            
+            print(f"[{description}] {dataset_name}: loss={dataset_loss/max(1,dataset_samples):.4f} | "
+                  f"policy={dataset_policy/max(1,dataset_samples):.4f} | "
+                  f"value={dataset_value/max(1,dataset_samples):.4f} | "
+                  f"acc={dataset_correct/max(1,dataset_samples):.4f} | samples={dataset_samples}")
+    
+    # Overall weighted metrics
+    overall_acc = total_correct / max(1, total_samples)
+    print(f"[{description}] COMBINED: loss={total_loss:.4f} | policy={total_policy_loss:.4f} | "
+          f"value={total_value_loss:.4f} | acc={overall_acc:.4f} | total_samples={total_samples}")
+    
+    model.train()
+    return {
+        'total_loss': total_loss,
+        'policy_loss': total_policy_loss, 
+        'value_loss': total_value_loss,
+        'accuracy': overall_acc,
+        'total_samples': total_samples
+    }
+
 def _compute_losses(
         model: torch.nn.Module,
         hand: torch.Tensor,
@@ -249,11 +363,12 @@ def _compute_losses(
         advantages: torch.Tensor,
         returns: torch.Tensor,
         *,
-        mode: str = 'ppo',
         epsilon: float = 0.2,
         value_coeff: float = 0.5,
         entropy_coeff: float = 0.01,
         bc_fallback_ratio: float = 5.0,
+        bc_weight: float = 0.0,
+        policy_weight: float = 1.0,
         print_debug: bool = False,
 ):
     a_pp, t_pp, val = model(hand.float(), calls.float(), disc.float(), gsv.float())
@@ -280,6 +395,7 @@ def _compute_losses(
 
     # Prepare lightweight debug aggregates for epoch-level reporting
     # We return sums to enable exact aggregation across variable batch sizes
+    _max_ratio = float(ratio_joint.max().item())
     dbg = {
         'bsz': batch_size_curr,
         'ratio_sum': float(ratio_joint.sum().item()),
@@ -287,6 +403,9 @@ def _compute_losses(
         'adv_sum': float(advantages.sum().item()),
         'adv_sumsq': float((advantages * advantages).sum().item()),
         'clipped_cnt': int(((ratio_joint < (1 - epsilon)) | (ratio_joint > (1 + epsilon))).sum().item()),
+        # Added: track BC fallback usage for this batch and the max ratio observed
+        'bc_fallback_used': False,
+        'max_ratio': _max_ratio,
     }
     if print_debug:
         r_mean = dbg['ratio_sum'] / max(1, dbg['bsz'])
@@ -300,11 +419,11 @@ def _compute_losses(
         print(f"Advantage stats: mean={a_mean:.6f}, std={a_std:.6f}")
         print(f"Joint clipped: {clip_rate:.3f}")
 
-    # Value-only path: train only the value head/trunk via value regression
-    if mode == 'value':
+    # Value-only path: when both policy weights are 0, train only the value head
+    if (bc_weight == 0.0) and (policy_weight == 0.0):
         policy_loss = torch.zeros((), device=val.device, dtype=val.dtype)
         value_loss = F.mse_loss(val, returns)
-        total = value_loss  # only value
+        total = value_loss
         dbg = {
             'bsz': batch_size_curr,
             'ratio_sum': 0.0,
@@ -312,41 +431,41 @@ def _compute_losses(
             'adv_sum': 0.0,
             'adv_sumsq': 0.0,
             'clipped_cnt': 0,
+            'bc_fallback_used': False,
+            'max_ratio': 0.0,
         }
         return total, policy_loss, value_loss, batch_size_curr, dbg
 
-    # Check for divergence earlier and more strictly based on joint ratio
-    if mode == 'bc' or mode == 'bc_policy_only' or ratio_joint.max().item() > bc_fallback_ratio:
-        if mode == 'ppo' and print_debug:
-            print(f"Switching to BC mode due to high joint ratio: {ratio_joint.max().item():.2f}")
+    # Compute BC policy loss (NLL on current logits)
+    log_a = (a_pp.clamp_min(1e-8)).log()
+    log_t = (t_pp.clamp_min(1e-8)).log()
+    bc_loss_a = F.nll_loss(log_a, action_idx.to(dtype=torch.long, device=a_pp.device))
+    bc_loss_t = F.nll_loss(log_t, tile_idx.to(dtype=torch.long, device=t_pp.device))
+    bc_policy_loss = bc_loss_a + bc_loss_t
 
-        log_a = (a_pp.clamp_min(1e-8)).log()
-        log_t = (t_pp.clamp_min(1e-8)).log()
-        policy_loss_a = F.nll_loss(log_a, action_idx.to(dtype=torch.long, device=a_pp.device))
-        policy_loss_t = F.nll_loss(log_t, tile_idx.to(dtype=torch.long, device=t_pp.device))
-        policy_loss = policy_loss_a + policy_loss_t
-
-        # Add entropy even in BC mode to maintain exploration
-        entropy_a = safe_entropy_calculation(a_pp)
-        entropy_t = safe_entropy_calculation(t_pp)
-        entropy = entropy_a + entropy_t
-
-        # For bc_policy_only mode, exclude value loss completely
-        if mode == 'bc_policy_only':
-            total = policy_loss - entropy_coeff * entropy
-            return total, policy_loss, torch.zeros_like(policy_loss), batch_size_curr, dbg
-        else:
-            # Regular BC mode includes value loss
-            value_loss = F.mse_loss(val, returns)
-            total = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
-            return total, policy_loss, value_loss, batch_size_curr, dbg
-
+    # Compute PPO policy loss (clipped surrogate on joint ratio)
     clipped_ratio = torch.clamp(ratio_joint, 1 - epsilon, 1 + epsilon)
-    policy_loss = -torch.min(
+    ppo_policy_loss = -torch.min(
         ratio_joint * advantages,
         clipped_ratio * advantages
     ).mean()
 
+    # Active weights
+    bw = float(bc_weight)
+    pw = float(policy_weight)
+
+    # Fallback to BC when ratios explode and PPO component is active
+    if (pw > 0.0) and (_max_ratio > bc_fallback_ratio):
+        if print_debug:
+            print(f"Switching weights to BC due to high joint ratio: {_max_ratio:.2f}")
+        # use 10% BC weight to prevent gradient shock
+        bw, pw = 0.1, 0.0
+        dbg['bc_fallback_used'] = True
+
+    # Mix policy losses
+    policy_loss = bw * bc_policy_loss + pw * ppo_policy_loss
+
+    # Value and entropy terms
     value_loss = F.mse_loss(val, returns)
     entropy_a = safe_entropy_calculation(a_pp)
     entropy_t = safe_entropy_calculation(t_pp)
@@ -396,8 +515,8 @@ def _run_value_pretraining(
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages, returns,
-                mode='value',
                 bc_fallback_ratio=bc_fallback_ratio,
+                bc_weight=0.0, policy_weight=0.0,
             )
             value_opt.zero_grad(set_to_none=True)
             total_loss_v.backward()
@@ -431,8 +550,8 @@ def _run_value_pretraining(
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
-                        mode='value',
                         bc_fallback_ratio=bc_fallback_ratio,
+                        bc_weight=0.0, policy_weight=0.0,
                     )
                     validation_total_v += float(value_loss_v.item()) * bsz
                     validation_total_n += int(bsz)
@@ -515,8 +634,6 @@ def _run_warmup_bc(
                 returns,
             ) = _prepare_batch_tensors(batch, dev)
 
-            # Choose mode based on warm_up_value setting
-            mode = 'bc' if warm_up_value else 'bc_policy_only'
             loss, policy_loss, value_loss, _, _dbg = _compute_losses(
                 model,
                 hand, calls, disc, gsv,
@@ -524,9 +641,9 @@ def _run_warmup_bc(
                 joint_old_log_probs,
                 advantages,
                 returns,
-                mode=mode,
                 value_coeff=value_coeff if warm_up_value else 0.0,
                 bc_fallback_ratio=bc_fallback_ratio,
+                bc_weight=1.0, policy_weight=0.0,
             )
 
             warmup_opt.zero_grad()
@@ -550,10 +667,20 @@ def _run_warmup_bc(
                 correct += int(both.sum().item())
                 if was_training:
                     model.train()
-            progress.set_postfix(loss=f"{float(loss.item()):.4f}", pol=f"{float(policy_loss.item()):.4f}", value=f"{float(value_loss.item()):.4f}")
+            # Show running averages to reduce noise
+            denom = max(1, total_examples)
+            progress.set_postfix(
+                loss=f"{(total_loss/denom):.4f}",
+                pol=f"{(pol_loss_acc/denom):.4f}",
+                value=f"{(value_loss_acc/denom):.4f}"
+            )
 
-        # Calculate train accuracy
-        train_acc = (correct / max(1, total_examples))
+        # Calculate train metrics (averaged)
+        train_denominator = max(1, total_examples)
+        train_acc = (correct / train_denominator)
+        train_total_avg = (total_loss / train_denominator)
+        train_policy_avg = (pol_loss_acc / train_denominator)
+        train_value_avg = (value_loss_acc / train_denominator)
 
         # Calculate validation accuracy if available
         validation_acc = None
@@ -578,9 +705,9 @@ def _run_warmup_bc(
                         joint_old_log_probs,
                         advantages,
                         returns,
-                        mode='bc',
                         value_coeff=value_coeff,
                         bc_fallback_ratio=bc_fallback_ratio,
+                        bc_weight=1.0, policy_weight=0.0,
                     )
                     bsz = int(gsv.size(0))
                     validation_total += float(loss_v.item()) * bsz
@@ -597,12 +724,12 @@ def _run_warmup_bc(
             print(f"\nWarmUp {epoch+1} [validation] - total: {validation_total/validation_denominator:.4f} | policy: {validation_pol/validation_denominator:.4f} | value: {validation_value/validation_denominator:.4f} | acc: {validation_acc:.4f}")
             model.train()
 
-        # Display both train and validation accuracy
+        # Display both train and validation metrics
         if validation_acc is not None:
-            print(f"WarmUp {epoch+1} [train] - acc: {train_acc:.4f}")
+            print(f"WarmUp {epoch+1} [train] - total: {train_total_avg:.4f} | policy: {train_policy_avg:.4f} | value: {train_value_avg:.4f} | acc: {train_acc:.4f}")
             epoch_acc = validation_acc  # Use validation accuracy for threshold checking
         else:
-            print(f"WarmUp {epoch+1} [train] - acc: {train_acc:.4f}")
+            print(f"WarmUp {epoch+1} [train] - total: {train_total_avg:.4f} | policy: {train_policy_avg:.4f} | value: {train_value_avg:.4f} | acc: {train_acc:.4f}")
             epoch_acc = train_acc
 
         if epoch_acc >= threshold:
@@ -639,6 +766,9 @@ def _run_ppo_training(
     # Track consecutive epochs where joint KL(prev||curr) <= threshold (when enabled)
     kl_below_count: int = 0
     
+    # Track overall BC fallback usage across all training epochs
+    overall_bc_batches = 0
+    overall_total_batches = 0
     for epoch in range(epochs):
         total_loss = 0.0
         total_examples = 0
@@ -653,6 +783,9 @@ def _run_ppo_training(
         dbg_adv_sumsq = 0.0
         dbg_clipped = 0
         dbg_count = 0
+        # Epoch-level BC fallback counters
+        epoch_bc_batches = 0
+        epoch_total_batches = 0
         for bi, batch in enumerate(progress):
             tensors = _prepare_batch_tensors(batch, dev)
             (
@@ -668,11 +801,12 @@ def _run_ppo_training(
                 model, hand, calls, disc, gsv,
                 action_idx, tile_idx,
                 joint_old_log_probs,
-                advantages, returns, mode='ppo',
+                advantages, returns,
                 epsilon=epsilon,
                 value_coeff=value_coeff,
                 entropy_coeff=entropy_coeff,
                 bc_fallback_ratio=bc_fallback_ratio,
+                bc_weight=0.0, policy_weight=1.0,
                 print_debug=False,
             )
 
@@ -694,11 +828,18 @@ def _run_ppo_training(
             dbg_adv_sumsq += dbg['adv_sumsq']
             dbg_clipped += int(dbg['clipped_cnt'])
             dbg_count += int(dbg['bsz'])
-            # Per-batch progress like Keras
+            # Count BC fallback usage at batch granularity
+            epoch_total_batches += 1
+            overall_total_batches += 1
+            if bool(dbg.get('bc_fallback_used', False)):
+                epoch_bc_batches += 1
+                overall_bc_batches += 1
+            # Show running averages to reduce noise
+            denom = max(1, total_examples)
             progress.set_postfix(
-                loss=f"{float(total.item()):.4f}",
-                pol=f"{float(policy_loss.item()):.4f}",
-                val=f"{float(value_loss.item()):.4f}"
+                loss=f"{(total_loss/denom):.4f}",
+                pol=f"{(total_policy_loss/denom):.4f}",
+                value=f"{(total_value_loss/denom):.4f}"
             )
 
         # End-of-epoch debug summary (averages over training epoch)
@@ -711,6 +852,10 @@ def _run_ppo_training(
             a_std = math.sqrt(a_var)
             clip_rate = dbg_clipped / max(1, dbg_count)
             print(f"Epoch {epoch + 1}/{epochs} [train dbg] - ratio_mean={r_mean:.4f} | ratio_std={r_std:.4f} | clipped={clip_rate:.3f}")
+        # Report BC fallback fraction for this epoch
+        if epoch_total_batches > 0:
+            frac_bc = epoch_bc_batches / float(epoch_total_batches)
+            print(f"Epoch {epoch + 1}/{epochs} [train dbg] - BC fallback batches: {epoch_bc_batches}/{epoch_total_batches} ({frac_bc:.3f})")
 
         # Evaluate on holdout set
         validation_avg_joint_kl_prev_curr = None
@@ -742,6 +887,7 @@ def _run_ppo_training(
                         value_coeff=value_coeff,
                         entropy_coeff=entropy_coeff,
                         bc_fallback_ratio=bc_fallback_ratio,
+                        bc_weight=0.0, policy_weight=1.0,
                     )
 
                     # Compute current probs
@@ -815,6 +961,10 @@ def _run_ppo_training(
                     )
                     break
 
+    # Final overall BC fallback usage summary
+    if overall_total_batches > 0:
+        overall_frac = overall_bc_batches / float(overall_total_batches)
+        print(f"Overall BC fallback batches: {overall_bc_batches}/{overall_total_batches} ({overall_frac:.3f})")
     return timestamp
 
 
@@ -884,6 +1034,16 @@ def train_ppo(
                 mmap=True,
             )  # in the future we can always fit scaler to fit new distribution
             print(f"Loaded initial weights from {init_model}")
+            '''
+            # Evaluate loaded model performance on dataset
+            print("\n" + "="*80)
+            print("LOADED MODEL EVALUATION")
+            print("="*80)
+            dl_temp, dl_val_temp = _create_dataloaders(ds, batch_size, val_split, dl_workers, prefetch_factor)
+            _evaluate_model_on_combined_dataset(model, dl_temp, dl_val_temp, dev, bc_fallback_ratio, "POST-LOAD")
+            print("="*80)
+            '''
+            
         except Exception as e:
             raise ValueError(f"Warning: failed to load init model '{init_model}': {e}")
     else:
@@ -902,18 +1062,9 @@ def train_ppo(
             precompute_features=False,
             mmap=True,
         )
-    # Build train/validation split
-    n = len(ds)
-    k = int(max(0, min(n, round(float(val_split) * n))))
-    if k > 0 and n > 1:
-        idx = np.random.permutation(n)
-        val_idx = idx[:k].tolist()
-        train_idx = idx[k:].tolist()
-        ds_train = Subset(ds, train_idx) if len(train_idx) > 0 else ds
-        ds_val = Subset(ds, val_idx)
-    else:
-        ds_train = ds
-        ds_val = None
+    # Build train/validation split by game_ids to avoid leakage
+    ds_train, ds_val = ds.train_val_subsets_by_game(val_split)
+
     # Determine DataLoader worker defaults based on platform if not provided
     resolved = _resolve_loader_defaults(
         os_hint=os_hint,
@@ -934,8 +1085,8 @@ def train_ppo(
         drop_last=False,
         num_workers=resolved['dl_workers'],
         pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
-        prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
-        persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
+        prefetch_factor=None,
+        persistent_workers=False,
     )
     dl_val = (
         DataLoader(
@@ -945,12 +1096,10 @@ def train_ppo(
             drop_last=False,
             num_workers=resolved['dl_workers'],
             pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
-            prefetch_factor=resolved['prefetch_factor'] if resolved['dl_workers'] > 0 else None,
-            persistent_workers=resolved['persistent_workers'] if resolved['dl_workers'] > 0 else False,
-        )
-        if ds_val is not None else None
+            prefetch_factor=None,
+            persistent_workers=False,
+        ) if ds_val is not None else None
     )
-    model.train()
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -962,7 +1111,13 @@ def train_ppo(
 
     # Main PPO training loop
     timestamp = _run_ppo_training(model, dl, dl_val, dev, opt, epochs, epsilon, value_coeff, entropy_coeff, kl_threshold, patience, bc_fallback_ratio)
-
+    '''
+    # Evaluate final model performance on combined dataset before saving
+    print("\n" + "="*80)
+    print("FINAL MODEL EVALUATION BEFORE SAVING")
+    print("="*80)
+    _evaluate_model_on_combined_dataset(model, dl, dl_val, dev, bc_fallback_ratio, "PRE-SAVE")
+    '''
     # Save trained weights and scaler
     out_dir = os.path.join(os.getcwd(), 'models')
     os.makedirs(out_dir, exist_ok=True)

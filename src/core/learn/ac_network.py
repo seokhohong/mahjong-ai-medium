@@ -32,11 +32,9 @@ class ACNetwork:
     All heads share the same feature extractor from inputs to the pre-head layer.
     """
 
-    def __init__(self, gsv_scaler: StandardScaler | None, hidden_size: int = 128, embedding_dim: int = 4,
-                 temperature: float = 1.0):
+    def __init__(self, gsv_scaler: StandardScaler | None, hidden_size: int = 128, embedding_dim: int = 4):
         self.hidden_size = hidden_size
         self.embedding_dim = embedding_dim
-        self.temperature = float(max(0.0, temperature))
         if gsv_scaler is None:
             print("Warning, instantiating ACNetwork with null StandardScaler")
             self._gsv_scaler = StandardScaler()
@@ -90,18 +88,19 @@ class ACNetwork:
                     nn.ReLU(),
                     nn.Dropout(0.3),
                 )
+                # value trunk overfits so it should be smaller
                 self.value_trunk = nn.Sequential(
-                    nn.Linear(input_dim, outer.hidden_size),
+                    nn.Linear(input_dim, outer.hidden_size // 2),
                     nn.ReLU(),
                     nn.Dropout(0.3),
-                    nn.Linear(outer.hidden_size, outer.hidden_size // 2),
+                    nn.Linear(outer.hidden_size // 2, outer.hidden_size // 4),
                     nn.ReLU(),
                     nn.Dropout(0.3),
                 )
                 # Heads: two-head policy (action, tile) + value
                 self.head_action = nn.Linear(outer.hidden_size // 2, int(ACTION_HEAD_SIZE))
                 self.head_tile = nn.Linear(outer.hidden_size // 2, int(TILE_HEAD_SIZE))
-                self.head_value = nn.Linear(outer.hidden_size // 2, 1)
+                self.head_value = nn.Linear(outer.hidden_size // 4, 1)
 
             def forward(self, hand_seq: torch.Tensor, calls_seq: torch.Tensor, disc_seq: torch.Tensor, gsv: torch.Tensor):
                 # hand_seq: (batch_size, embedding_dim, hand_len)

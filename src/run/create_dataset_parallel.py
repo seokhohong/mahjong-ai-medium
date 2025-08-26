@@ -5,10 +5,8 @@ import os
 import sys
 import time
 import argparse
-import importlib.util
 import multiprocessing as mp
 import gc
-import psutil
 import queue as pyqueue
 from contextlib import contextmanager
 from typing import Dict, Any, List, Tuple
@@ -16,33 +14,239 @@ from typing import Dict, Any, List, Tuple
 import numpy as np
 
 
-# Memory monitoring utilities
-def get_memory_usage():
-    """Get current memory usage in MB"""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
-
-
-def log_memory(stage: str, verbose: bool = True):
-    """Log current memory usage"""
-    if verbose:
-        mem_mb = get_memory_usage()
-        print(f"[MEMORY] {stage}: {mem_mb:.1f} MB")
+# (Removed memory monitoring utilities)
 
 
 # Ensure src on path (parent of this file is the src directory)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-# Dynamically load sibling create_dataset.py to reuse its functions without requiring run/ as a package
-_CD_PATH = os.path.join(os.path.dirname(__file__), 'create_dataset.py')
-_spec = importlib.util.spec_from_file_location("_create_dataset_module", _CD_PATH)
-assert _spec and _spec.loader
-_cd_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_cd_mod)  # type: ignore[arg-type]
-build_ac_dataset = getattr(_cd_mod, 'build_ac_dataset')
-save_dataset = getattr(_cd_mod, 'save_dataset')
+# Direct imports for dataset building
+from core.game import MediumJong
+from core.learn.recording_ac_player import RecordingACPlayer, RecordingHeuristicACPlayer, ACPlayer
+from core import constants
+from tqdm import tqdm
 
-# No direct player imports needed here; players are managed inside build_ac_dataset
+# --- Inlined utilities from create_dataset.py ---
+from typing import Optional, Sequence
+
+# =========================
+# In-code configuration
+# =========================
+# Edit this factory to define a fixed set of players to use for dataset creation.
+# Return a list of 4 Recording* players, or return None to disable and fall back
+# to CLI options (e.g., --use_heuristic).
+def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuristicACPlayer]]:
+    # Example: use heuristic players (uncomment to enable)
+    # return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
+
+    temperature = 1
+    net = ACPlayer.from_directory("models/ac_ppo_20250825_214046", temperature=temperature).network
+    import torch
+    device = torch.device('cpu')
+    net = net.to(device)
+
+    players = [
+        RecordingACPlayer(net, temperature=0.2, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.3, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.4, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.5, zero_network_reward=False)
+    ]
+    return players
+
+def compute_n_step_returns(
+    rewards: List[float],
+    n_step: int,
+    gamma: float,
+    values: List[float],
+) -> Tuple[List[float], List[float]]:
+    """Compute n-step discounted returns and advantages for a single trajectory.
+
+    Returns a tuple (returns, advantages), where advantages = returns - values_t.
+
+    G_t = sum_{k=0..n-1} gamma^k * r_{t+k}, truncated at episode end.
+    """
+    T = len(rewards)
+    n = max(1, int(n_step))
+    g = float(gamma)
+    returns: List[float] = [0.0] * T
+    for t in range(T):
+        acc = 0.0
+        powg = 1.0
+        for k in range(n):
+            idx = t + k
+            if idx >= T:
+                break
+            acc += powg * float(rewards[idx])
+            powg *= g
+        returns[t] = acc
+    advantages = [float(returns[t]) - float(values[t]) for t in range(T)]
+    return returns, advantages
+
+def reward_function(points_delta):
+    return points_delta / 10000.0
+
+def build_ac_dataset(
+    games: int,
+    seed: int | None = None,
+    n_step: int = 3,
+    gamma: float = 0.99,
+    prebuilt_players: Sequence[RecordingACPlayer | RecordingHeuristicACPlayer] | None = None,
+) -> dict:
+    import random
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+    else:
+        random.seed(int(time.time()))
+
+    # Accumulate per-field arrays for compact storage
+    hand_idx_list: List[np.ndarray] = []
+    disc_idx_list: List[np.ndarray] = []
+    called_idx_list: List[np.ndarray] = []
+    game_state_list: List[np.ndarray] = []
+    called_discards_list: List[np.ndarray] = []
+    action_idx_list: List[int] = []
+    tile_idx_list: List[int] = []
+    all_returns: List[float] = []
+    all_advantages: List[float] = []
+    joint_log_probs: List[float] = []
+    # Two-head policy stores separate log-probs for each head
+    all_game_ids: List[int] = []
+    all_step_ids: List[int] = []
+    all_actor_ids: List[int] = []
+    # Per-game metadata (structured only)
+    game_outcomes_obj: List[dict] = []  # serialized GameOutcome per game
+
+    # Create players once and reuse across games; clear their buffers between episodes
+    if prebuilt_players is None:
+        raise ValueError("build_ac_dataset requires prebuilt_players; configure build_prebuilt_players()")
+    players = list(prebuilt_players)
+    # Use robust tqdm settings so progress continues to render in long runs
+    for gi in tqdm(range(max(1, int(games))), dynamic_ncols=True, mininterval=0.1, miniters=1, leave=True):
+        game = MediumJong(players, tile_copies=constants.TILE_COPIES_DEFAULT)
+        game.play_round()
+
+        # Structured outcome from the game
+        outcome = game.get_game_outcome()
+        game_outcomes_obj.append(outcome.serialize())
+        # Compute terminal reward from points delta and assign directly to last reward slot
+        pts = game.get_points()
+        for pid, p in enumerate(players):
+            if len(p.experience) == 0:
+                continue
+            terminal_reward = reward_function(pts[pid])
+            p.finalize_episode(float(terminal_reward))  # type: ignore[attr-defined]
+        for pid, p in enumerate(players):
+            T = len(p.experience)
+            if T == 0:
+                continue
+            rewards = list(p.experience.rewards)
+            # Use stored values from the experience buffer
+            values: List[float] = [float(v) for v in p.experience.values]
+            nstep, adv = compute_n_step_returns(rewards, n_step, gamma, values)
+            
+            # Collect all data for this player's episode in batches
+            player_hand_idx = []
+            player_disc_idx = []
+            player_called_idx = []
+            player_game_state = []
+            player_called_discards = []
+            player_action_idx = []
+            player_tile_idx = []
+            player_returns = []
+            player_advantages = []
+            player_joint_log_probs = []
+            player_game_ids = []
+            player_step_ids = []
+            player_actor_ids = []
+            
+            for t in range(T):
+                gs = p.experience.states[t]
+                a_idx, t_idx = p.experience.actions[t]
+                # Extract raw indexed features per sample
+                player_hand_idx.append(np.asarray(gs['hand_idx'], dtype=np.int16))
+                player_disc_idx.append(np.asarray(gs['disc_idx'], dtype=np.int16))
+                player_called_idx.append(np.asarray(gs['called_idx'], dtype=np.int16))
+                player_game_state.append(np.asarray(gs['game_state'], dtype=np.float32))
+                player_called_discards.append(np.asarray(gs['called_discards'], dtype=np.int16))
+                player_action_idx.append(int(a_idx))
+                player_tile_idx.append(int(t_idx))
+                player_returns.append(float(nstep[t]))
+                player_advantages.append(float(adv[t]))
+                player_joint_log_probs.append(float(p.experience.joint_log_probs[t]))
+                player_game_ids.append(int(gi))
+                player_step_ids.append(int(t))
+                player_actor_ids.append(int(pid))
+            
+            # Use extend to add all player data at once
+            hand_idx_list.extend(player_hand_idx)
+            disc_idx_list.extend(player_disc_idx)
+            called_idx_list.extend(player_called_idx)
+            game_state_list.extend(player_game_state)
+            called_discards_list.extend(player_called_discards)
+            action_idx_list.extend(player_action_idx)
+            tile_idx_list.extend(player_tile_idx)
+            all_returns.extend(player_returns)
+            all_advantages.extend(player_advantages)
+            joint_log_probs.extend(player_joint_log_probs)
+            all_game_ids.extend(player_game_ids)
+            all_step_ids.extend(player_step_ids)
+            all_actor_ids.extend(player_actor_ids)
+            
+            # Clear experience buffers for next game
+            p.experience.clear()
+
+    # Final safety: ensure no lingering data in player buffers after batch completes
+    try:
+        import gc  # local import to keep top clean
+        for p in players:
+            if hasattr(p, 'experience') and p.experience is not None:
+                p.experience.clear()
+        # Only drop players if we created them internally (not when passed-in reusable players)
+        del players
+        gc.collect()
+    except Exception:
+        pass
+
+    return {
+        'hand_idx': np.asarray(hand_idx_list, dtype=np.int16),
+        'disc_idx': np.asarray(disc_idx_list, dtype=np.int16),
+        'called_idx': np.asarray(called_idx_list, dtype=np.int16),
+        'game_state': np.asarray(game_state_list, dtype=np.int16),
+        'called_discards': np.asarray(called_discards_list, dtype=np.int16),
+        'action_idx': np.asarray(action_idx_list, dtype=np.int16),
+        'tile_idx': np.asarray(tile_idx_list, dtype=np.int16),
+        'returns': np.asarray(all_returns, dtype=np.float32),
+        'advantages': np.asarray(all_advantages, dtype=np.float32),
+        'joint_log_probs': np.asarray(joint_log_probs, dtype=np.float32),
+        'game_ids': np.asarray(all_game_ids, dtype=np.int16),
+        'step_ids': np.asarray(all_step_ids, dtype=np.int16),
+        'actor_ids': np.asarray(all_actor_ids, dtype=np.int16),
+        # Per-game metadata
+        'game_outcomes_obj': np.asarray(game_outcomes_obj, dtype=object),
+    }
+
+def save_dataset(built, out_path):
+    # Save
+    np.savez(
+        out_path,
+        hand_idx=built['hand_idx'],
+        disc_idx=built['disc_idx'],
+        called_idx=built['called_idx'],
+        game_state=built['game_state'],
+        called_discards=built['called_discards'],
+        action_idx=built['action_idx'],
+        tile_idx=built['tile_idx'],
+        returns=built['returns'],
+        advantages=built['advantages'],
+        joint_log_probs=built['joint_log_probs'],
+        game_ids=built['game_ids'],
+        step_ids=built['step_ids'],
+        actor_ids=built['actor_ids'],
+        game_outcomes_obj=built['game_outcomes_obj'],
+    )
+ 
+    print(f"Saved AC dataset to {out_path}")
 
 
 @contextmanager
@@ -81,39 +285,29 @@ def _aggressive_cleanup():
 
 def _worker_build_with_cleanup(games: int,
                                seed: int | None,
-                               temperature: float,
-                               zero_network_reward: bool,
                                n_step: int,
                                gamma: float,
-                               use_heuristic: bool,
-                               model_path: str | None,
-                               silence_io: bool,
-                               prebuilt_players: list | None = None) -> Dict[str, Any]:
+                               silence_io: bool) -> Dict[str, Any]:
     """Build dataset with aggressive cleanup"""
+
+    # Construct prebuilt players inside the process (avoids pickling issues)
+    prebuilt_players = build_prebuilt_players()
 
     if silence_io:
         with _suppress_output():
             result = build_ac_dataset(
                 games=games,
                 seed=seed,
-                temperature=temperature,
-                zero_network_reward=zero_network_reward,
                 n_step=n_step,
                 gamma=gamma,
-                use_heuristic=use_heuristic,
-                model_path=model_path,
                 prebuilt_players=prebuilt_players,
             )
     else:
         result = build_ac_dataset(
             games=games,
             seed=seed,
-            temperature=temperature,
-            zero_network_reward=zero_network_reward,
             n_step=n_step,
             gamma=gamma,
-            use_heuristic=use_heuristic,
-            model_path=model_path,
             prebuilt_players=prebuilt_players,
         )
 
@@ -129,7 +323,7 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     total_samples = 0
     all_game_counts = []
 
-    log_memory("Starting metadata collection")
+    # Start metadata collection
 
     for path in file_paths:
         try:
@@ -143,8 +337,6 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
             print(f"Error reading {path}: {e}")
             all_game_counts.append(0)
 
-    log_memory("Metadata collection complete")
-
     if total_samples == 0:
         print("No samples found in any files")
         return
@@ -156,9 +348,6 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         offsets.append(acc)
         acc += cnt
 
-    # Pre-allocate output arrays
-    log_memory("Pre-allocating output arrays")
-
     # For object arrays, we'll collect in lists first
     hand_idx_list = []
     disc_idx_list = []
@@ -168,20 +357,19 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     outcomes_list = []
 
     # For numeric arrays, pre-allocate
-    action_idx = np.empty(total_samples, dtype=np.int64)
-    tile_idx = np.empty(total_samples, dtype=np.int64)
+    action_idx = np.empty(total_samples, dtype=np.int16)
+    tile_idx = np.empty(total_samples, dtype=np.int16)
     returns = np.empty(total_samples, dtype=np.float32)
     advantages = np.empty(total_samples, dtype=np.float32)
     joint_log_probs = np.empty(total_samples, dtype=np.float32)
-    game_ids = np.empty(total_samples, dtype=np.int32)
-    step_ids = np.empty(total_samples, dtype=np.int32)
-    actor_ids = np.empty(total_samples, dtype=np.int32)
+    game_ids = np.empty(total_samples, dtype=np.int16)
+    step_ids = np.empty(total_samples, dtype=np.int16)
+    actor_ids = np.empty(total_samples, dtype=np.int16)
 
     # Second pass: load and combine data
     sample_offset = 0
 
     for i, path in enumerate(file_paths):
-        log_memory(f"Processing file {i + 1}/{len(file_paths)}")
 
         try:
             data = np.load(path, allow_pickle=True)
@@ -224,15 +412,15 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
             print(f"Error processing {path}: {e}")
             continue
 
-    log_memory("Converting object lists to arrays")
 
-    # Convert object lists to arrays
+    # Convert object lists to arrays. The lists will be of the same dimension,
+    # avoiding the need to store them as objects
     combined = {
-        'hand_idx': np.array(hand_idx_list, dtype=object),
-        'disc_idx': np.array(disc_idx_list, dtype=object),
-        'called_idx': np.array(called_idx_list, dtype=object),
-        'game_state': np.array(game_state_list, dtype=object),
-        'called_discards': np.array(called_discards_list, dtype=object),
+        'hand_idx': np.array(hand_idx_list, dtype=np.int16),
+        'disc_idx': np.array(disc_idx_list, dtype=np.int16),
+        'called_idx': np.array(called_idx_list, dtype=np.int16),
+        'game_state': np.array(game_state_list, dtype=np.int16),
+        'called_discards': np.array(called_discards_list, dtype=np.int16),
         'action_idx': action_idx,
         'tile_idx': tile_idx,
         'returns': returns,
@@ -249,20 +437,15 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     del game_state_list, called_discards_list, outcomes_list
     _aggressive_cleanup()
 
-    log_memory("Saving combined dataset")
     save_dataset(combined, output_path)
-    log_memory("Save complete")
+    # Save complete
 
 
 def run_chunk_process(rank: int,
                       games_for_chunk: int,
                       seed: int | None,
-                      temperature: float,
-                      zero_network_reward: bool,
                       n_step: int,
                       gamma: float,
-                      use_heuristic: bool,
-                      model_path: str | None,
                       reporter_rank: int,
                       queue: mp.Queue,
                       run_id: str,
@@ -284,14 +467,9 @@ def run_chunk_process(rank: int,
     built = _worker_build_with_cleanup(
         games=int(max(1, games_for_chunk)),
         seed=seed,
-        temperature=temperature,
-        zero_network_reward=bool(zero_network_reward),
         n_step=int(n_step),
         gamma=float(gamma),
-        use_heuristic=bool(use_heuristic),
-        model_path=model_path,
         silence_io=silence,
-        prebuilt_players=None,
     )
 
     out_path = os.path.join(tmp_dir, f'chunk_{chunk_index:06d}.npz')
@@ -311,17 +489,12 @@ def create_dataset_parallel(*,
                             games: int,
                             num_processes: int = 1,
                             seed: int | None = None,
-                            temperature: float = 0.1,
-                            zero_network_reward: bool = False,
                             n_step: int = 3,
                             gamma: float = 0.99,
                             out: str | None = None,
-                            use_heuristic: bool = False,
-                            model: str | None = None,
                             chunk_size: int = 250,
                             keep_partials: bool = False,
-                            stream_combine: bool = True,
-                            verbose_memory: bool = False) -> str:
+                            stream_combine: bool = True) -> str:
     """Programmatic API to build a dataset in parallel and save it to disk.
 
     Returns the output .npz path.
@@ -338,20 +511,15 @@ def create_dataset_parallel(*,
     args.games = games
     args.num_processes = num_processes
     args.seed = seed
-    args.temperature = temperature
-    args.zero_network_reward = zero_network_reward
     args.n_step = n_step
     args.gamma = gamma
     args.out = out
-    args.use_heuristic = use_heuristic
-    args.model = model
     args.chunk_size = chunk_size
     args.keep_partials = keep_partials
     args.stream_combine = stream_combine
-    args.verbose_memory = verbose_memory
     
 
-    log_memory("Starting main process", args.verbose_memory)
+    # Starting main process
 
     total_games = max(1, int(args.games))
     num_procs = max(1, int(args.num_processes))
@@ -393,8 +561,6 @@ def create_dataset_parallel(*,
     next_task_idx = 0
     total_tasks = len(chunk_tasks)
 
-    log_memory(f"Scheduling {total_tasks} chunk processes (concurrency={num_procs})", args.verbose_memory)
-
     while next_task_idx < total_tasks or procs:
         # Start new processes while we have capacity
         while next_task_idx < total_tasks and len(procs) < num_procs:
@@ -405,8 +571,8 @@ def create_dataset_parallel(*,
             p = mp.Process(
                 target=run_chunk_process,
                 args=(
-                    rank_id, int(games_in_chunk), seed_for_chunk, args.temperature, bool(args.zero_network_reward),
-                    int(args.n_step), float(args.gamma), bool(args.use_heuristic), args.model,
+                    rank_id, int(games_in_chunk), seed_for_chunk,
+                    int(args.n_step), float(args.gamma),
                     reporter, queue, run_id, int(cidx)
                 ),
             )
@@ -449,8 +615,6 @@ def create_dataset_parallel(*,
                     collected[int(r_rank)] = []
                 collected[int(r_rank)].extend(list(r_paths))
 
-    log_memory("All processes joined, starting combination", args.verbose_memory)
-
     # Prepare output path
     base_dir = os.path.abspath(os.getcwd())
     out_dir = os.path.join(base_dir, 'training_data')
@@ -476,8 +640,6 @@ def create_dataset_parallel(*,
 
     _stream_combine_results(all_file_paths, out_path)
 
-    log_memory("Dataset saved", args.verbose_memory)
-
     # Cleanup partials unless requested to keep
     if not args.keep_partials:
         try:
@@ -495,45 +657,34 @@ def create_dataset_parallel(*,
         except Exception:
             pass
 
-    log_memory("Final cleanup complete", args.verbose_memory)
+    # Final cleanup complete
     return out_path
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Memory-optimized parallel AC dataset creation')
+    ap = argparse.ArgumentParser(description='Parallel AC dataset creation (players configured in-code via build_prebuilt_players)')
     ap.add_argument('--games', type=int, default=10, help='Total number of games to simulate')
     ap.add_argument('--num_processes', type=int, default=1, help='Number of parallel worker processes')
     ap.add_argument('--seed', type=int, default=None, help='Base random seed')
-    ap.add_argument('--temperature', type=float, default=0.1)
-    ap.add_argument('--zero_network_reward', action='store_true')
     ap.add_argument('--n_step', type=int, default=3, help='N for n-step returns')
     ap.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
     ap.add_argument('--out', type=str, default=None, help='Output .npz path')
-    ap.add_argument('--use_heuristic', action='store_true')
-    ap.add_argument('--model', type=str, default=None, help='Path to AC network')
     ap.add_argument('--chunk_size', type=int, default=250, help='Smaller chunks to reduce memory')
     ap.add_argument('--keep_partials', action='store_true')
     ap.add_argument('--stream_combine', action='store_true',
                     help='Use streaming combination to reduce memory usage (kept for compatibility, streaming is always used)')
-    ap.add_argument('--verbose_memory', action='store_true',
-                    help='Print detailed memory usage information')
     args = ap.parse_args()
 
     return create_dataset_parallel(
         games=args.games,
         num_processes=args.num_processes,
         seed=args.seed,
-        temperature=args.temperature,
-        zero_network_reward=bool(args.zero_network_reward),
         n_step=args.n_step,
         gamma=args.gamma,
         out=args.out,
-        use_heuristic=bool(args.use_heuristic),
-        model=args.model,
         chunk_size=int(max(1, args.chunk_size)),
         keep_partials=bool(args.keep_partials),
         stream_combine=bool(args.stream_combine),
-        verbose_memory=bool(args.verbose_memory),
     )
 
 

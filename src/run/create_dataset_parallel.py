@@ -37,20 +37,21 @@ from typing import Optional, Sequence
 # to CLI options (e.g., --use_heuristic).
 def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuristicACPlayer]]:
     # Example: use heuristic players (uncomment to enable)
-    # return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
-
+    return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
+    '''
     temperature = 1
-    net = ACPlayer.from_directory("models/ac_ppo_20250825_232213", temperature=temperature).network
+    net = ACPlayer.from_directory("models/ac_ppo_20250826_154715", temperature=temperature).network
     import torch
     device = torch.device('cpu')
     net = net.to(device)
 
     players = [
-        RecordingACPlayer(net, temperature=0.2, zero_network_reward=False),
         RecordingACPlayer(net, temperature=0.4, zero_network_reward=False),
         RecordingACPlayer(net, temperature=0.6, zero_network_reward=False),
-        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False)
+        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=1, zero_network_reward=False)
     ]
+    '''
     return players
 
 def compute_n_step_returns(
@@ -99,17 +100,33 @@ def build_ac_dataset(
     else:
         random.seed(int(time.time()))
 
-    # Accumulate per-field arrays for compact storage
-    hand_idx_list: List[np.ndarray] = []
-    disc_idx_list: List[np.ndarray] = []
-    called_idx_list: List[np.ndarray] = []
-    game_state_list: List[np.ndarray] = []
-    called_discards_list: List[np.ndarray] = []
+    # Accumulate per-field arrays for compact storage via field specs
+    array_fields = [
+        ('hand_idx', np.int8),
+        ('disc_idx', np.int8),
+        ('called_idx', np.int8),
+        ('seat_winds', np.int8),
+        ('riichi_declarations', np.int8),
+        ('dora_indicator_tiles', np.int8),
+        ('legal_action_mask', np.int8),
+        ('called_discards', np.int8),
+    ]
+    scalar_fields = [
+        ('round_wind', np.int8, -1),
+        ('remaining_tiles', np.int8, 0),
+        ('owner_of_reactable_tile', np.int8, -1),
+        ('reactable_tile', np.int8, -1),
+        ('newly_drawn_tile', np.int8, -1),
+    ]
+    master_arrays: Dict[str, List[np.ndarray]] = {k: [] for k, _ in array_fields}
+    master_scalars: Dict[str, List[int]] = {k: [] for k, _, _ in scalar_fields}
     action_idx_list: List[int] = []
     tile_idx_list: List[int] = []
     all_returns: List[float] = []
     all_advantages: List[float] = []
     joint_log_probs: List[float] = []
+    # Scalars per-sample
+    # scalar lists are in master_scalars
     # Two-head policy stores separate log-probs for each head
     all_game_ids: List[int] = []
     all_step_ids: List[int] = []
@@ -145,12 +162,9 @@ def build_ac_dataset(
             values: List[float] = [float(v) for v in p.experience.values]
             nstep, adv = compute_n_step_returns(rewards, n_step, gamma, values)
             
-            # Collect all data for this player's episode in batches
-            player_hand_idx = []
-            player_disc_idx = []
-            player_called_idx = []
-            player_game_state = []
-            player_called_discards = []
+            # Collect per-player episode in batches via dicts
+            player_arrays: Dict[str, List[np.ndarray]] = {k: [] for k, _ in array_fields}
+            player_scalars: Dict[str, List[int]] = {k: [] for k, _, _ in scalar_fields}
             player_action_idx = []
             player_tile_idx = []
             player_returns = []
@@ -163,12 +177,12 @@ def build_ac_dataset(
             for t in range(T):
                 gs = p.experience.states[t]
                 a_idx, t_idx = p.experience.actions[t]
-                # Extract raw indexed features per sample
-                player_hand_idx.append(np.asarray(gs['hand_idx'], dtype=np.int16))
-                player_disc_idx.append(np.asarray(gs['disc_idx'], dtype=np.int16))
-                player_called_idx.append(np.asarray(gs['called_idx'], dtype=np.int16))
-                player_game_state.append(np.asarray(gs['game_state'], dtype=np.float32))
-                player_called_discards.append(np.asarray(gs['called_discards'], dtype=np.int16))
+                # Arrays
+                for fname, dt in array_fields:
+                    player_arrays[fname].append(np.asarray(gs[fname], dtype=dt))
+                # Scalars
+                for fname, _dt, default in scalar_fields:
+                    player_scalars[fname].append(int(gs.get(fname, default)))
                 player_action_idx.append(int(a_idx))
                 player_tile_idx.append(int(t_idx))
                 player_returns.append(float(nstep[t]))
@@ -177,13 +191,12 @@ def build_ac_dataset(
                 player_game_ids.append(int(gi))
                 player_step_ids.append(int(t))
                 player_actor_ids.append(int(pid))
-            
-            # Use extend to add all player data at once
-            hand_idx_list.extend(player_hand_idx)
-            disc_idx_list.extend(player_disc_idx)
-            called_idx_list.extend(player_called_idx)
-            game_state_list.extend(player_game_state)
-            called_discards_list.extend(player_called_discards)
+
+            # Extend master arrays and scalars
+            for k in master_arrays.keys():
+                master_arrays[k].extend(player_arrays[k])
+            for k in master_scalars.keys():
+                master_scalars[k].extend(player_scalars[k])
             action_idx_list.extend(player_action_idx)
             tile_idx_list.extend(player_tile_idx)
             all_returns.extend(player_returns)
@@ -196,55 +209,25 @@ def build_ac_dataset(
             # Clear experience buffers for next game
             p.experience.clear()
 
-    # Final safety: ensure no lingering data in player buffers after batch completes
-    try:
-        import gc  # local import to keep top clean
-        for p in players:
-            if hasattr(p, 'experience') and p.experience is not None:
-                p.experience.clear()
-        # Only drop players if we created them internally (not when passed-in reusable players)
-        del players
-        gc.collect()
-    except Exception:
-        pass
-
-    return {
-        'hand_idx': np.asarray(hand_idx_list, dtype=np.int16),
-        'disc_idx': np.asarray(disc_idx_list, dtype=np.int16),
-        'called_idx': np.asarray(called_idx_list, dtype=np.int16),
-        'game_state': np.asarray(game_state_list, dtype=np.int16),
-        'called_discards': np.asarray(called_discards_list, dtype=np.int16),
-        'action_idx': np.asarray(action_idx_list, dtype=np.int16),
-        'tile_idx': np.asarray(tile_idx_list, dtype=np.int16),
-        'returns': np.asarray(all_returns, dtype=np.float32),
-        'advantages': np.asarray(all_advantages, dtype=np.float32),
-        'joint_log_probs': np.asarray(joint_log_probs, dtype=np.float32),
-        'game_ids': np.asarray(all_game_ids, dtype=np.int16),
-        'step_ids': np.asarray(all_step_ids, dtype=np.int16),
-        'actor_ids': np.asarray(all_actor_ids, dtype=np.int16),
-        # Per-game metadata
-        'game_outcomes_obj': np.asarray(game_outcomes_obj, dtype=object),
-    }
+    built: Dict[str, Any] = {}
+    for k, dt in array_fields:
+        built[k] = np.asarray(master_arrays[k], dtype=dt)
+    for k, dt, _d in scalar_fields:
+        built[k] = np.asarray(master_scalars[k], dtype=dt)
+    built['action_idx'] = np.asarray(action_idx_list, dtype=np.int8)
+    built['tile_idx'] = np.asarray(tile_idx_list, dtype=np.int8)
+    built['returns'] = np.asarray(all_returns, dtype=np.float32)
+    built['advantages'] = np.asarray(all_advantages, dtype=np.float32)
+    built['joint_log_probs'] = np.asarray(joint_log_probs, dtype=np.float32)
+    built['game_ids'] = np.asarray(all_game_ids, dtype=np.int8)
+    built['step_ids'] = np.asarray(all_step_ids, dtype=np.int8)
+    built['actor_ids'] = np.asarray(all_actor_ids, dtype=np.int8)
+    built['game_outcomes_obj'] = np.asarray(game_outcomes_obj, dtype=object)
+    return built
 
 def save_dataset(built, out_path):
-    # Save
-    np.savez(
-        out_path,
-        hand_idx=built['hand_idx'],
-        disc_idx=built['disc_idx'],
-        called_idx=built['called_idx'],
-        game_state=built['game_state'],
-        called_discards=built['called_discards'],
-        action_idx=built['action_idx'],
-        tile_idx=built['tile_idx'],
-        returns=built['returns'],
-        advantages=built['advantages'],
-        joint_log_probs=built['joint_log_probs'],
-        game_ids=built['game_ids'],
-        step_ids=built['step_ids'],
-        actor_ids=built['actor_ids'],
-        game_outcomes_obj=built['game_outcomes_obj'],
-    )
+    # Save all keys as-is
+    np.savez(out_path, **built)
  
     print(f"Saved AC dataset to {out_path}")
 
@@ -348,23 +331,25 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         offsets.append(acc)
         acc += cnt
 
-    # For object arrays, we'll collect in lists first
-    hand_idx_list = []
-    disc_idx_list = []
-    called_idx_list = []
-    game_state_list = []
-    called_discards_list = []
-    outcomes_list = []
+    # For per-sample object-like arrays, collect in lists first
+    per_sample_fields = [
+        'hand_idx','disc_idx','called_idx','seat_winds','riichi_declarations',
+        'dora_indicator_tiles','legal_action_mask','called_discards','round_wind',
+        'remaining_tiles','owner_of_reactable_tile','reactable_tile','newly_drawn_tile'
+    ]
+    collected_lists: Dict[str, List[Any]] = {k: [] for k in per_sample_fields}
+    # Per-game outcomes are collected separately
+    outcomes_list: List[Any] = []
 
     # For numeric arrays, pre-allocate
-    action_idx = np.empty(total_samples, dtype=np.int16)
-    tile_idx = np.empty(total_samples, dtype=np.int16)
+    action_idx = np.empty(total_samples, dtype=np.int8)
+    tile_idx = np.empty(total_samples, dtype=np.int8)
     returns = np.empty(total_samples, dtype=np.float32)
     advantages = np.empty(total_samples, dtype=np.float32)
     joint_log_probs = np.empty(total_samples, dtype=np.float32)
-    game_ids = np.empty(total_samples, dtype=np.int16)
-    step_ids = np.empty(total_samples, dtype=np.int16)
-    actor_ids = np.empty(total_samples, dtype=np.int16)
+    game_ids = np.empty(total_samples, dtype=np.int8)
+    step_ids = np.empty(total_samples, dtype=np.int8)
+    actor_ids = np.empty(total_samples, dtype=np.int8)
 
     # Second pass: load and combine data
     sample_offset = 0
@@ -393,13 +378,11 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
             step_ids[sample_offset:sample_offset + chunk_size] = data['step_ids']
             actor_ids[sample_offset:sample_offset + chunk_size] = data['actor_ids']
 
-            # Collect object arrays
-            hand_idx_list.extend(data['hand_idx'])
-            disc_idx_list.extend(data['disc_idx'])
-            called_idx_list.extend(data['called_idx'])
-            game_state_list.extend(data['game_state'])
-            called_discards_list.extend(data['called_discards'])
-            outcomes_list.extend(data['game_outcomes_obj'])
+            # Collect per-sample arrays
+            for k in per_sample_fields:
+                collected_lists[k].extend(list(data[k]))
+            # Collect per-game outcomes
+            outcomes_list.extend(list(data['game_outcomes_obj']))
 
             sample_offset += chunk_size
             data.close()
@@ -416,11 +399,6 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     # Convert object lists to arrays. The lists will be of the same dimension,
     # avoiding the need to store them as objects
     combined = {
-        'hand_idx': np.array(hand_idx_list, dtype=np.int16),
-        'disc_idx': np.array(disc_idx_list, dtype=np.int16),
-        'called_idx': np.array(called_idx_list, dtype=np.int16),
-        'game_state': np.array(game_state_list, dtype=np.int16),
-        'called_discards': np.array(called_discards_list, dtype=np.int16),
         'action_idx': action_idx,
         'tile_idx': tile_idx,
         'returns': returns,
@@ -429,12 +407,30 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         'game_ids': game_ids,
         'step_ids': step_ids,
         'actor_ids': actor_ids,
-        'game_outcomes_obj': np.array(outcomes_list, dtype=object),
     }
+    # Cast per-sample arrays to appropriate dtypes
+    dtypes_map = {
+        'hand_idx': np.int8,
+        'disc_idx': np.int8,
+        'called_idx': np.int8,
+        'seat_winds': np.int8,
+        'riichi_declarations': np.int8,
+        'dora_indicator_tiles': np.int8,
+        'legal_action_mask': np.int8,
+        'called_discards': np.int8,
+        'round_wind': np.int8,
+        'remaining_tiles': np.int8,
+        'owner_of_reactable_tile': np.int8,
+        'reactable_tile': np.int8,
+        'newly_drawn_tile': np.int8,
+    }
+    for k in per_sample_fields:
+        combined[k] = np.array(collected_lists[k], dtype=dtypes_map[k])
+    # Add per-game outcomes (concatenate across files)
+    combined['game_outcomes_obj'] = np.array(outcomes_list, dtype=object)
 
     # Clear the lists
-    del hand_idx_list, disc_idx_list, called_idx_list
-    del game_state_list, called_discards_list, outcomes_list
+    del collected_lists, outcomes_list
     _aggressive_cleanup()
 
     save_dataset(combined, output_path)

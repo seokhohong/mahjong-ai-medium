@@ -35,15 +35,57 @@ class TestFeatureEngineering(unittest.TestCase):
             steps += 1
 
     def _assert_gp_equals(self, gp, gp2):
-        # Hand tiles preserved (ignoring order normalization differences beyond sort)
+        # Helper to stringify tiles including aka flag
+        def ts(tiles):
+            return [str(t) + ('r' if getattr(t, 'aka', False) else '') for t in tiles]
+
+        # Hand tiles preserved (ignoring order)
         self.assertEqual(sorted([str(t) for t in gp.player_hand]), sorted([str(t) for t in gp2.player_hand]))
-        # Last discard preserved
-        if gp._reactable_tile is not None and gp2._reactable_tile is not None:
-            self.assertEqual(str(gp._reactable_tile), str(gp2._reactable_tile))
+
+        # Reactable tile and owner
+        self.assertEqual(str(gp.reactable_tile()) if gp.reactable_tile() else None,
+                         str(gp2.reactable_tile()) if gp2.reactable_tile() else None)
         self.assertEqual(gp._owner_of_reactable_tile, gp2._owner_of_reactable_tile)
-        # Discards preserved for P0 including aka flags when present
-        self.assertEqual([str(t) + ('r' if t.aka else '') for t in gp.player_discards[0]],
-                         [str(t) + ('r' if t.aka else '') for t in gp2.player_discards[0]])
+
+        # Discards preserved for all players
+        for pid in range(4):
+            self.assertEqual(ts(gp.player_discards.get(pid, [])), ts(gp2.player_discards.get(pid, [])))
+
+        # Called sets preserved (tiles and grouping)
+        for pid in range(4):
+            cs1 = gp.called_sets.get(pid, [])
+            cs2 = gp2.called_sets.get(pid, [])
+            self.assertEqual(len(cs1), len(cs2))
+            for a, b in zip(cs1, cs2):
+                self.assertEqual(ts(a.tiles), ts(b.tiles))
+
+        # Called discards preserved
+        self.assertEqual(gp.called_discards, gp2.called_discards)
+
+        # Winds preserved
+        self.assertEqual(gp.round_wind.value, gp2.round_wind.value)
+        for pid in range(4):
+            self.assertEqual(gp.seat_winds[pid].value, gp2.seat_winds[pid].value)
+
+        # Riichi declarations preserved
+        self.assertEqual(gp.riichi_declaration_tile, gp2.riichi_declaration_tile)
+
+        # Remaining tiles preserved
+        self.assertEqual(gp.remaining_tiles, gp2.remaining_tiles)
+
+        # Newly drawn tile preserved
+        self.assertEqual(str(gp.newly_drawn_tile) if gp.newly_drawn_tile else None,
+                         str(gp2.newly_drawn_tile) if gp2.newly_drawn_tile else None)
+
+        # Dora indicators preserved (order up to first -1 index)
+        self.assertEqual([str(t) for t in getattr(gp, 'dora_indicators', []) or []],
+                         [str(t) for t in getattr(gp2, 'dora_indicators', []) or []])
+
+        # Legal action mask preserved
+        lam1 = gp.legal_action_mask()
+        lam2 = gp2.legal_action_mask()
+        self.assertEqual(len(lam1), len(lam2))
+        self.assertTrue(all(int(a) == int(b) for a, b in zip(lam1, lam2)))
 
     def test_feature_engineering_roundtrip_basic(self):
         # Build a simple game state and ensure encode/decode preserves key fields

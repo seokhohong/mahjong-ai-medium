@@ -23,12 +23,12 @@ def diagnose_ratio_mismatch(model: torch.nn.Module, dataset: ACDataset, device: 
     with torch.no_grad():
         for bi, batch in enumerate(dl):
             (
-                hand, calls, disc, gsv,
+                hand, keys, calls, disc, gsv,
                 action_idx, tile_idx,
                 joint_old_log_probs, advantages, returns,
             ) = _prepare_batch_tensors(batch, device)
 
-            a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+            a_pp, t_pp, _ = model(hand.float(), keys.float(), calls.float(), disc.float(), gsv.float())
             a_idx = action_idx.view(-1, 1)
             t_idx = tile_idx.view(-1, 1)
             chosen_a = torch.gather(a_pp.clamp_min(1e-8), 1, a_idx).squeeze(1)
@@ -126,12 +126,13 @@ def check_model_loading_consistency(model_path):
     # Test on dummy input
     dummy_gsv = torch.randn(1, player1.network._gsv_scaler.n_features_in_)
     dummy_hand = torch.randn(1, 34)
+    dummy_keys = torch.randn(1, 16, 6)
     dummy_calls = torch.randn(1, 4, 4)
     dummy_disc = torch.randn(1, 4, 34)
 
     with torch.no_grad():
-        a1, t1, v1 = player1.network.torch_module(dummy_hand, dummy_calls, dummy_disc, dummy_gsv)
-        a2, t2, v2 = player2.network.torch_module(dummy_hand, dummy_calls, dummy_disc, dummy_gsv)
+        a1, t1, v1 = player1.network.torch_module(dummy_hand, dummy_keys, dummy_calls, dummy_disc, dummy_gsv)
+        a2, t2, v2 = player2.network.torch_module(dummy_hand, dummy_keys, dummy_calls, dummy_disc, dummy_gsv)
 
         action_diff = (a1 - a2).abs().max().item()
         tile_diff = (t1 - t2).abs().max().item()

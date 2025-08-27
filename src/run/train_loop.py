@@ -6,9 +6,14 @@ import time
 import argparse
 from typing import Optional
 
-from run.create_dataset import build_ac_dataset, save_dataset
-from run.create_dataset_parallel import create_dataset_parallel
+from run.create_dataset_parallel import create_dataset_parallel, build_ac_dataset, save_dataset
+from core.learn.recording_ac_player import (
+    RecordingACPlayer,
+    RecordingHeuristicACPlayer,
+    ACPlayer,
+)
 from run.train_model import train_ppo
+import torch
 
 
 def _default_out_name(prefix: str) -> str:
@@ -76,28 +81,43 @@ def run_train_loop(
                 games=games_per_gen,
                 num_processes=int(num_processes),
                 seed=(None if seed is None else int(seed) + gen),
-                temperature=temperature,
-                zero_network_reward=False,
                 n_step=n_step,
                 gamma=gamma,
                 out=os.path.basename(ds_path),
-                use_heuristic=False,
-                model=current_model_dir,
                 chunk_size=250,
                 keep_partials=False,
                 stream_combine=True,
-                verbose_memory=False
             )
         else:
+            # Build prebuilt players locally for serial dataset generation
+            prebuilt_players = None
+            try:
+                if current_model_dir is not None:
+                    # Load network from the current model directory
+                    net = ACPlayer.from_directory(current_model_dir, temperature=temperature).network
+                    import torch
+                    device = torch.device('cpu') if (device is None) else torch.device(device)
+                    net = net.to(device)
+                    prebuilt_players = [
+                        RecordingACPlayer(net, temperature=max(0.05, temperature * 0.4), zero_network_reward=False),
+                        RecordingACPlayer(net, temperature=max(0.05, temperature * 0.6), zero_network_reward=False),
+                        RecordingACPlayer(net, temperature=max(0.05, temperature * 0.8), zero_network_reward=False),
+                        RecordingACPlayer(net, temperature=max(0.05, temperature * 1), zero_network_reward=False),
+                    ]
+                else:
+                    # Fall back to heuristic players when no model is provided
+                    prebuilt_players = [RecordingHeuristicACPlayer(random_exploration=max(0.0, float(temperature))) for _ in range(4)]
+            except Exception as e:
+                # As a safeguard, default to heuristic players if model loading fails
+                print(f"[Gen {gen}] Warning: failed to load model players: {e}. Falling back to heuristic players.")
+                prebuilt_players = [RecordingHeuristicACPlayer(random_exploration=max(0.0, float(temperature))) for _ in range(4)]
+
             built = build_ac_dataset(
                 games=games_per_gen,
                 seed=(None if seed is None else int(seed) + gen),
-                temperature=temperature,
-                zero_network_reward=False,
                 n_step=n_step,
                 gamma=gamma,
-                use_heuristic=False,
-                model_path=current_model_dir,
+                prebuilt_players=prebuilt_players,
             )
             save_dataset(built, ds_path)
 

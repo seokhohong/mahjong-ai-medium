@@ -14,8 +14,12 @@ TOTAL_TILES: int = 52 + 70
 # Training-time caps
 MAX_CALLS: int = 4
 MAX_CALLED_SET_SIZE: int = 4
-# Derive tiles-per-player cap from sets x tiles-per-set (supports up to 4 kans)
-MAX_CALLED_TILES_PER_PLAYER: int = MAX_CALLS * MAX_CALLED_SET_SIZE
+# The number of tiles that can be part of called sets for one player (e.g., up to 4 kans)
+MAX_CALLED_TILES: int = MAX_CALLS * MAX_CALLED_SET_SIZE  # usually 16
+# Total tiles considered for the player's hand+calls sequence: 2 (for a pair) + called tiles cap
+MAX_TOTAL_PLAYER_TILES: int = 2 + MAX_CALLED_TILES      # usually 18
+# Back-compat derived constant
+MAX_CALLED_TILES_PER_PLAYER: int = MAX_CALLED_TILES
 # Called-sets serialized default shape: [player, set_index, tiles_in_set]
 CALLED_SETS_DEFAULT_SHAPE = (MAX_CALLED_SET_SIZE, MAX_CALLS, MAX_CALLED_SET_SIZE)
 

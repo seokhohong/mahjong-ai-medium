@@ -11,14 +11,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..game import GamePerspective, Tile, TileType, Suit
-from core.constants import NUM_PLAYERS
+from ..tile import UNIQUE_TILE_COUNT
+from core.constants import NUM_PLAYERS, MAX_CALLS, MAX_CALLED_SET_SIZE, MAX_CALLED_TILES_PER_PLAYER, MAX_DISCARDS_PER_PLAYER
 from .feature_engineering import encode_game_perspective
 from .ac_constants import (
-    TILE_INDEX_SIZE,
-    MAX_CALLS,
-    MAX_CALLED_SET_SIZE,
     ACTION_HEAD_SIZE,
     TILE_HEAD_SIZE,
+    MAX_CONCEALED_TILES
 )
 
 
@@ -32,9 +31,16 @@ class ACNetwork:
     All heads share the same feature extractor from inputs to the pre-head layer.
     """
 
-    def __init__(self, gsv_scaler: StandardScaler | None, hidden_size: int = 128, embedding_dim: int = 16):
+    def __init__(
+        self,
+        gsv_scaler: StandardScaler | None,
+        hidden_size: int = 128,
+        embedding_dim: int = 16,
+        discard_projection_size: int = 64,
+    ):
         self.hidden_size = hidden_size
         self.embedding_dim = embedding_dim
+        self.disc_proj_size = int(discard_projection_size)
         if gsv_scaler is None:
             print("Warning, instantiating ACNetwork with null StandardScaler")
             self._gsv_scaler = StandardScaler()
@@ -48,38 +54,56 @@ class ACNetwork:
         self._max_discards_per_player = max(1, (int(TOTAL_TILES) - dealt) // int(NUM_PLAYERS))
         self._max_called_sets = int(MAX_CALLS)
         self._max_tiles_per_called_set = int(MAX_CALLED_SET_SIZE)
-
-        conv_ch1, conv_ch2 = 32, 64
+        # Fixed lengths derived from constants
+        # 18 = 2 (pair) + MAX_CALLED_TILES_PER_PLAYER
+        self.seq_len_total = 2 + int(MAX_CALLED_TILES_PER_PLAYER)
+        # Discards per player use the global cap (typically 21)
+        self.disc_seq_len = int(MAX_DISCARDS_PER_PLAYER)
 
         class _ACModule(nn.Module):
             def __init__(self, outer: 'ACNetwork') -> None:
                 super().__init__()
                 self.outer = outer
-                num_p = int(NUM_PLAYERS)
-                # Convolutional towers
-                self.hand_conv = nn.Sequential(
-                    nn.Conv1d(outer.embedding_dim, conv_ch1, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv1d(conv_ch1, conv_ch2, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.AdaptiveMaxPool1d(1),
-                )
-                self.calls_conv = nn.Sequential(
-                    nn.Conv1d(outer.embedding_dim, conv_ch1, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv1d(conv_ch1, conv_ch2, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.AdaptiveMaxPool1d(1),
-                )
-                self.disc_conv = nn.Sequential(
-                    nn.Conv1d(outer.embedding_dim, conv_ch1, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv1d(conv_ch1, conv_ch2, kernel_size=3, padding=1),
-                    nn.ReLU(),
-                    nn.AdaptiveMaxPool1d(1),
-                )
-                # Separate trunks for policy and value
-                input_dim = (conv_ch2 * (1 + 2 * num_p)) + GSV
+                # Embedding for tiles (37 unique + 1 pad)
+                self.pad_index = int(UNIQUE_TILE_COUNT)  # 37 used as PAD
+                self.tile_emb = nn.Embedding(int(UNIQUE_TILE_COUNT) + 1, outer.embedding_dim, padding_idx=self.pad_index)
+
+                # Hand+calls conv over (B, 1, seq_len_total, emb+1)
+                hc_in_channels = 1
+                hc_width = outer.embedding_dim + 1
+                self.hc_conv1 = nn.Conv2d(hc_in_channels, 32, kernel_size=3, padding=1)
+                self.hc_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+                self.hc_gap = nn.AdaptiveAvgPool2d((1, 1))
+
+                # Opponents conv shared for each of 3 stacks over (B*3,1,MAX_CALLED_TILES_PER_PLAYER,emb)
+                self.opp_conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+                self.opp_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+                self.opp_gap = nn.AdaptiveAvgPool2d((1, 1))
+                # Reduce each opponent's feature to 16-d
+                self.opp_reduce = nn.Linear(64, 16)
+
+                # Discards attention (query-based):
+                # - Keys/values built from discard tokens: tile_emb + pos_emb(8) + player_emb(4) -> Dkv
+                # - Queries from player's concealed hand tiles (MAX_CONCEALED_TILES)
+                # - Output: per-query attended vectors (B,MAX_CONCEALED_TILES,Dkv)
+                #   Reduced via a single Linear over flattened (Q*Dkv) -> 32: (B, Q*Dkv) -> (B, 32)
+                self.disc_pos_emb = nn.Embedding(outer.disc_seq_len, 8)
+                self.disc_player_emb = nn.Embedding(int(NUM_PLAYERS), 4)
+                self.query_proj = nn.Linear(outer.embedding_dim, outer.embedding_dim + 8 + 4)  # emb -> Dkv
+                # Flattened reduction from (Q * Dkv) -> 32 (bias-free so zero attention -> zero features)
+                self.query_reduce = nn.Linear(int(MAX_CONCEALED_TILES) * (outer.embedding_dim + 8 + 4), 32, bias=False)
+
+                # Player concealed hand conv over (B,1,MAX_CONCEALED_TILES,emb)
+                self.hand_conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+                self.hand_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+                self.hand_gap = nn.AdaptiveAvgPool2d((1, 1))
+                # Separate reducer for player's calls for clarity (64 -> 16)
+                self.player_calls_reduce = nn.Linear(64, 16)
+
+                # Separate trunks for policy and value; input is
+                #   hand(64) + player_calls(16) + opp(3*16) + disc_attn(32) + react(emb) + gsv(GSV)
+                from .ac_constants import GAME_STATE_VEC_LEN as GSV
+                input_dim = 64 + 16 + (3 * 16) + 32 + outer.embedding_dim + int(GSV)
                 self.policy_trunk = nn.Sequential(
                     nn.Linear(input_dim, outer.hidden_size),
                     nn.ReLU(),
@@ -102,49 +126,93 @@ class ACNetwork:
                 self.head_tile = nn.Linear(outer.hidden_size // 2, int(TILE_HEAD_SIZE))
                 self.head_value = nn.Linear(outer.hidden_size // 4, 1)
 
-            def forward(self, hand_seq: torch.Tensor, calls_seq: torch.Tensor, disc_seq: torch.Tensor, gsv: torch.Tensor):
-                # hand_seq: (batch_size, embedding_dim, hand_len)
-                hand_features = self.hand_conv(hand_seq).squeeze(-1)
-                # calls_seq: (batch_size, num_players, embedding_dim, flat_calls_len)
-                batch_size, num_players, embedding_dim, flat_calls_len = calls_seq.shape
-                calls_flat = calls_seq.reshape(batch_size * num_players, embedding_dim, flat_calls_len)
-                calls_features_per_player = self.calls_conv(calls_flat).squeeze(-1)  # (batch_size*num_players, conv_ch2)
-                calls_features = calls_features_per_player.reshape(batch_size, num_players * calls_features_per_player.shape[1])
-                # disc_seq: (batch_size, num_players, embedding_dim, max_discards_per_player)
-                _, _, embedding_dim_disc, max_discards_per_player = disc_seq.shape
-                disc_flat = disc_seq.reshape(batch_size * num_players, embedding_dim_disc, max_discards_per_player)
-                disc_features_per_player = self.disc_conv(disc_flat).squeeze(-1)
-                disc_features = disc_features_per_player.reshape(batch_size, num_players * disc_features_per_player.shape[1])
-                x = torch.cat([hand_features, calls_features, disc_features, gsv], dim=1)
-                
-                # Process through separate trunks
-                policy_features = self.policy_trunk(x)
-                value_features = self.value_trunk(x)
-                
-                action_logits = self.head_action(policy_features)
-                tile_logits = self.head_tile(policy_features)
-                action_pp = F.softmax(action_logits, dim=-1)
-                tile_pp = F.softmax(tile_logits, dim=-1)
-                val = self.head_value(value_features)
-                return action_pp, tile_pp, val
+            def forward(
+                self,
+                player_hand_idx: torch.Tensor,              # (B, MAX_CONCEALED_TILES)
+                player_called_idx: torch.Tensor,            # (B, MAX_CALLED_TILES_PER_PLAYER)
+                opp_called_idx: torch.Tensor,               # (B, 3, MAX_CALLED_TILES_PER_PLAYER)
+                disc_idx: torch.Tensor,                     # (B, NUM_PLAYERS, disc_seq_len)
+                game_tile_indicator_idx: torch.Tensor,      # (B, 5) [react, d1..d4] as indices or -1
+                game_state_vec: torch.Tensor,               # (B, GSV) standardized numeric vector
+            ):
+                B = player_hand_idx.shape[0]
 
-            def forward_two_head(self, hand_seq: torch.Tensor, calls_seq: torch.Tensor, disc_seq: torch.Tensor, gsv: torch.Tensor):
-                # Same feature extraction as forward()
-                hand_features = self.hand_conv(hand_seq).squeeze(-1)
-                batch_size, num_players, embedding_dim, flat_calls_len = calls_seq.shape
-                calls_flat = calls_seq.reshape(batch_size * num_players, embedding_dim, flat_calls_len)
-                calls_features_per_player = self.calls_conv(calls_flat).squeeze(-1)
-                calls_features = calls_features_per_player.reshape(batch_size, num_players * calls_features_per_player.shape[1])
-                _, _, embedding_dim_disc, max_discards_per_player = disc_seq.shape
-                disc_flat = disc_seq.reshape(batch_size * num_players, embedding_dim_disc, max_discards_per_player)
-                disc_features_per_player = self.disc_conv(disc_flat).squeeze(-1)
-                disc_features = disc_features_per_player.reshape(batch_size, num_players * disc_features_per_player.shape[1])
-                x = torch.cat([hand_features, calls_features, disc_features, gsv], dim=1)
-                
+                # Helper: map negative indices to pad_index
+                def padify(x: torch.Tensor) -> torch.Tensor:
+                    return torch.where(x < 0, torch.full_like(x, self.pad_index), x)
+
+                # Player concealed hand conv path
+                hand_idx = padify(player_hand_idx).long()                               # (B, MAX_CONCEALED_TILES)
+                hand_emb = self.tile_emb(hand_idx)                                      # (B, MAX_CONCEALED_TILES, emb)
+                hand_emb_2d = hand_emb.unsqueeze(1)                                     # (B,1,MAX_CONCEALED_TILES,emb)
+                hand_feat = self.hand_gap(F.relu(self.hand_conv2(F.relu(self.hand_conv1(hand_emb_2d))))).view(B, 64)
+
+                # React vector: use only index at position 0, direct embedding lookup (no processing)
+                gri0 = padify(game_tile_indicator_idx[:, 0]).long()                    # (B,)
+                react_vec = self.tile_emb(gri0)                                        # (B,emb)
+
+                # Player called tiles: conv path (same style as opponents) -> reduce to 16
+                pc_idx = padify(player_called_idx).long()                               # (B,MAX_CALLED_TILES_PER_PLAYER)
+                pc_emb = self.tile_emb(pc_idx).unsqueeze(1)                             # (B,1,MAX_CALLED_TILES_PER_PLAYER,emb)
+                pc_feat_agg = self.opp_gap(F.relu(self.opp_conv2(F.relu(self.opp_conv1(pc_emb)))))  # (B,64,1,1)
+                pc_feat = pc_feat_agg.view(B, 64)
+                pc_feat_small = self.player_calls_reduce(pc_feat)                       # (B,16)
+
+                # Opponents called tiles: (B,3,MAX_CALLED_TILES_PER_PLAYER) -> embed -> conv per opponent (shared weights) -> (B, 3*64)
+                o_idx = padify(opp_called_idx).long()                                  # (B,3,MAX_CALLED_TILES_PER_PLAYER)
+                o_emb = self.tile_emb(o_idx)                                           # (B,3,MAX_CALLED_TILES_PER_PLAYER,emb)
+                o_emb = o_emb.view(B * 3, int(MAX_CALLED_TILES_PER_PLAYER), -1).unsqueeze(1)  # (B*3,1,MAX_CALLED_TILES_PER_PLAYER,emb)
+                o_feat_agg = self.opp_gap(F.relu(self.opp_conv2(F.relu(self.opp_conv1(o_emb)))))  # (B*3,64,1,1)
+                o_feat_agg = o_feat_agg.view(B, 3, 64)                                  # (B,3,64)
+                o_feat_small = self.opp_reduce(o_feat_agg)                              # (B,3,16)
+                o_feat = o_feat_small.view(B, 3 * 16)                                   # (B,48)
+
+                # Discards: query-based attention with MAX_CONCEALED_TILES queries
+                d_idx = padify(disc_idx).long()                                        # (B,NUM_PLAYERS,disc_seq_len)
+                d_tile = self.tile_emb(d_idx)                                          # (B,NUM_PLAYERS,disc_seq_len,emb)
+                pos_ids = torch.arange(self.outer.disc_seq_len, device=d_idx.device).view(1, 1, -1).expand(B, int(NUM_PLAYERS), -1)
+                d_pos = self.disc_pos_emb(pos_ids)                                     # (B,NUM_PLAYERS,disc_seq_len,8)
+                ply_ids = torch.arange(int(NUM_PLAYERS), device=d_idx.device).view(1, -1, 1).expand(B, -1, self.outer.disc_seq_len)
+                d_ply = self.disc_player_emb(ply_ids)                                  # (B,NUM_PLAYERS,disc_seq_len,4)
+                d_kv = torch.cat([d_tile, d_pos, d_ply], dim=-1)                       # (B,NUM_PLAYERS,disc_seq_len,Dkv)
+                Dkv = d_kv.shape[-1]
+                N = int(NUM_PLAYERS) * self.outer.disc_seq_len
+                d_kv = d_kv.view(B, N, Dkv)                                            # (B,N,Dkv)
+                d_mask = (d_idx.view(B, N) != self.pad_index)                          # (B,N)
+
+                # Queries from player's hand (concealed draw+13):
+                q_idx = padify(player_hand_idx).long()                                 # (B,MAX_CONCEALED_TILES)
+                q_emb = self.tile_emb(q_idx)                                           # (B,MAX_CONCEALED_TILES,emb)
+                q_proj = self.query_proj(q_emb)                                        # (B,MAX_CONCEALED_TILES,Dkv)
+
+                # Attention: per-query weights over discard keys
+                # attn_logits: (B, Q, N) where Q = MAX_CONCEALED_TILES
+                attn_logits = torch.matmul(q_proj, d_kv.transpose(1, 2)) / (Dkv ** 0.5)
+                # mask PAD tokens in discards
+                mask = d_mask.unsqueeze(1)                                             # (B,1,N)
+                attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+                # softmax, then zero out masked, and renormalize only if there is at least one valid token
+                attn_w = F.softmax(attn_logits, dim=-1)                                # (B,Q,N)
+                attn_w = attn_w * mask                                                # zero out masked positions
+                denom = attn_w.sum(dim=-1, keepdim=True)                               # (B,Q,1)
+                has_valid = denom > 0
+                # avoid division by zero: only normalize where sum>0
+                attn_w = torch.where(has_valid, attn_w / torch.clamp_min(denom, 1e-12), torch.zeros_like(attn_w))
+                # Weighted sum over values -> (B,Q,Dkv), then flatten and reduce to 32-d
+                d_per_query = torch.matmul(attn_w, d_kv)                               # (B,MAX_CONCEALED_TILES,Dkv)
+                q_flat = d_per_query.reshape(B, -1)                                    # (B, Q*Dkv)
+                d_feat = self.query_reduce(q_flat)                                     # (B,32)
+
+                # Game-state features: use the standardized vector directly
+                gsv_feat = game_state_vec.float()                                       # (B,GSV)
+
+                # Concatenate all features
+                x = torch.cat([hand_feat, pc_feat_small, o_feat, d_feat, react_vec, gsv_feat], dim=1)
+
                 # Process through separate trunks
                 policy_features = self.policy_trunk(x)
                 value_features = self.value_trunk(x)
-                
+
                 action_logits = self.head_action(policy_features)
                 tile_logits = self.head_tile(policy_features)
                 action_pp = F.softmax(action_logits, dim=-1)
@@ -157,97 +225,169 @@ class ACNetwork:
         self._net.to(self._device)
         self._net.eval()
 
-        # Precomputed embedding table [0..TILE_INDEX_SIZE-1];
-        # index < 0 (PAD) will be masked to zeros after lookup
-        self._embedding_table = np.zeros((int(TILE_INDEX_SIZE), self.embedding_dim), dtype=np.float32)
-        for idx in range(0, int(TILE_INDEX_SIZE)):
-            rng = np.random.RandomState(seed=idx + 1337)
-            self._embedding_table[idx] = (rng.randn(self.embedding_dim) * 0.1).astype(np.float32)
-
-    def _get_tile_index(self, tile: Tile) -> int:
-        return (tile.tile_type.value - 1) * 2 + (0 if tile.suit == Suit.PINZU else 1)
+        # Note: model now consumes index sequences + flags and performs its own embeddings.
 
     def _is_fit(self):
         return hasattr(self._gsv_scaler, 'scale_')
 
-    def fit_scaler(self, game_state_arr):
+    def fit_scaler(self, global_state_arr):
+        """Fit scaler on the remaining-tiles feature only (index 0)."""
         assert not self._is_fit(), "gsv_scaler has already been fitted; refusing to refit in ACNetwork"
-        # Ensure StandardScaler sees a consistent feature size matching AC constants
-        from core.learn.ac_constants import GAME_STATE_VEC_LEN as AC_GSV_LEN  # type: ignore
-        gsv_arr = np.asarray(game_state_arr, dtype=np.float32)
-        assert gsv_arr.shape[0] > 0
-        if gsv_arr.ndim == 1:
-            gsv_arr = gsv_arr[None, :]
-        pad_width = int(AC_GSV_LEN) - gsv_arr.shape[1]
-        if pad_width > 0:
-            gsv_arr = np.pad(gsv_arr, ((0, 0), (0, pad_width)), mode='constant')
-        self._gsv_scaler.fit(gsv_arr)
+        g = np.asarray(global_state_arr, dtype=np.float32)
+        if g.ndim == 2 and g.shape[1] > 1:
+            col0 = g[:, 0:1]
+        else:
+            col0 = g.reshape(-1, 1)
+        assert col0.shape[0] > 0
+        self._gsv_scaler.fit(col0)
 
 
-    def extract_features_from_indexed(self, hand_idx: np.ndarray, disc_idx: np.ndarray, called_idx: np.ndarray, game_state_vec: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        assert self._is_fit, "StandardScaler is not fit"
-        from .ac_constants import GAME_STATE_VEC_LEN as GSV
-        # Hand embeddings (index < 0 is padding and will be zeroed). We assume inputs are already fixed-size.
-        hand_idx_safe = np.asarray(hand_idx, dtype=np.int32)
-        valid_mask = (hand_idx_safe >= 0) #need the >=0 to avoid padding
-        hand_emb = np.zeros((hand_idx_safe.shape[0], self.embedding_dim), dtype=np.float32)
-        hand_emb[valid_mask] = self._embedding_table[hand_idx_safe[valid_mask]]
-        hand_seq = np.transpose(hand_emb, (1, 0))  # (embed, hand_len)
-        # Called per player now structured as (num_players, max_calls, tiles_per_set)
+    def extract_features_from_indexed(
+        self,
+        *,
+        hand_idx: np.ndarray,
+        disc_idx: np.ndarray,
+        called_idx: np.ndarray,
+        game_tile_indicators: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Build index-based features for the new architecture.
+        Returns:
+          - player_hand_idx_fixed: (MAX_CONCEALED_TILES,)
+          - player_called_idx: (MAX_CALLED_TILES_PER_PLAYER,)
+          - opp_called_idx: (3, MAX_CALLED_TILES_PER_PLAYER)
+          - disc_idx_seq: (NUM_PLAYERS, MAX_DISCARDS_PER_PLAYER) most recent discards (pad with -1)
+        """
+        PAD = -1
+        # Flatten called tiles per player
         called = np.asarray(called_idx, dtype=np.int32)
         if called.ndim == 2:
-            # Legacy: flatten called tiles per player -> reshape to (max_calls, tiles_per_set)
-            num_players, flat_len = called.shape
-            mc = int(self._max_called_sets)
-            ts = int(self._max_tiles_per_called_set)
-            pad = mc * ts
-            if flat_len < pad:
-                pad_width = pad - flat_len
-                called = np.pad(called, ((0,0),(0,pad_width)), constant_values=-1)
-            called = called.reshape(num_players, mc, ts)
-        # Embed called tiles
-        valid_called = (called >= 0)
-        calls_emb = np.zeros((called.shape[0], called.shape[1], called.shape[2], self.embedding_dim), dtype=np.float32)
-        calls_emb[valid_called] = self._embedding_table[called[valid_called]]
-        # Rearrange to (num_players, embed, max_calls * tiles_per_set)
-        calls_seq = calls_emb.reshape(called.shape[0], called.shape[1] * called.shape[2], self.embedding_dim)
-        calls_seq = np.transpose(calls_seq, (0, 2, 1))  # (4, embed, max_calls*tiles_per_set)
-        # Discards per player (shape (4, max_discards)) already aligned from serialization
-        discs = np.asarray(disc_idx, dtype=np.int32)
-        valid_disc = (discs >= 0)
-        disc_emb = np.zeros((discs.shape[0], discs.shape[1], self.embedding_dim), dtype=np.float32)
-        disc_emb[valid_disc] = self._embedding_table[discs[valid_disc]]
-        disc_seq = np.transpose(disc_emb, (0, 2, 1))  # (4, embed, max_discards)
-        # Game state vec (already a flat float vector from serialization pass)
-        gs = np.asarray(game_state_vec, dtype=np.float32)
-        if gs.shape[0] < GSV:
-            gs = np.pad(gs, (0, GSV - gs.shape[0]))
-        gs = self._gsv_scaler.transform([gs])[0]
-        return hand_seq.astype(np.float32), calls_seq.astype(np.float32), disc_seq.astype(np.float32), gs.astype(np.float32)
+            called_flat = called
+        else:
+            called_flat = called.reshape(called.shape[0], -1)
+
+        # Player hand (may include padding); keep non-negative
+        hand_arr = np.asarray(hand_idx, dtype=np.int32)
+        hand_tiles = [int(v) for v in hand_arr.tolist() if int(v) >= 0]
+        # Fixed-length concealed hand vector for queries (length MAX_CONCEALED_TILES)
+        if len(hand_tiles) < int(MAX_CONCEALED_TILES):
+            player_hand_idx_fixed = hand_tiles + ([-1] * (int(MAX_CONCEALED_TILES) - len(hand_tiles)))
+        else:
+            player_hand_idx_fixed = hand_tiles[: int(MAX_CONCEALED_TILES)]
+        # Player called tiles
+        p_called_tiles = [int(v) for v in called_flat[0].tolist() if int(v) >= 0]
+        # Fixed-length player called vector
+        target_len_pc = int(MAX_CALLED_TILES_PER_PLAYER)
+        if len(p_called_tiles) < target_len_pc:
+            player_called_idx = p_called_tiles + ([PAD] * (target_len_pc - len(p_called_tiles)))
+        else:
+            player_called_idx = p_called_tiles[: target_len_pc]
+        # removed compact hand+calls sequence and flags (not used by the network anymore)
+
+        # Opponents called tiles sequences up to MAX_CALLED_TILES_PER_PLAYER each
+        opp_called_list: List[np.ndarray] = []
+        for i in range(1, 4):
+            tiles = [int(v) for v in called_flat[i].tolist() if int(v) >= 0]
+            target_len = int(MAX_CALLED_TILES_PER_PLAYER)
+            if len(tiles) < target_len:
+                tiles = tiles + [PAD] * (target_len - len(tiles))
+            else:
+                tiles = tiles[: target_len]
+            opp_called_list.append(np.asarray(tiles, dtype=np.int32))
+        opp_called_idx = np.stack(opp_called_list, axis=0)
+
+        # Discards: take most recent up to MAX_DISCARDS_PER_PLAYER per player
+        disc = np.asarray(disc_idx, dtype=np.int32)
+        disc_seq_list: List[np.ndarray] = []
+        for i in range(int(NUM_PLAYERS)):
+            tiles = [int(v) for v in disc[i].tolist() if int(v) >= 0]
+            # take last disc_seq_len
+            tiles = tiles[-self.disc_seq_len:]
+            if len(tiles) < self.disc_seq_len:
+                tiles = ([PAD] * (self.disc_seq_len - len(tiles))) + tiles
+            disc_seq_list.append(np.asarray(tiles, dtype=np.int32))
+        disc_idx_seq = np.stack(disc_seq_list, axis=0)
+
+        # game_tile_indicators are handled in evaluate() and passed directly to forward()
+
+        return (
+            np.asarray(player_hand_idx_fixed, dtype=np.int32),
+            np.asarray(player_called_idx, dtype=np.int32),
+            opp_called_idx.astype(np.int32),
+            disc_idx_seq.astype(np.int32),
+        )
 
     def evaluate(self, game_state: GamePerspective) -> Tuple[np.ndarray, np.ndarray, float]:
         """Return (action_head_probs, tile_head_probs, value) for two-head policy.
         """
         self._net.eval()
         feat = encode_game_perspective(game_state)
-        hand_idx = feat['hand_idx']
-        called_idx = feat['called_idx']
-        disc_idx = feat['disc_idx']
-        game_state_vec = feat['game_state']
-        h, c, d, g = self.extract_features_from_indexed(hand_idx, disc_idx, called_idx, game_state_vec)
-        with torch.no_grad():
-            a_pp, t_pp, val = self._net(
-                torch.from_numpy(h[None, ...]).to(self._device),
-                torch.from_numpy(c[None, ...]).to(self._device),
-                torch.from_numpy(d[None, ...]).to(self._device),
-                torch.from_numpy(g[None, ...]).to(self._device),
-            )
-        a = a_pp.cpu().numpy()[0]
-        t = t_pp.cpu().numpy()[0]
-        v = float(val.cpu().numpy()[0][0])
-        return a, t, v
+        # Unpack encoded features
+        hand_idx = np.asarray(feat['hand_idx'], dtype=np.int32)
+        called_idx = np.asarray(feat['called_idx'], dtype=np.int32)
+        disc_idx = np.asarray(feat['disc_idx'], dtype=np.int32)
+        # Construct game_tile_indicator_idx = [react, d1, d2, d3, d4]
+        react_idx = int(feat.get('reactable_tile', -1))
+        dora_vals = [int(v) for v in np.asarray(feat.get('dora_indicator_tiles', []), dtype=np.int32).tolist()]
+        while len(dora_vals) < 4:
+            dora_vals.append(-1)
+        game_tile_indicators = np.asarray([react_idx] + dora_vals[:4], dtype=np.int32)
 
-    @property
+        # Build fixed-length index features
+        (
+            player_hand_idx,
+            player_called_idx,
+            opp_called_idx,
+            disc_idx_seq,
+        ) = self.extract_features_from_indexed(
+            hand_idx=hand_idx,
+            disc_idx=disc_idx,
+            called_idx=called_idx,
+            game_tile_indicators=game_tile_indicators,
+        )
+
+        # Game-state vector: explicit layout per ac_constants.GAME_STATE_VEC_LEN doc
+        from .ac_constants import GAME_STATE_VEC_LEN as GSV
+        gsv = np.zeros((int(GSV),), dtype=np.float32)
+        # [0] remaining_tiles
+        gsv[0] = float(int(feat.get('remaining_tiles', 0)))
+        # [1] last_discard_player (owner_of_reactable_tile), -1 if none
+        gsv[1] = float(int(feat.get('owner_of_reactable_tile', -1)))
+        # [2..5] seat_winds[4] (Honor.value)
+        seat_winds = [int(v) for v in np.asarray(feat.get('seat_winds', [0, 0, 0, 0]), dtype=np.int32).tolist()]
+        for i in range(4):
+            gsv[2 + i] = float(seat_winds[i] if i < len(seat_winds) else 0)
+        # [6..9] riichi_decl_idxs[4]
+        riichi_decl = [int(v) for v in np.asarray(feat.get('riichi_declarations', [-1, -1, -1, -1]), dtype=np.int32).tolist()]
+        for i in range(4):
+            gsv[6 + i] = float(riichi_decl[i] if i < len(riichi_decl) else -1)
+        # [10..] legal_action_mask[ACTION_HEAD_SIZE]
+        lam = np.asarray(feat.get('legal_action_mask', []), dtype=np.int32)
+        from .ac_constants import ACTION_HEAD_SIZE
+        lam_fixed = np.zeros((int(ACTION_HEAD_SIZE),), dtype=np.float32)
+        k = min(int(ACTION_HEAD_SIZE), int(lam.shape[0]))
+        lam_fixed[:k] = lam[:k]
+        gsv[10:10 + int(ACTION_HEAD_SIZE)] = lam_fixed
+        gsv_std = gsv.copy()
+        try:
+            col0_scaled = self._gsv_scaler.transform(gsv_std[0:1].reshape(-1, 1)).astype(np.float32)[0, 0]
+            gsv_std[0] = float(col0_scaled)
+        except Exception:
+            gsv_std[0] = 0.0
+
+        with torch.no_grad():
+            action_pp, tile_pp, val = self._net(
+                torch.from_numpy(player_hand_idx[None, ...]).to(self._device),
+                torch.from_numpy(player_called_idx[None, ...]).to(self._device),
+                torch.from_numpy(opp_called_idx[None, ...]).to(self._device),
+                torch.from_numpy(disc_idx_seq[None, ...]).to(self._device),
+                torch.from_numpy(game_tile_indicators[None, ...]).to(self._device),
+                torch.from_numpy(gsv_std[None, ...]).to(self._device),
+            )
+        return (
+            action_pp.cpu().numpy()[0],
+            tile_pp.cpu().numpy()[0],
+            float(val.cpu().numpy()[0][0]),
+        )
     def torch_module(self) -> nn.Module:
         return self._net
 

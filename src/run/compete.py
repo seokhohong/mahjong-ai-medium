@@ -41,11 +41,13 @@ def build_players() -> List[Player]:
 	from core.learn.data_utils import load_gsv_scaler
 
 	return [
-        ACPlayer.from_directory("models/ac_ppo_20250825_181954", temperature=0.2),
-        ACPlayer.from_directory("models/ac_ppo_20250825_164819", temperature=0.2),
-        ACPlayer.from_directory("models/ac_ppo_20250825_172005", temperature=0.2),
-        ACPlayer.from_directory("models/ac_ppo_20250825_174835", temperature=0.2)
-
+        #ACPlayer.from_directory("models/ac_ppo_20250826_140749", temperature=0.2),
+        #ACPlayer.from_directory("models/ac_ppo_20250826_013253", temperature=0.2),
+        #ACPlayer.from_directory("models/ac_ppo_20250825_172005", temperature=0.2),
+        ACPlayer.from_directory("models/ac_ppo_20250826_144021", temperature=0.2),
+        RecordingHeuristicACPlayer(random_exploration=0),
+        RecordingHeuristicACPlayer(random_exploration=0),
+        RecordingHeuristicACPlayer(random_exploration=0)
 	]
 
 

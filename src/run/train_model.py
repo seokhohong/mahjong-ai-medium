@@ -20,6 +20,8 @@ from tqdm import tqdm  # type: ignore
 
 from core.learn.ac_player import ACPlayer
 from core.learn.ac_network import ACNetwork
+from core.learn.ac_constants import ACTION_HEAD_SIZE, GAME_STATE_VEC_LEN
+from core.tile import UNIQUE_TILE_COUNT
 from sklearn.preprocessing import StandardScaler  # type: ignore
 
 # ---- Helpers: runtime/loader configuration ----
@@ -87,58 +89,20 @@ def _resolve_loader_defaults(*, os_hint: str | None, dl_workers: int | None, pin
 
 # not using called discards yet
 class ACDataset(Dataset):
-    def __init__(self, npz_path: str, net: ACNetwork, fit_scaler: bool = True, *, precompute_features: bool = True, mmap: bool = False):
-        # Use memory-mapped loading if requested to reduce peak RAM
-        data = np.load(npz_path, allow_pickle=True, mmap_mode=('r' if mmap else None))
-        # New compact format fields
-        self._hand_idx = data['hand_idx']
-        self._disc_idx = data['disc_idx']
-        self._called_idx = data['called_idx']
-        self._gsv = data['game_state']
-        self.action_idx = data['action_idx']
-        self.tile_idx = data['tile_idx']
-        self.game_ids = data['game_ids']
-        # Load returns/advantages
-        self.returns = data['returns'].astype(np.float32)
-        self.advantages = data['advantages'].astype(np.float32)
-        self.joint_old_log_probs = data['joint_log_probs'].astype(np.float32)
+    def __init__(self, npz_path: str, net: ACNetwork, fit_scaler: bool = True, *, mmap: bool = True):
+        """Dataset backed by a memory-mapped .npz created by build_ac_dataset.
 
-        # Fit the standard scaler so we can properly use extract_features
+        Only stores a reference to the data file handle and computes features on demand.
+        """
+        # Keep only the handle to the npz to avoid loading everything in memory
+        self._data = np.load(npz_path, allow_pickle=True, mmap_mode=('r' if mmap else None))
+
+        # Optionally fit the scaler on remaining_tiles (column 0 of GSV)
         if fit_scaler:
-            # StandardScaler handles memmap arrays; this may stream from disk when mmap=True
-            net.fit_scaler(self._gsv)
+            remaining_tiles_arr = np.asarray(self._data['remaining_tiles'], dtype=np.float32).reshape(-1, 1)
+            net.fit_scaler(remaining_tiles_arr)
 
         self._net = net
-        self._precompute = bool(precompute_features)
-
-        if self._precompute:
-            # Pre-extract indexed states and transform to embedded sequences once
-            hand_list = []
-            calls_list = []
-            disc_list = []
-            gsv_list = []
-            N = len(self._hand_idx)
-            for i in range(N):
-                h, c, d, g = net.extract_features_from_indexed(
-                    np.asarray(self._hand_idx[i], dtype=np.int32),
-                    np.asarray(self._disc_idx[i], dtype=np.int32),
-                    np.asarray(self._called_idx[i], dtype=np.int32),
-                    np.asarray(self._gsv[i], dtype=np.float32),
-                )
-                hand_list.append(h.astype(np.float32))
-                calls_list.append(c.astype(np.float32))
-                disc_list.append(d.astype(np.float32))
-                gsv_list.append(g.astype(np.float32))
-            self.hand = np.asarray(hand_list, dtype=np.float32)
-            self.calls = np.asarray(calls_list, dtype=np.float32)
-            self.disc = np.asarray(disc_list, dtype=np.float32)
-            self.gsv = np.asarray(gsv_list, dtype=np.float32)
-        else:
-            # Defer feature extraction to __getitem__ to minimize resident memory
-            self.hand = None  # type: ignore
-            self.calls = None  # type: ignore
-            self.disc = None  # type: ignore
-            self.gsv = None  # type: ignore
 
     def train_val_subsets_by_game(self, val_frac: float, *, seed: int | None = None) -> tuple[Subset, Subset] | tuple[Subset, None]:
         """Return train/validation Subset(s) grouped by game.
@@ -152,10 +116,11 @@ class ACDataset(Dataset):
             # No validation split requested
             return Subset(self, list(range(len(self)))), None
 
-        if self.game_ids is None:
+        # Access game_ids lazily from file (NpzFile doesn't guarantee .get())
+        if 'game_ids' not in getattr(self._data, 'files', []):
             raise ValueError("ACDataset: game_ids not found in dataset; cannot split by game. Please regenerate dataset with 'game_ids'.")
-
-        game_ids_arr = _np.asarray(self.game_ids)
+        game_ids = self._data['game_ids']
+        game_ids_arr = _np.asarray(game_ids)
         unique_games = _np.unique(game_ids_arr)
         if unique_games.size == 0:
             # Degenerate case; treat as no validation
@@ -173,60 +138,82 @@ class ACDataset(Dataset):
         # removed guard against empty splits since we expect the dataset to be large enough
 
         ds_train = Subset(self, train_indices)
-        ds_val = Subset(self, val_indices) if len(val_indices) > 0 else None
-        return ds_train, ds_val
+        ds_validation = Subset(self, val_indices) if len(val_indices) > 0 else None
+        return ds_train, ds_validation
 
     def __len__(self) -> int:
-        return int(len(self._hand_idx))
+        # Use length of the primary arrays (action_idx)
+        return int(len(self._data['action_idx']))
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        if self._precompute:
-            hand = self.hand[idx]
-            calls = self.calls[idx]
-            disc = self.disc[idx]
-            gsv = self.gsv[idx]
-        else:
-            # Compute features on demand to save RAM
-            h, c, d, g = self._net.extract_features_from_indexed(
-                np.asarray(self._hand_idx[idx], dtype=np.int32),
-                np.asarray(self._disc_idx[idx], dtype=np.int32),
-                np.asarray(self._called_idx[idx], dtype=np.int32),
-                np.asarray(self._gsv[idx], dtype=np.float32),
-            )
-            hand = h.astype(np.float32)
-            calls = c.astype(np.float32)
-            disc = d.astype(np.float32)
-            gsv = g.astype(np.float32)
+        # Compute features on demand to save RAM
+        data = self._data
+
+        # Build game_tile_indicators_idx = [react, d1, d2, d3, d4]
+        react_idx = int(data['reactable_tile'][idx]) if 'reactable_tile' in data else -1
+        dora = np.asarray(data['dora_indicator_tiles'][idx], dtype=np.int32)
+        dora_vals = dora.tolist()
+        while len(dora_vals) < 4:
+            dora_vals.append(-1)
+        game_tile_indicators_idx = np.asarray([react_idx] + dora_vals[:4], dtype=np.int32)
+
+        (
+            player_hand_idx_fixed,
+            player_called_idx,
+            opp_called_idx,
+            disc_idx,
+        ) = self._net.extract_features_from_indexed(
+            hand_idx=np.asarray(data['hand_idx'][idx], dtype=np.int32),
+            called_idx=np.asarray(data['called_idx'][idx], dtype=np.int32),
+            disc_idx=np.asarray(data['disc_idx'][idx], dtype=np.int32),
+            game_tile_indicators=game_tile_indicators_idx,
+        )
+
+        # Construct game_state_vec to length GAME_STATE_VEC_LEN
+        gsv = np.zeros((int(GAME_STATE_VEC_LEN),), dtype=np.float32)
+        # [0] remaining_tiles (to be standardized later)
+        gsv[0] = float(int(data['remaining_tiles'][idx]))
+        # [1] owner_of_reactable_tile
+        gsv[1] = float(int(data['owner_of_reactable_tile'][idx]))
+        # [2..5] seat_winds[4]
+        sw = np.asarray(data['seat_winds'][idx], dtype=np.int32)
+        for i in range(4):
+            gsv[2 + i] = float(int(sw[i]) if i < sw.shape[0] else 0)
+        # [6..9] riichi_declarations[4]
+        rd = np.asarray(data['riichi_declarations'][idx], dtype=np.int32)
+        for i in range(4):
+            gsv[6 + i] = float(int(rd[i]) if i < rd.shape[0] else -1)
+        # [10..] legal_action_mask[ACTION_HEAD_SIZE]
+        lam = np.asarray(data['legal_action_mask'][idx], dtype=np.int32)
+        lam_fixed = np.zeros((int(ACTION_HEAD_SIZE),), dtype=np.float32)
+        k = min(int(ACTION_HEAD_SIZE), int(lam.shape[0]))
+        lam_fixed[:k] = lam[:k]
+        gsv[10:10 + int(ACTION_HEAD_SIZE)] = lam_fixed
+
+        # Standardize remaining_tiles column only
+        gsv_std = gsv.copy()
+        try:
+            col0_scaled = self._net._gsv_scaler.transform(gsv_std[0:1].reshape(-1, 1)).astype(np.float32)[0, 0]
+            gsv_std[0] = float(col0_scaled)
+        except Exception:
+            gsv_std[0] = 0.0
+
         return {
-            'hand': hand,
-            'calls': calls,
-            'disc': disc,
-            'gsv': gsv,
-            'action_idx': int(self.action_idx[idx]),
-            'tile_idx': int(self.tile_idx[idx]),
-            'return': float(self.returns[idx]),
-            'advantage': float(self.advantages[idx]),
-            'joint_old_log_prob': float(self.joint_old_log_probs[idx]),
+            'player_hand_idx': np.asarray(player_hand_idx_fixed, dtype=np.int32),
+            'player_called_idx': np.asarray(player_called_idx, dtype=np.int32),
+            'opp_called_idx': opp_called_idx.astype(np.int32),
+            'disc_idx': disc_idx.astype(np.int32),
+            'game_tile_indicators_idx': game_tile_indicators_idx.astype(np.int32),
+            'game_state_vec': gsv_std.astype(np.float32),
+            'action_idx': int(self._data['action_idx'][idx]),
+            'tile_idx': int(self._data['tile_idx'][idx]),
+            'return': float(self._data['returns'][idx]),
+            'advantage': float(self._data['advantages'][idx]),
+            'joint_old_log_prob': float(self._data['joint_log_probs'][idx]),
         }
 
 
-def batch_to_tensors(batch: Dict[str, Any], device: torch.device) -> Tuple[torch.Tensor, ...]:
-    hand = np.stack([b['hand_idx'] for b in batch])  # (B,12)
-    disc = np.stack([b['disc_idx'] for b in batch])  # (B,4,K)
-    called = np.stack([b['called_idx'] for b in batch])  # (B,4,3,3)
-    gsv = np.stack([b['game_state'] for b in batch])  # (B,G)
-    B = hand.shape[0]
-    # Convert to embeddings sequence layout expected by ACNetwork.torch_module
-    # Hand: (B, embed, 12), Calls: (B, embed, 36), Discards: (B, embed, 4*K)
-    # We will embed indices using ACNetwork's internal embedding table via a small helper
-    return (
-        torch.from_numpy(hand).to(device),
-        torch.from_numpy(disc).to(device),
-        torch.from_numpy(called).to(device),
-        torch.from_numpy(gsv).to(device),
-    )
-
-
+ 
 
 def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
     def _to_dev(x, dtype):
@@ -234,10 +221,12 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
             return x.to(device=dev, dtype=dtype)
         return torch.as_tensor(x, dtype=dtype, device=dev)
 
-    hand = torch.from_numpy(np.stack(batch['hand'])).to(dev)
-    calls = torch.from_numpy(np.stack(batch['calls'])).to(dev)
-    disc = torch.from_numpy(np.stack(batch['disc'])).to(dev)
-    gsv = torch.from_numpy(np.stack(batch['gsv'])).to(dev)
+    player_hand_idx = torch.from_numpy(np.stack(batch['player_hand_idx'])).to(dev)
+    player_called_idx = torch.from_numpy(np.stack(batch['player_called_idx'])).to(dev)
+    opp_called_idx = torch.from_numpy(np.stack(batch['opp_called_idx'])).to(dev)
+    disc_idx = torch.from_numpy(np.stack(batch['disc_idx'])).to(dev)
+    game_tile_indicators_idx = torch.from_numpy(np.stack(batch['game_tile_indicators_idx'])).to(dev)
+    game_state_vec = torch.from_numpy(np.stack(batch['game_state_vec'])).to(dev)
 
     action_idx = _to_dev(batch['action_idx'], torch.long)
     tile_idx = _to_dev(batch['tile_idx'], torch.long)
@@ -246,7 +235,7 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
     returns = _to_dev(batch['return'], torch.float32)
 
     return (
-        hand, calls, disc, gsv,
+        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
         action_idx, tile_idx,
         joint_old_log_probs,
         advantages, returns,
@@ -268,7 +257,7 @@ def safe_entropy_calculation(probs, min_prob=1e-8):
 
     return entropy
 
-def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val, dev: torch.device, bc_fallback_ratio: float, description: str = ""):
+def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_validation, dev: torch.device, bc_fallback_ratio: float, description: str = ""):
     """Evaluate model performance on the combined train+validation dataset with weighted averaging."""
     model.eval()
     
@@ -280,9 +269,9 @@ def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val
         datasets.append(('train', dl_train))
         weights.append(len(dl_train.dataset))
     
-    if dl_val is not None:
-        datasets.append(('validation', dl_val))
-        weights.append(len(dl_val.dataset))
+    if dl_validation is not None:
+        datasets.append(('validation', dl_validation))
+        weights.append(len(dl_validation.dataset))
     
     if not datasets:
         print(f"[{description}] No datasets available for evaluation")
@@ -300,19 +289,22 @@ def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val
             dataset_samples = dataset_correct = 0
             
             for batch in dataloader:
-                (hand, calls, disc, gsv, action_idx, tile_idx, 
-                 joint_old_log_probs, advantages, returns) = _prepare_batch_tensors(batch, dev)
+                (player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                 action_idx, tile_idx, joint_old_log_probs, advantages, returns) = _prepare_batch_tensors(batch, dev)
                 
                 # Compute losses
                 total_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
-                    model, hand, calls, disc, gsv, action_idx, tile_idx,
-                    joint_old_log_probs, advantages, returns,
+                    model,
+                    player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                    action_idx, tile_idx, joint_old_log_probs, advantages, returns,
                     bc_fallback_ratio=bc_fallback_ratio,
                     bc_weight=0.0, policy_weight=1.0,
                 )
                 
                 # Compute accuracy
-                a_logits, t_logits, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                a_logits, t_logits, _ = model(
+                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                )
                 pred_a = torch.argmax(a_logits, dim=1)
                 pred_t = torch.argmax(t_logits, dim=1)
                 both_correct = (pred_a == action_idx) & (pred_t == tile_idx)
@@ -353,10 +345,12 @@ def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val
 
 def _compute_losses(
         model: torch.nn.Module,
-        hand: torch.Tensor,
-        calls: torch.Tensor,
-        disc: torch.Tensor,
-        gsv: torch.Tensor,
+        player_hand_idx: torch.Tensor,
+        player_called_idx: torch.Tensor,
+        opp_called_idx: torch.Tensor,
+        disc_idx: torch.Tensor,
+        game_tile_indicators_idx: torch.Tensor,
+        game_state_vec: torch.Tensor,
         action_idx: torch.Tensor,
         tile_idx: torch.Tensor,
         joint_old_log_probs: torch.Tensor,
@@ -371,9 +365,11 @@ def _compute_losses(
         policy_weight: float = 1.0,
         print_debug: bool = False,
 ):
-    a_pp, t_pp, val = model(hand.float(), calls.float(), disc.float(), gsv.float())
-    val = val.squeeze(1)
-    batch_size_curr = int(gsv.size(0))
+    a_pp, t_pp, value_pred = model(
+        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+    )
+    value_pred = value_pred.squeeze(1)
+    batch_size_curr = int(player_hand_idx.size(0))
 
     # Normalize advantages per batch
     # This ensures consistent scale and prevents exploding gradients
@@ -421,8 +417,8 @@ def _compute_losses(
 
     # Value-only path: when both policy weights are 0, train only the value head
     if (bc_weight == 0.0) and (policy_weight == 0.0):
-        policy_loss = torch.zeros((), device=val.device, dtype=val.dtype)
-        value_loss = F.mse_loss(val, returns)
+        policy_loss = torch.zeros((), device=value_pred.device, dtype=value_pred.dtype)
+        value_loss = F.smooth_l1_loss(value_pred, returns)
         total = value_loss
         dbg = {
             'bsz': batch_size_curr,
@@ -466,7 +462,7 @@ def _compute_losses(
     policy_loss = bw * bc_policy_loss + pw * ppo_policy_loss
 
     # Value and entropy terms
-    value_loss = F.mse_loss(val, returns)
+    value_loss = F.smooth_l1_loss(value_pred, returns)
     entropy_a = safe_entropy_calculation(a_pp)
     entropy_t = safe_entropy_calculation(t_pp)
     entropy = entropy_a + entropy_t
@@ -479,7 +475,7 @@ def _compute_losses(
 def _run_value_pretraining(
     model: torch.nn.Module,
     dl: DataLoader,
-    dl_val: DataLoader | None,
+    dl_validation: DataLoader | None,
     dev: torch.device,
     lr: float,
     value_lr: float | None,
@@ -504,17 +500,15 @@ def _run_value_pretraining(
         progress = tqdm(dl, desc=f"ValuePre {ve+1}/{value_pre_epochs}", leave=False)
         for batch in progress:
             (
-                hand, calls, disc, gsv,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages, returns,
             ) = _prepare_batch_tensors(batch, dev)
             total_loss_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
                 model,
-                hand, calls, disc, gsv,
-                action_idx, tile_idx,
-                joint_old_log_probs,
-                advantages, returns,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                action_idx, tile_idx, joint_old_log_probs, advantages, returns,
                 bc_fallback_ratio=bc_fallback_ratio,
                 bc_weight=0.0, policy_weight=0.0,
             )
@@ -530,14 +524,14 @@ def _run_value_pretraining(
         
         # Validation phase - for value pretraining, evaluate on ALL batches (no BC filtering)
         validation_value_loss = None
-        if dl_val is not None:
+        if dl_validation is not None:
             model.eval()
             validation_total_v = 0.0
             validation_total_n = 0
             with torch.no_grad():
-                for validation_batch in dl_val:
+                for validation_batch in dl_validation:
                     (
-                        hand, calls, disc, gsv,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
@@ -546,10 +540,8 @@ def _run_value_pretraining(
                     # For value pretraining, use all batches regardless of BC mode
                     _, _, value_loss_v, bsz, _ = _compute_losses(
                         model,
-                        hand, calls, disc, gsv,
-                        action_idx, tile_idx,
-                        joint_old_log_probs,
-                        advantages, returns,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                        action_idx, tile_idx, joint_old_log_probs, advantages, returns,
                         bc_fallback_ratio=bc_fallback_ratio,
                         bc_weight=0.0, policy_weight=0.0,
                     )
@@ -566,7 +558,7 @@ def _run_value_pretraining(
 def _run_warmup_bc(
     model: torch.nn.Module,
     dl: DataLoader,
-    dl_val: DataLoader | None,
+    dl_validation: DataLoader | None,
     dev: torch.device,
     opt: torch.optim.Optimizer,
     warm_up_acc: float,
@@ -593,24 +585,26 @@ def _run_warmup_bc(
         with torch.no_grad():
             for batch in dloader:
                 (
-                    hand, calls, disc, gsv,
+                    player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                     action_idx, tile_idx,
                     _joint_old_log_probs,
                     _advantages,
                     _returns,
                 ) = _prepare_batch_tensors(batch, dev)
-                a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                a_pp, t_pp, _ = model(
+                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                )
                 pred_a = torch.argmax(a_pp, dim=1)
                 pred_t = torch.argmax(t_pp, dim=1)
                 both = (pred_a == action_idx) & (pred_t == tile_idx)
                 correct += int(both.sum().item())
-                count += int(gsv.size(0))
+                count += int(player_hand_idx.size(0))
         model.train()
         return float(correct) / float(max(1, count))
     
     threshold = float(max(0.0, min(1.0, warm_up_acc)))
     # Pre-check: if current model already meets threshold on validation (or train) accuracy, skip warm-up
-    initial_acc = _eval_policy_accuracy(dl_val if dl_val is not None else dl)
+    initial_acc = _eval_policy_accuracy(dl_validation if dl_validation is not None else dl)
     if initial_acc >= threshold:
         print(f"Skipping warm-up: initial accuracy {initial_acc:.4f} >= {threshold:.4f}")
         return
@@ -627,7 +621,7 @@ def _run_warmup_bc(
         progress = tqdm(dl, desc=f"WarmUp {epoch+1}", leave=False)
         for batch in progress:
             (
-                hand, calls, disc, gsv,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages,
@@ -636,7 +630,7 @@ def _run_warmup_bc(
 
             loss, policy_loss, value_loss, _, _dbg = _compute_losses(
                 model,
-                hand, calls, disc, gsv,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages,
@@ -651,7 +645,7 @@ def _run_warmup_bc(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             warmup_opt.step()
 
-            bsz = int(gsv.size(0))
+            bsz = int(player_hand_idx.size(0))
             total_examples += bsz
             total_loss += float(loss.item()) * bsz
             pol_loss_acc += float(policy_loss.item()) * bsz
@@ -660,7 +654,9 @@ def _run_warmup_bc(
             with torch.no_grad():
                 was_training = model.training
                 model.eval()
-                a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                a_pp, t_pp, _ = model(
+                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                )
                 pred_a = torch.argmax(a_pp, dim=1)
                 pred_t = torch.argmax(t_pp, dim=1)
                 both = (pred_a == action_idx) & (pred_t == tile_idx)
@@ -684,15 +680,15 @@ def _run_warmup_bc(
 
         # Calculate validation accuracy if available
         validation_acc = None
-        if dl_val is not None:
+        if dl_validation is not None:
             model.eval()
             validation_total = validation_pol = validation_value = 0.0
             validation_count = 0
             validation_correct = 0
             with torch.no_grad():
-                for vb in dl_val:
+                for vb in dl_validation:
                     (
-                        hand, calls, disc, gsv,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages,
@@ -700,7 +696,7 @@ def _run_warmup_bc(
                     ) = _prepare_batch_tensors(vb, dev)
                     loss_v, policy_loss_v, value_loss_v, _, _ = _compute_losses(
                         model,
-                        hand, calls, disc, gsv,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages,
@@ -709,12 +705,14 @@ def _run_warmup_bc(
                         bc_fallback_ratio=bc_fallback_ratio,
                         bc_weight=1.0, policy_weight=0.0,
                     )
-                    bsz = int(gsv.size(0))
+                    bsz = int(player_hand_idx.size(0))
                     validation_total += float(loss_v.item()) * bsz
                     validation_pol += float(policy_loss_v.item()) * bsz
                     validation_value += float(value_loss_v.item()) * bsz
                     validation_count += bsz
-                    a_pp, t_pp, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                    a_pp, t_pp, _ = model(
+                        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                    )
                     pred_a = torch.argmax(a_pp, dim=1)
                     pred_t = torch.argmax(t_pp, dim=1)
                     both = (pred_a == action_idx) & (pred_t == tile_idx)
@@ -742,7 +740,7 @@ def _run_warmup_bc(
 def _run_ppo_training(
     model: torch.nn.Module,
     dl: DataLoader,
-    dl_val: DataLoader | None,
+    dl_validation: DataLoader | None,
     dev: torch.device,
     opt: torch.optim.Optimizer,
     epochs: int,
@@ -787,18 +785,18 @@ def _run_ppo_training(
         epoch_bc_batches = 0
         epoch_total_batches = 0
         for bi, batch in enumerate(progress):
-            tensors = _prepare_batch_tensors(batch, dev)
             (
-                hand, calls, disc, gsv,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages, returns,
-            ) = tensors
+            ) = _prepare_batch_tensors(batch, dev)
 
             # Print PPO debugging once per epoch at the last training step
             last_step = (bi == (len(dl) - 1))
             total, policy_loss, value_loss, batch_size_curr, dbg = _compute_losses(
-                model, hand, calls, disc, gsv,
+                model,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages, returns,
@@ -859,7 +857,7 @@ def _run_ppo_training(
 
         # Evaluate on holdout set
         validation_avg_joint_kl_prev_curr = None
-        if dl_val is not None:
+        if dl_validation is not None:
             model.eval()
             validation_total = validation_pol = validation_value = 0.0
             validation_pol_main = 0.0
@@ -870,16 +868,16 @@ def _run_ppo_training(
             # Joint KL(prev || curr) across validation set
             validation_joint_kl_prev_curr_sum = 0.0
             with torch.no_grad():
-                for vb in dl_val:
-                    tensors = _prepare_batch_tensors(vb, dev)
+                for vb in dl_validation:
                     (
-                        hand, calls, disc, gsv,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
-                    ) = tensors
+                    ) = _prepare_batch_tensors(vb, dev)
                     total_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
-                        model, hand, calls, disc, gsv,
+                        model,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
@@ -891,7 +889,9 @@ def _run_ppo_training(
                     )
 
                     # Compute current probs
-                    a_curr, t_curr, _ = model(hand.float(), calls.float(), disc.float(), gsv.float())
+                    a_curr, t_curr, _ = model(
+                        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                    )
                     
                     validation_total += float(total_v.item()) * bsz
                     validation_pol += float(policy_loss_v.item()) * bsz
@@ -899,8 +899,10 @@ def _run_ppo_training(
                     validation_pol_main += float(policy_loss_v.item()) * bsz
                     
                     # Check if this is a BC batch (ratio > bc_fallback_ratio) - if not, include in value loss tracking
-                    ratio_joint = torch.exp(joint_old_log_probs - (a_curr.log_softmax(dim=1).gather(1, action_idx.unsqueeze(1)).squeeze(1) + 
-                                                                   t_curr.log_softmax(dim=1).gather(1, tile_idx.unsqueeze(1)).squeeze(1)))
+                    # joint_old_log_probs are from dataset; compute current joint log-prob from probabilities
+                    curr_logp_a = a_curr.clamp_min(1e-8).log().gather(1, action_idx.view(-1,1)).squeeze(1)
+                    curr_logp_t = t_curr.clamp_min(1e-8).log().gather(1, tile_idx.view(-1,1)).squeeze(1)
+                    ratio_joint = torch.exp(curr_logp_a + curr_logp_t - joint_old_log_probs)
                     if ratio_joint.max().item() <= bc_fallback_ratio:
                         # Non-BC batch: include in value loss measurement
                         validation_value_non_bc += float(value_loss_v.item()) * bsz
@@ -908,11 +910,15 @@ def _run_ppo_training(
                     # Low memory mode: use a frozen previous-epoch model on CPU if available
                     if prev_epoch_model_cpu is not None:
                         # Move inputs to CPU for prev model
-                        hand_cpu = hand.float().to('cpu')
-                        calls_cpu = calls.float().to('cpu')
-                        disc_cpu = disc.float().to('cpu')
-                        gsv_cpu = gsv.float().to('cpu')
-                        a_prev, t_prev, _ = prev_epoch_model_cpu(hand_cpu, calls_cpu, disc_cpu, gsv_cpu)
+                        player_hand_idx_cpu = player_hand_idx.long().to('cpu')
+                        player_called_idx_cpu = player_called_idx.long().to('cpu')
+                        opp_called_idx_cpu = opp_called_idx.long().to('cpu')
+                        disc_idx_cpu = disc_idx.long().to('cpu')
+                        gti_cpu = game_tile_indicators_idx.long().to('cpu')
+                        gsv_cpu = game_state_vec.float().to('cpu')
+                        a_prev, t_prev, _ = prev_epoch_model_cpu(
+                            player_hand_idx_cpu, player_called_idx_cpu, opp_called_idx_cpu, disc_idx_cpu, gti_cpu, gsv_cpu,
+                        )
                         a_prev_safe = a_prev.clamp_min(1e-8)
                         t_prev_safe = t_prev.clamp_min(1e-8)
                         a_curr_safe = a_curr.clamp_min(1e-8).detach().cpu()
@@ -948,7 +954,7 @@ def _run_ppo_training(
             model.train()
 
         # Early stopping
-        if dl_val is not None:
+        if dl_validation is not None:
             # KL-based early stopping with patience: require joint KL(prev||curr) <= threshold for `patience` consecutive epochs
             if kl_threshold is not None and validation_avg_joint_kl_prev_curr is not None:
                 if validation_avg_joint_kl_prev_curr <= float(kl_threshold):
@@ -1025,12 +1031,11 @@ def train_ppo(
         try:
             player = ACPlayer.from_directory(init_model)
             net = player.network.to(dev)
-            model = net.torch_module
+            model = net.torch_module()
             ds = ACDataset(
                 dataset_path,
                 net,
                 fit_scaler=False,
-                precompute_features=False,
                 mmap=True,
             )  # in the future we can always fit scaler to fit new distribution
             print(f"Loaded initial weights from {init_model}")
@@ -1049,21 +1054,20 @@ def train_ppo(
     else:
         gsv_scaler = StandardScaler()
         # Initialize AC network first so we can use its feature extraction table and standard scaler for preprocessing
-        net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=hidden_size, embedding_dim=embedding_dim, temperature=0.05)
+        net = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=hidden_size, embedding_dim=embedding_dim)
         net = net.to(dev)
         # Ensure the scaler we persist is the exact one used by the network during preprocessing
         player = ACPlayer(gsv_scaler=gsv_scaler, network=net)
 
-        model = net.torch_module
+        model = net.torch_module()
         ds = ACDataset(
             dataset_path,
             net,
             fit_scaler=True,
-            precompute_features=False,
             mmap=True,
         )
     # Build train/validation split by game_ids to avoid leakage
-    ds_train, ds_val = ds.train_val_subsets_by_game(val_split)
+    ds_train, ds_validation = ds.train_val_subsets_by_game(val_split)
 
     # Determine DataLoader worker defaults based on platform if not provided
     resolved = _resolve_loader_defaults(
@@ -1088,9 +1092,9 @@ def train_ppo(
         prefetch_factor=None,
         persistent_workers=False,
     )
-    dl_val = (
+    dl_validation = (
         DataLoader(
-            ds_val,
+            ds_validation,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
@@ -1098,25 +1102,25 @@ def train_ppo(
             pin_memory=resolved['pin_memory'] and (dev.type in ('cuda', 'mps')),
             prefetch_factor=None,
             persistent_workers=False,
-        ) if ds_val is not None else None
+        ) if ds_validation is not None else None
     )
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     # Optional value pretraining: optimize value-only for a few epochs before warm-up/PPO
-    _run_value_pretraining(model, dl, dl_val, dev, lr, value_lr, bc_fallback_ratio)
+    _run_value_pretraining(model, dl, dl_validation, dev, lr, value_lr, bc_fallback_ratio)
 
     # Optional warm-up: behavior cloning on flat action index + value regression until accuracy threshold
-    _run_warmup_bc(model, dl, dl_val, dev, opt, warm_up_acc, warm_up_max_epochs, value_coeff, bc_fallback_ratio, lr, value_lr, warm_up_value)
+    _run_warmup_bc(model, dl, dl_validation, dev, opt, warm_up_acc, warm_up_max_epochs, value_coeff, bc_fallback_ratio, lr, value_lr, warm_up_value)
 
     # Main PPO training loop
-    timestamp = _run_ppo_training(model, dl, dl_val, dev, opt, epochs, epsilon, value_coeff, entropy_coeff, kl_threshold, patience, bc_fallback_ratio)
+    timestamp = _run_ppo_training(model, dl, dl_validation, dev, opt, epochs, epsilon, value_coeff, entropy_coeff, kl_threshold, patience, bc_fallback_ratio)
     '''
     # Evaluate final model performance on combined dataset before saving
     print("\n" + "="*80)
     print("FINAL MODEL EVALUATION BEFORE SAVING")
     print("="*80)
-    _evaluate_model_on_combined_dataset(model, dl, dl_val, dev, bc_fallback_ratio, "PRE-SAVE")
+    _evaluate_model_on_combined_dataset(model, dl, dl_validation, dev, bc_fallback_ratio, "PRE-SAVE")
     '''
     # Save trained weights and scaler
     out_dir = os.path.join(os.getcwd(), 'models')

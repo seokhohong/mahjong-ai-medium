@@ -16,6 +16,7 @@ from ..action import (
     Tsumo,
     Ron,
     Discard,
+    Riichi,
     Pon,
     Chi,
     Reaction,
@@ -24,6 +25,9 @@ from ..action import (
 from .ac_player import ACPlayer
 from ..heuristics_player import MediumHeuristicsPlayer
 
+# Intermediate Rewards
+TENPAI_REWARD = 0.1
+YAKUHAI_REWARD = 0.05
 
 class ExperienceBuffer:
     """Simple experience buffer for AC training: (encoded_features, action, reward).
@@ -103,15 +107,30 @@ class RecordingACPlayer(ACPlayer):
         """
         if len(self.experience) == 0:
             return
+        # Ensure intermediate positive rewards do not exceed the positive terminal value.
+        # We rescale only the positive intermediate rewards proportionally so that
+        # their sum is clamped to max(0, terminal_value). Negative rewards are kept as-is.
+        term_pos_cap = max(0.0, float(terminal_value))
+        if len(self.experience.rewards) >= 2:
+            interm = self.experience.rewards[:-1]
+            sum_pos = sum(r for r in interm if r > 0)
+            if sum_pos > term_pos_cap:
+                factor = term_pos_cap / sum_pos if sum_pos > 0 else 0.0
+                self.experience.rewards[:-1] = [
+                    (r * factor) if r > 0 else r for r in interm
+                ]
+        # Assign terminal reward to the last step
         self.experience.rewards[-1] = float(terminal_value)
 
     # Record decisions along with value estimates from the network
     def play(self, game_state: GamePerspective):  # type: ignore[override]
         move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
+        # Aggregate intermediate rewards (transition to tenpai, yakuhai acquisition, etc.)
+        reward = _compute_intermediate_reward(move, game_state)
         self.experience.add(
             encode_game_perspective(game_state),
             (a_idx, t_idx),
-            0.0,
+            reward,
             float(value if not self._zero_network_reward else 0.0),
             joint_logp=logp_joint,
             raw_state=game_state,
@@ -121,10 +140,11 @@ class RecordingACPlayer(ACPlayer):
 
     def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]):  # type: ignore[override]
         move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
+        reward = _compute_intermediate_reward(move, game_state)
         self.experience.add(
             encode_game_perspective(game_state),
             (a_idx, t_idx),
-            0.0,
+            reward,
             float(value if not self._zero_network_reward else 0.0),
             joint_logp=logp_joint,
             raw_state=game_state,
@@ -208,3 +228,116 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
         )
         return move
 
+def _transitions_into_tenpai(move: Any, game_state: GamePerspective) -> bool:
+    """Reward only when action transitions the hand into tenpai.
+
+    Conditions:
+    - move must be Discard or Riichi (tile-parametrized action)
+    - prior_concealed_13 = current concealed hand minus newly_drawn_tile must NOT be tenpai
+    - post_concealed_13 = current concealed hand minus move.tile must be tenpai
+
+    Notes:
+    - If `newly_drawn_tile` is missing or either removal fails, return False (no reward)
+    - For open hands, include `called_sets` in tenpai checks
+    """
+    if not isinstance(move, (Discard, Riichi)):
+        return False
+    try:
+        from ..tenpai import hand_is_tenpai_for_tiles as _tenpai_closed
+        from ..tenpai import hand_is_tenpai as _tenpai_any
+    except Exception:
+        return False
+
+    hand = list(getattr(game_state, 'player_hand', []))
+    if not hand:
+        return False
+    called_sets = getattr(game_state, 'called_sets', {})
+    my_calls = called_sets.get(0, []) if isinstance(called_sets, dict) else []
+
+    def _is_tenpai(tiles_13: List[Tile]) -> bool:
+        return _tenpai_any(tiles_13, my_calls) if my_calls else _tenpai_closed(tiles_13)
+
+    # Build prior concealed set: remove newly_drawn_tile (works for closed and open hands)
+    last = getattr(game_state, 'newly_drawn_tile', None)
+    removed_prior = False
+    prior_13: List[Tile] = []
+    if last is None:
+        # No draw (e.g., after a call); use current concealed set as the prior state
+        prior_13 = list(hand)
+        removed_prior = True
+    else:
+        for t in hand:
+            if (not removed_prior) and t.suit == last.suit and t.tile_type == last.tile_type:
+                removed_prior = True
+                continue
+            prior_13.append(t)
+        if not removed_prior:
+            return False
+    if _is_tenpai(prior_13):
+        # Already in tenpai before the action; do not reward holding
+        return False
+
+    # Build post concealed set: remove the tile in the chosen move
+    target = move.tile
+    removed_post = False
+    post_13: List[Tile] = []
+    for t in hand:
+        if (not removed_post) and t.suit == target.suit and t.tile_type == target.tile_type:
+            removed_post = True
+            continue
+        post_13.append(t)
+    if not removed_post:
+        return False
+    return _is_tenpai(post_13)
+
+
+def _is_yakuhai_tile(tile: Tile, game_state: GamePerspective) -> bool:
+    from ..tile import Suit, Honor as H
+    if tile.suit != Suit.HONORS:
+        return False
+    # Dragons are always yakuhai
+    if tile.tile_type in (H.WHITE, H.GREEN, H.RED):
+        return True
+    # Seat and round winds are yakuhai
+    seat_winds = getattr(game_state, 'seat_winds', {}) or {}
+    round_wind = getattr(game_state, 'round_wind', None)
+    my_seat = seat_winds.get(0, None) if isinstance(seat_winds, dict) else None
+    return tile.tile_type == my_seat or tile.tile_type == round_wind
+
+
+def _yakuhai_acquired_by_draw(game_state: GamePerspective) -> bool:
+    # Reward if newly drawn tile forms (at least) a triplet of yakuhai in concealed hand
+    last = getattr(game_state, 'newly_drawn_tile', None)
+    if last is None:
+        return False
+    if not _is_yakuhai_tile(last, game_state):
+        return False
+    hand = list(getattr(game_state, 'player_hand', []))
+    cnt = sum(1 for t in hand if t.suit == last.suit and t.tile_type == last.tile_type)
+    # If we drew one and now have 3+, we must have had >=2 before draw; treat as acquisition
+    return cnt >= 3
+
+
+def _yakuhai_acquired_by_pon(move: Any, game_state: GamePerspective) -> bool:
+    # Reward if a Pon creates a yakuhai triplet
+    if not isinstance(move, Pon):
+        return False
+    tiles = getattr(move, 'tiles', [])
+    if len(tiles) != 3:
+        return False
+    a = tiles[0]
+    # Ensure identical tiles
+    if not all(t.suit == a.suit and t.tile_type == a.tile_type for t in tiles):
+        return False
+    return _is_yakuhai_tile(a, game_state)
+
+
+def _compute_intermediate_reward(move: Any, game_state: GamePerspective) -> float:
+    reward = 0.0
+    # Tenpai transition on action (discard/riichi), and also valid after calls due to prior-state handling
+    if _transitions_into_tenpai(move, game_state):
+        reward += float(TENPAI_REWARD)
+    # Yakuhai acquisition by draw or by Pon
+    if _yakuhai_acquired_by_draw(game_state) or _yakuhai_acquired_by_pon(move, game_state):
+        reward += float(YAKUHAI_REWARD)
+    return reward

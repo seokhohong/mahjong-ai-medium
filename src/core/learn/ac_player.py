@@ -73,11 +73,12 @@ class ACPlayer(Player):
         """
         if gsv_scaler is None:
             gsv_scaler = StandardScaler()
+        # Note: ACNetwork no longer uses an internal temperature; keep network_temperature
+        # for backward compatibility at the player level only.
         network = ACNetwork(
             gsv_scaler=gsv_scaler,
             hidden_size=hidden_size,
             embedding_dim=embedding_dim,
-            temperature=network_temperature,
         )
         return cls(network=network, gsv_scaler=gsv_scaler, temperature=temperature,
                    expert_injection=expert_injection)

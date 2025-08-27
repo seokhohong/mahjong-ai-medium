@@ -34,21 +34,25 @@ ACTION_HEAD_SIZE: int = len(ACTION_HEAD_ORDER)
 TILE_HEAD_SIZE: int = 38
 TILE_HEAD_NOOP: int = TILE_HEAD_SIZE - 1
 
+# Generic sentinel used across the codebase to indicate the absence of a tile index
+# (e.g., no riichi declaration tile selected yet).
+NULL_TILE_INDEX: int = -1
+
 # Legacy flat policy (kept for reference/back-compat reading of old datasets/models only)
 FLAT_POLICY_SIZE: int = 160
 # Tile index space used by feature embeddings (unchanged)
 TILE_INDEX_PAD: int = 0
 TILE_INDEX_SIZE: int = 38
 
-from ..constants import (
-    MAX_CALLS,
-    MAX_CALLED_SET_SIZE,
-    MAX_CALLED_TILES_PER_PLAYER,
-    CALLED_SETS_DEFAULT_SHAPE,
-    MAX_DISCARDS_PER_PLAYER,
-)
-# Game-state vector length used by serialization pipeline (fallback default)
-GAME_STATE_VEC_LEN: int = 32
+MAX_CONCEALED_TILES: int = 14
+
+# Game-state vector length used by serialization pipeline (without key_tiles_idx)
+# Current layout (after feature reduction):
+# [remaining_tiles, last_discard_player,
+#  seat_winds[4], riichi_decl_idxs[4],
+#  legal_action_mask[ACTION_HEAD_SIZE]]
+# Base = 10, so total = 10 + ACTION_HEAD_SIZE
+GAME_STATE_VEC_LEN: int = 10 + ACTION_HEAD_SIZE
 # Default maximum turns for episode rollout
 MAX_TURNS: int = 256
 
@@ -75,12 +79,12 @@ def chi_variant_index(last_discarded_tile: 'Tile', tiles: list['Tile']) -> int:
     except Exception:
         Tile = object  # type: ignore
     if last_discarded_tile is None or len(tiles) < 2:
-        return -1
+        raise IllegalChiException()
     d = int(getattr(last_discarded_tile.tile_type, 'value', 0))
     try:
         ranks = sorted(int(getattr(t.tile_type, 'value', 0)) for t in tiles)
     except Exception:
-        return -1
+        raise IllegalChiException()
     if ranks == [d - 2, d - 1]:
         return 0
     if ranks == [d - 1, d + 1]:

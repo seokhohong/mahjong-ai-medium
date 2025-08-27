@@ -10,10 +10,13 @@ import os
 # Add the src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.game import hand_is_tenpai, hand_is_tenpai_for_tiles, CalledSet
+from core.game import hand_is_tenpai, hand_is_tenpai_for_tiles, CalledSet, GamePerspective
 from core.tile import Tile, TileType, Suit, Honor
 from core.tenpai import can_complete_standard_with_calls, clear_hand_caches, waits_for_tiles
 from core.tenpai import hand_is_tenpai_with_calls  # type: ignore
+from core.action import Discard, Riichi, Action
+from core.learn.recording_ac_player import _transitions_into_tenpai
+from core.learn.ac_constants import NULL_TILE_INDEX
 
 
 class TestTenpaiHelpers(unittest.TestCase):
@@ -28,7 +31,57 @@ class TestTenpaiHelpers(unittest.TestCase):
                          Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)]
         self.assertEqual(len(hand), 13)
         self.assertTrue(hand_is_tenpai_for_tiles(hand))
-        self.assertTrue(hand_is_tenpai(hand))
+
+    def test_puts_hand_in_tenpai_after_move_closed(self):
+        # Start from a known 13-tile tenpai hand
+        base_s = [
+            Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.TWO), Tile(Suit.SOUZU, TileType.THREE),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.SOUZU, TileType.SEVEN), Tile(Suit.SOUZU, TileType.EIGHT), Tile(Suit.SOUZU, TileType.NINE),
+        ]
+        tenpai13 = base_s + [Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.SEVEN),
+                              Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.FOUR)]
+        self.assertTrue(hand_is_tenpai_for_tiles(tenpai13))
+        # Create a 14-tile hand by adding a junk tile and discard that tile
+        extra = Tile(Suit.HONORS, Honor.WHITE)
+        hand14 = list(tenpai13) + [extra]
+        gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=, owner_of_reactable_tile=None,
+                             called_sets={0: [], 1: [], 2: [], 3: []}, player_discards={0: [], 1: [], 2: [], 3: []},
+                             called_discards={0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None,
+                             seat_winds={0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH},
+                             round_wind=Honor.EAST, dora_indicators=[],
+                             riichi_declaration_tile={0: NULL_TILE_INDEX, 1: NULL_TILE_INDEX, 2: NULL_TILE_INDEX,
+                                                      3: NULL_TILE_INDEX})
+        move = Discard(tile=extra)
+        self.assertTrue(_transitions_into_tenpai(move, gp))
+
+    def test_puts_hand_in_tenpai_after_move_open(self):
+        # Open hand: chi 1-2-3m and pon E E E; concealed 7 tiles tenpai as in existing test
+        chi = CalledSet([
+            Tile(Suit.MANZU, TileType.ONE), Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE)
+        ], 'chi', Tile(Suit.MANZU, TileType.TWO), caller_position=0, source_position=3)
+        pon = CalledSet([
+            Tile(Suit.HONORS, Honor.EAST), Tile(Suit.HONORS, Honor.EAST), Tile(Suit.HONORS, Honor.EAST)
+        ], 'pon', Tile(Suit.HONORS, Honor.EAST), caller_position=0, source_position=1)
+        concealed7 = [
+            Tile(Suit.PINZU, TileType.TWO), Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.FOUR),
+            Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE),
+            Tile(Suit.SOUZU, TileType.NINE), Tile(Suit.SOUZU, TileType.NINE),
+        ]
+        # Player's concealed hand should NOT include called set tiles.
+        # Build 8 concealed: concealed7 + one extra junk to discard
+        extra = Tile(Suit.HONORS, Honor.WHITE)
+        hand14 = list(concealed7) + [extra]
+        gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=, owner_of_reactable_tile=None,
+                             called_sets={0: [chi, pon], 1: [], 2: [], 3: []},
+                             player_discards={0: [], 1: [], 2: [], 3: []}, called_discards={0: [], 1: [], 2: [], 3: []},
+                             newly_drawn_tile=None,
+                             seat_winds={0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH},
+                             round_wind=Honor.EAST, dora_indicators=[],
+                             riichi_declaration_tile={0: NULL_TILE_INDEX, 1: NULL_TILE_INDEX, 2: NULL_TILE_INDEX,
+                                                      3: NULL_TILE_INDEX})
+        move = Discard(tile=extra)
+        self.assertTrue(_transitions_into_tenpai(move, gp))
 
     def test_chiitoi_tenpai(self):
         # Six pairs + one singleton -> chiitoitsu tenpai

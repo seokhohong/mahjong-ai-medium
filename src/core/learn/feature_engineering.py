@@ -10,7 +10,7 @@ from core.constants import (
     MAX_DISCARDS_PER_PLAYER, NUM_PLAYERS,
 )
 from core.game import GamePerspective, CalledSet
-from core.tile import Tile, Suit, TileType, Honor
+from core.tile import Tile, Suit, TileType, Honor, tile_flat_index, tile_from_flat_index, UNIQUE_TILE_COUNT
 
 
 # Fixed sizes for vectorization (aligned with game rules)
@@ -18,62 +18,6 @@ from core.tile import Tile, Suit, TileType, Honor
 # During the acting player's turn (pre-discard), the transient hand may be 14.
 MAX_HAND_LEN: int = 13
 PAD_IDX: int = -1  # padding index; 0.. are valid tile indices (including aka slots)
-
-
-def tile_to_index(tile: Tile) -> int:
-    """Map a Tile to a unique integer index in [1..37].
-
-    Layout (compatible with TILE_INDEX_SIZE=38):
-    - 1..9   : Manzu 1..9
-    - 10..18 : Pinzu 1..9
-    - 19..27 : Souzu 1..9
-    - 28..34 : Honors EAST(1)..RED(7)
-    - 35     : Manzu aka 5
-    - 36     : Pinzu aka 5
-    - 37     : Souzu aka 5
-
-    Padding uses PAD_IDX (-1) and is handled by callers.
-    """
-    if tile.suit == Suit.MANZU:
-        if tile.tile_type == TileType.FIVE and tile.aka:
-            return 35
-        return int(tile.tile_type.value)
-    if tile.suit == Suit.PINZU:
-        if tile.tile_type == TileType.FIVE and tile.aka:
-            return 36
-        return 9 + int(tile.tile_type.value)
-    if tile.suit == Suit.SOUZU:
-        if tile.tile_type == TileType.FIVE and tile.aka:
-            return 37
-        return 18 + int(tile.tile_type.value)
-    # Honors EAST(1)..RED(7) -> 28..34
-    return 27 + int(tile.tile_type.value)
-
-
-def index_to_tile(idx: int) -> Tile:
-    """Inverse of tile_to_index.
-
-    For idx <= 0, returns a placeholder tile (ignored by callers in padding/None cases).
-    """
-    if idx <= 0:
-        return Tile(Suit.MANZU, TileType.ONE)
-    # Aka slots
-    if idx == 35:
-        return Tile(Suit.MANZU, TileType.FIVE, aka=True)
-    if idx == 36:
-        return Tile(Suit.PINZU, TileType.FIVE, aka=True)
-    if idx == 37:
-        return Tile(Suit.SOUZU, TileType.FIVE, aka=True)
-    # Normal suited/honors
-    if 1 <= idx <= 9:
-        return Tile(Suit.MANZU, TileType(idx))
-    if 10 <= idx <= 18:
-        return Tile(Suit.PINZU, TileType(idx - 9))
-    if 19 <= idx <= 27:
-        return Tile(Suit.SOUZU, TileType(idx - 18))
-    # 28..34
-    return Tile(Suit.HONORS, Honor(idx - 27))
-
 
 def tile_is_aka(tile: Tile) -> int:
     # Deprecated: aka encoded in index now
@@ -83,13 +27,21 @@ def tile_is_aka(tile: Tile) -> int:
 def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
     """Encode a GamePerspective into fixed-size features.
 
-    Returns a dict with keys: hand_idx, called_idx, disc_idx, called_discards, game_state.
+    Breaking change: we now return explicit fields instead of a packed 'game_state'.
+    Returns a dict with keys at least:
     - hand_idx: List[int] of length MAX_HAND_LEN + 1, includes the newly drawn tile for any action
-    - called_idx: int array shape (4, MAX_CALLED_SETS, MAX_TILES_PER_CALLED_SET)
-      (pads unused set slots and tiles with PAD_IDX)
+    - called_idx: int array shape (4, MAX_CALLED_SETS, MAX_TILES_PER_CALLED_SET) (pads with PAD_IDX)
     - disc_idx: List[List[int]] shape (4, MAX_DISCARDS_PER_PLAYER)
-    - game_state: flat list of scalars encoding meta state
-    - newly_drawn_tile: int index of the newly drawn tile, for any action
+    - called_discards: np.ndarray shape like disc_idx mask for calls
+    - dora_indicator_tiles: np.ndarray of length 4 with tile indices (or -1 for pad)
+    - round_wind: int (Honor.value)
+    - seat_winds: List[int] length 4 (Honor.value per player, relative to perspective)
+    - legal_action_mask: List[int] length ACTION_HEAD_SIZE
+    - riichi_declarations: List[int] length 4 (discard indices, meaning which index in disc_idx riichi was declared, or -1)
+    - remaining_tiles: int
+    - owner_of_reactable_tile: int in {-1,0,1,2,3}
+    - reactable_tile: int tile index or -1
+    - newly_drawn_tile: int tile index or -1
     """
     # Hand
     hand_tiles = list(gp.player_hand)
@@ -97,7 +49,7 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
     state_is_action = (getattr(gp, 'state', None) is not None) and (
         gp.state is game.Action or getattr(gp.state, '__name__', '') == 'Action'
     )
-    hand_vals: List[int] = [tile_to_index(t) for t in hand_tiles]
+    hand_vals: List[int] = [int(tile_flat_index(t)) for t in hand_tiles]
 
     # Always output fixed-size arrays; it is possible to have a 14-tile hand in the action state
     pad_len = (MAX_HAND_LEN + 1) - len(hand_vals)
@@ -114,7 +66,7 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
         for si in range(MAX_CALLED_SETS):
             if si < len(sets):
                 cs = sets[si]
-                vals = [tile_to_index(t) for t in cs.tiles[:MAX_TILES_PER_CALLED_SET]]
+                vals = [int(tile_flat_index(t)) for t in cs.tiles[:MAX_TILES_PER_CALLED_SET]]
                 if len(vals) < MAX_TILES_PER_CALLED_SET:
                     vals.extend([PAD_IDX] * (MAX_TILES_PER_CALLED_SET - len(vals)))
             else:
@@ -127,7 +79,7 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
     disc_rows: List[np.ndarray] = []
     for pid in range(NUM_PLAYERS):
         tiles = gp.player_discards.get(pid, [])[:MAX_DISCARDS_PER_PLAYER]
-        vals = [tile_to_index(t) for t in tiles]
+        vals = [int(tile_flat_index(t)) for t in tiles]
         if len(vals) < MAX_DISCARDS_PER_PLAYER:
             pad = MAX_DISCARDS_PER_PLAYER - len(vals)
             vals.extend([PAD_IDX] * pad)
@@ -147,98 +99,108 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
         called_discards_rows.append(mask)
     called_discards = np.stack(called_discards_rows, axis=0)
 
-    # Game state vector (compact, fixed-length base + legal action mask):
-    # [remaining_tiles, last_discard_idx, last_discard_player,
-    #  is_action_state(0/1), can_call(0/1), last_drawn_idx,
-    #  round_wind(1..4), seat_winds[0..3] (1..4), riichi_flags[0..3] (0/1),
-    #  legal_action_mask[0..ACTION_HEAD_SIZE-1] (0/1)]
-    def tile_idx_or_zero(t):
-        return 0 if t is None else tile_to_index(t)
-
     round_wind_val = int(gp.round_wind.value)
     seat_winds_vals = [int(gp.seat_winds[i].value) for i in range(4)]
-    riichi_flags = [1 if gp.riichi_declared.get(i, False) else 0 for i in range(4)]
+    # Riichi declaration discard-order indices per player (-1 if not declared)
+    riichi_decl_idxs = [int(gp.riichi_declaration_tile.get(i, -1)) for i in range(4)]
 
-    # direct featurization risks overfitting on player indices, but we're going to keep it for now to avoid risk of bugs
-    # Extend with legal action mask from perspective to avoid separate can_ron/can_tsumo flags
+    # Dora list for indicators -> indices up to 4
+    dora_list = getattr(gp, 'dora_indicators', []) or []
+    dora_vals = [int(tile_flat_index(t)) for t in dora_list[:4]]
+
+    # Reactable tile and dora indicators (explicit fields)
+    reactable_idx = int(-1)
+    if hasattr(gp, '_reactable_tile') and getattr(gp, '_reactable_tile') is not None:
+        try:
+            reactable_idx = int(tile_flat_index(getattr(gp, '_reactable_tile')))
+        except Exception:
+            reactable_idx = -1
+    # Newly drawn tile index (explicit)
+    newly_idx = int(-1)
+    if hasattr(gp, 'newly_drawn_tile') and getattr(gp, 'newly_drawn_tile') is not None:
+        try:
+            newly_idx = int(tile_flat_index(getattr(gp, 'newly_drawn_tile')))
+        except Exception:
+            newly_idx = -1
+    while len(dora_vals) < 4:
+        dora_vals.append(-1)
+    dora_indicator_tiles = np.asarray(dora_vals[:4], dtype=np.int32)
+
+    # Explicit meta fields to return in place of packed game_state
     lam = gp.legal_action_mask()
     try:
         lam_list = [int(x) for x in lam.tolist()]
     except Exception:
         # Fallback in unlikely cases
         lam_list = [int(v) for v in np.asarray(lam).astype(np.int32).tolist()]
-    game_state_list: List[int] = [
-        int(gp.remaining_tiles),
-        int(tile_idx_or_zero(gp._reactable_tile)),
-        -1 if gp._owner_of_reactable_tile is None else int(gp._owner_of_reactable_tile),
-        int(1 if gp.state is type(gp).Action else 0) if hasattr(gp, 'Action') else int(1 if gp.state.__name__ == 'Action' else 0),
-        int(gp.can_call),
-        int(tile_idx_or_zero(gp.newly_drawn_tile)),
-        round_wind_val,
-        *seat_winds_vals,
-        *riichi_flags,
-        *lam_list,
-    ]
-    game_state = np.asarray(game_state_list, dtype=np.int32)
+    owner_idx = -1 if gp._owner_of_reactable_tile is None else int(gp._owner_of_reactable_tile)
     # Note: store current_player_idx is not directly available from perspective; infer via is_current_turn + players' turns is outside scope.
     return {
         'hand_idx': hand_idx,
         'called_idx': called_idx,
         'disc_idx': disc_idx,
-        'game_state': game_state,
-        'called_discards': called_discards
+        'called_discards': called_discards,
+        'round_wind': int(gp.round_wind.value),
+        'seat_winds': seat_winds_vals, # technically we don't need all seat winds, just one, since they're always in order
+        'legal_action_mask': np.asarray(lam_list, dtype=np.int32),
+        'riichi_declarations': riichi_decl_idxs,
+        'remaining_tiles': int(gp.remaining_tiles),
+        'owner_of_reactable_tile': int(owner_idx),
+        'reactable_tile': int(reactable_idx),
+        'newly_drawn_tile': int(newly_idx),
+        'dora_indicator_tiles': dora_indicator_tiles,
     }
 
 
 def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
     """Reconstruct a GamePerspective from encoded features.
-    Note: Called sets are reconstructed as a single flattened CalledSet per player when present.
+    This consumes the new explicit fields written by encode_game_perspective() and intentionally
+    drops legacy compatibility with packed 'game_state' and 'game_tile_indicators'.
+    Note: Called sets are reconstructed per set slot; call_type is set to 'chi' as a placeholder.
     """
+    # Fetch explicit arrays
     hand_idx_arr = np.asarray(features['hand_idx'], dtype=np.int32)
     called_idx_arr = np.asarray(features['called_idx'], dtype=np.int32)
     disc_idx_arr = np.asarray(features['disc_idx'], dtype=np.int32)
-    gs_arr = np.asarray(features['game_state'], dtype=np.int32)
     called_discards_arr = np.asarray(features['called_discards'], dtype=np.int32)
+    round_wind_val = int(features['round_wind'])
+    seat_winds_vals = [int(v) for v in np.asarray(features['seat_winds'], dtype=np.int32).tolist()]
+    riichi_decl_idxs_vals = [int(v) for v in np.asarray(features['riichi_declarations'], dtype=np.int32).tolist()]
+    remaining_tiles = int(features['remaining_tiles'])
+    owner_val = int(features.get('owner_of_reactable_tile', -1))
+    reactable_idx = int(features.get('reactable_tile', -1))
+    newly_idx = int(features.get('newly_drawn_tile', -1))
+    dora_idxs = [int(v) for v in np.asarray(features.get('dora_indicator_tiles', []), dtype=np.int32).tolist()]
 
-    # Unpack game state
-    remaining_tiles = int(gs_arr[0])
-    last_discard_idx = int(gs_arr[1])
-    last_discard_player = int(gs_arr[2])
-    state_is_action = bool(int(gs_arr[3]))
-    can_call = bool(int(gs_arr[4]))
-    last_drawn_idx = int(gs_arr[5])
-    round_wind_val = int(gs_arr[6])
-    seat_winds_vals = [int(v) for v in gs_arr[7:11].tolist()]
-    riichi_flags_vals = [int(v) for v in gs_arr[11:15].tolist()]
-
-    # Build basic fields
+    # Build basic fields from indices
     player_hand: List[Tile] = []
     for i in hand_idx_arr.tolist():
         if i < 0:
             continue
-        t = index_to_tile(i)
+        t = tile_from_flat_index(int(i))
         player_hand.append(t)
     called_sets: Dict[int, List[CalledSet]] = {i: [] for i in range(4)}
     for pid in range(4):
         sets: List[CalledSet] = []
-        # Support both legacy (4,12) and new (4,4,4) shapes
-        if called_idx_arr.ndim == 2:
-            tiles: List[Tile] = []
-            for i in called_idx_arr[pid].tolist():
-                if i < 0:
-                    continue
-                tiles.append(index_to_tile(int(i)))
-            if tiles:
-                sets = [CalledSet(tiles=tiles, call_type='chi', called_tile=None, caller_position=pid, source_position=None)]
-        else:
+        if called_idx_arr.ndim == 3:
+            # Shape expected: (4, MAX_CALLED_SETS, MAX_TILES_PER_CALLED_SET)
             for si in range(min(MAX_CALLED_SETS, called_idx_arr.shape[1])):
                 tiles: List[Tile] = []
                 for i in called_idx_arr[pid, si].tolist():
                     if int(i) < 0:
                         continue
-                    tiles.append(index_to_tile(int(i)))
+                    tiles.append(tile_from_flat_index(int(i)))
                 if tiles:
                     sets.append(CalledSet(tiles=tiles, call_type='chi', called_tile=None, caller_position=pid, source_position=None))
+        else:
+            # Fallback: flatten per player if not 3D
+            tiles: List[Tile] = []
+            for i in called_idx_arr[pid].tolist():
+                if int(i) < 0:
+                    continue
+                tiles.append(tile_from_flat_index(int(i)))
+            if tiles:
+                sets = [CalledSet(tiles=tiles, call_type='chi', called_tile=None, caller_position=pid, source_position=None)]
         called_sets[pid] = sets
     player_discards: Dict[int, List[Tile]] = {}
     for pid in range(4):
@@ -246,23 +208,21 @@ def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
         for i in disc_idx_arr[pid].tolist():
             if i < 0:
                 continue
-            t = index_to_tile(i)
+            t = tile_from_flat_index(int(i))
             tiles.append(t)
         player_discards[pid] = tiles
 
-    last_discarded_tile = index_to_tile(last_discard_idx) if last_discard_idx > 0 else None
-    last_discard_player_val = None if last_discard_player < 0 else int(last_discard_player)
-    newly_drawn_tile = index_to_tile(last_drawn_idx) if last_drawn_idx > 0 else None
+    # Reactable tile, newly drawn tile, and owner
+    last_discarded_tile = tile_from_flat_index(int(reactable_idx)) if reactable_idx >= 0 else None
+    last_discard_player_val = None if owner_val < 0 else int(owner_val)
+    newly_drawn_tile = tile_from_flat_index(int(newly_idx)) if newly_idx >= 0 else None
 
     # Winds
     round_wind = Honor(round_wind_val)
     seat_winds: Dict[int, Honor] = {i: Honor(seat_winds_vals[i]) for i in range(4)}
 
-    # State types: ensure identity matches core.game classes for `is` checks
-    StateType = game.Action if state_is_action else game.Reaction
-
-    # Riichi flags
-    riichi_declared: Dict[int, bool] = {i: bool(riichi_flags_vals[i]) for i in range(4)}
+    # Riichi declaration discard-order index per player (-1 if not declared)
+    riichi_declaration_tile: Dict[int, int] = {i: int(riichi_decl_idxs_vals[i]) for i in range(4)}
 
     # Reconstruct called_discards as dict of lists, bounding indices to available discards length
     called_discards: Dict[int, List[int]] = {}
@@ -271,21 +231,13 @@ def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
         idxs = [int(i) for i, v in enumerate(mask.tolist()) if int(v) == 1 and i < len(player_discards.get(pid, []))]
         called_discards[pid] = idxs
 
-    gp = GamePerspective(
-        player_hand=player_hand,
-        remaining_tiles=int(remaining_tiles),
-        last_discarded_tile=last_discarded_tile,
-        last_discard_player=last_discard_player_val,
-        called_sets=called_sets,
-        player_discards=player_discards,
-        called_discards=called_discards,
-        state=StateType,
-        newly_drawn_tile=newly_drawn_tile,
-        can_call=can_call,
-        seat_winds=seat_winds,
-        round_wind=round_wind,
-        riichi_declared=riichi_declared,
-    )
-    return gp
+    # Reconstruct dora indicators from indices if available
+    dora_indicators = [tile_from_flat_index(int(i)) for i in dora_idxs if int(i) >= 0]
 
+    gp = GamePerspective(player_hand=player_hand, remaining_tiles=int(remaining_tiles), reactable_tile=last_discarded_tile,
+                         owner_of_reactable_tile=last_discard_player_val, called_sets=called_sets,
+                         player_discards=player_discards, called_discards=called_discards,
+                         newly_drawn_tile=newly_drawn_tile, seat_winds=seat_winds, round_wind=round_wind,
+                         dora_indicators=dora_indicators, riichi_declaration_tile=riichi_declaration_tile)
+    return gp
 

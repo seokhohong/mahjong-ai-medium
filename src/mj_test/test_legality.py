@@ -365,7 +365,7 @@ class TestMediumLegality(unittest.TestCase):
         g.last_drawn_tile = hand_p0[0]
 
         # Sanity: not already in riichi
-        g.riichi_declared[0] = False
+        g.riichi_declaration_tile[0] = -1
 
         moves = g.legal_moves(0)
         # Expect at least one Discard option
@@ -408,7 +408,7 @@ class TestMediumLegality(unittest.TestCase):
         g.current_player_idx = 0
         g._reactable_tile = None
         g._owner_of_reactable_tile = None
-        g.riichi_declared[0] = False
+        g.riichi_declaration_tile[0] = -1
 
         # Test across each tile as the last drawn tile
         for drawn in hand:

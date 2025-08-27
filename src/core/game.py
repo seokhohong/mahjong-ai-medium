@@ -5,7 +5,7 @@ from enum import Enum
 from typing import List, Optional, Dict, Any, Union, Tuple
 import numpy as np
 
-from src.core.learn.ac_constants import chi_variant_index, ACTION_HEAD_INDEX, ACTION_HEAD_ORDER, TILE_HEAD_NOOP, TILE_HEAD_SIZE
+from .learn.ac_constants import chi_variant_index, ACTION_HEAD_INDEX, ACTION_HEAD_ORDER, TILE_HEAD_NOOP, TILE_HEAD_SIZE, NULL_TILE_INDEX
 from .constants import (
     NUM_PLAYERS as MC_NUM_PLAYERS,
     DEALER_ID_START,
@@ -787,34 +787,25 @@ def _chi_variant_index(last_discarded_tile: Optional[Tile], tiles: List[Tile]) -
 
 
 class GamePerspective:
-    def __init__(self,
-                 player_hand: List[Tile],
-                 remaining_tiles: int,
-                 last_discarded_tile: Optional[Tile],
-                 last_discard_player: Optional[int],
-                 called_sets: Dict[int, List[CalledSet]],
-                 player_discards: Dict[int, List[Tile]],
-                 called_discards: Dict[int, List[int]],
-                 state: type,
-                 newly_drawn_tile: Optional[Tile],
-                 can_call: bool,
-                 seat_winds: Dict[int, Honor],
-                 round_wind: Honor,
-                 riichi_declared: Dict[int, bool],
-                 ) -> None:
+    def __init__(self, player_hand: List[Tile], remaining_tiles: int, reactable_tile: Optional[Tile],
+                 owner_of_reactable_tile: Optional[int], called_sets: Dict[int, List[CalledSet]],
+                 player_discards: Dict[int, List[Tile]], called_discards: Dict[int, List[int]],
+                 newly_drawn_tile: Optional[Tile], seat_winds: Dict[int, Honor], round_wind: Honor,
+                 dora_indicators: List[Tile], riichi_declaration_tile: Dict[int, int]) -> None:
         self.player_hand = sorted(list(player_hand), key=_tile_sort_key)
         self.remaining_tiles = remaining_tiles
-        self._reactable_tile = last_discarded_tile
-        self._owner_of_reactable_tile = last_discard_player
+        self._reactable_tile = reactable_tile
+        self._owner_of_reactable_tile = owner_of_reactable_tile
         self.called_sets = {pid: list(sets) for pid, sets in called_sets.items()}
         self.player_discards = {pid: list(ts) for pid, ts in player_discards.items()}
         self.called_discards = {pid: list(idxs) for pid, idxs in called_discards.items()}
-        self.state = state
+        self.state = Reaction if reactable_tile else Action
         self.newly_drawn_tile = newly_drawn_tile
-        self.can_call = can_call
+        self.can_call = self.state == Reaction and owner_of_reactable_tile != 0
         self.seat_winds = dict(seat_winds)
         self.round_wind = round_wind
-        self.riichi_declared = dict(riichi_declared)
+        self.dora_indicators = list(dora_indicators)
+        self.riichi_declaration_tile = dict(riichi_declaration_tile)
 
     def __repr__(self) -> str:
         def _fmt_hand(tiles: List[Tile]) -> str:
@@ -845,8 +836,25 @@ class GamePerspective:
             f"Draw {newly_s} | Last {last_s} from {last_from} | CanCall {can_call_s} | Round {self.round_wind.name}"
         )
 
+    def has_declared_riichi(self) -> bool:
+        """Return True if the current player (0) has already declared riichi."""
+        return self.riichi_declaration_tile.get(0, NULL_TILE_INDEX) != NULL_TILE_INDEX
+
+    # doesn't check tenpai condition
+    def can_declare_riichi(self) -> bool:
+        """Return True if the current player (0) can declare riichi now.
+
+        Conditions: not yet declared and no open sets (closed hand).
+        """
+        return self.riichi_declaration_tile.get(0, NULL_TILE_INDEX) == NULL_TILE_INDEX and not self.called_sets.get(0, [])
+
     def _concealed_tiles(self) -> List[Tile]:
         return list(self.player_hand)
+
+    def reactable_tile(self):
+        # Return a copy of the reactable tile if present; otherwise None.
+        # Some tests access this in a None-safe way, so avoid calling copy() on None.
+        return None if self._reactable_tile is None else self._reactable_tile.copy()
 
     def legal_action_mask(self) -> np.ndarray:
         """Return ACTION_HEAD_SIZE-length 0/1 mask over action head.
@@ -1040,7 +1048,7 @@ class GamePerspective:
 
     def is_legal(self, move: Union[Action, Reaction]) -> bool:
         # Riichi restriction: after declaring, only Tsumo or Kan actions are allowed on own turn
-        riichi_locked = self.riichi_declared.get(0, False)
+        riichi_locked = self.has_declared_riichi()
         if isinstance(move, (Tsumo, Discard, Riichi, KanKakan, KanAnkan)):
             if self.state is not Action:
                 return False
@@ -1048,16 +1056,21 @@ class GamePerspective:
                 return self.can_tsumo()
             if isinstance(move, Riichi):
                 # Closed hand, not already in riichi, and discarding specified tile keeps tenpai
-                if self.riichi_declared.get(0, False):
+                if self.has_declared_riichi():
                     return False
                 if self.called_sets.get(0, []):
                     return False
-                if move.tile not in self.player_hand:
+                # The specified discard must put/keep hand in tenpai
+                try:
+                    # 13 tiles after discard)
+                    hand = list(self.player_hand)
+                    # Check tenpai after discarding this tile (13 tiles state)
+                    from .tenpai import hand_is_tenpai_for_tiles as _tenpai_tiles
+                    hand_after = list(self.player_hand)
+                    hand_after.remove(move.tile)
+                    return _tenpai_tiles(hand_after)
+                except ValueError:
                     return False
-                # Check tenpai after discarding this tile (13 tiles state)
-                from .tenpai import hand_is_tenpai_for_tiles as _tenpai_tiles
-                hand_after = list(self.player_hand)
-                hand_after.remove(move.tile)
                 return _tenpai_tiles(hand_after)
             if isinstance(move, KanKakan):
                 # Must have an existing pon of this tile
@@ -1098,7 +1111,7 @@ class GamePerspective:
 
     def legal_moves(self) -> List[Union[Action, Reaction]]:
         moves: List[Union[Action, Reaction]] = []
-        riichi_locked = self.riichi_declared.get(0, False)
+        riichi_locked = self.has_declared_riichi()
         if self.state is Reaction:
             moves = [PassCall()]
             if self.can_ron():
@@ -1112,10 +1125,10 @@ class GamePerspective:
             if self.can_tsumo():
                 moves.append(Tsumo())
             # Riichi declaration
-            if not self.riichi_declared.get(0, False) and not self.called_sets.get(0, []):
+            if self.can_declare_riichi():
                 # Optimized riichi candidates without per-tile is_legal calls
                 from .tenpai import legal_riichi_moves
-                moves.extend(legal_riichi_moves(self.riichi_declared, self.called_sets, self.player_hand))
+                moves.extend(legal_riichi_moves(self.riichi_declaration_tile, self.called_sets, self.player_hand))
             # Kakan opportunities
             for t in self.are_legal_kakans():
                 moves.append(KanKakan(t))
@@ -1249,8 +1262,8 @@ class MediumJong:
         self.seat_winds: Dict[int, Honor] = {
             0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH
         }
-        # Riichi flags
-        self.riichi_declared: Dict[int, bool] = {i: False for i in range(4)}
+        # Riichi declaration discard index per player (-1 if not declared)
+        self.riichi_declaration_tile: Dict[int, int] = {i: -1 for i in range(4)}
         # Dora/Uradora indicators (start with 1 each hidden)
         self.dora_indicators: List[Tile] = []
         self.ura_dora_indicators: List[Tile] = []
@@ -1362,23 +1375,14 @@ class MediumJong:
         player_discards = {rot_idx(pid): list(ts) for pid, ts in self.player_discards.items()}
         called_discards = {rot_idx(pid): list(idxs) for pid, idxs in self.called_discards.items()}
         seat_winds = {rot_idx(pid): wind for pid, wind in self.seat_winds.items()}
-        riichi_declared = {rot_idx(pid): val for pid, val in self.riichi_declared.items()}
+        riichi_declaration_tile = {rot_idx(pid): val for pid, val in self.riichi_declaration_tile.items()}
         last_discard_player_rel = None if self._owner_of_reactable_tile is None else rot_idx(self._owner_of_reactable_tile)
-        return GamePerspective(
-            player_hand=self._player_hands[player_id],
-            remaining_tiles=len(self.tiles),
-            last_discarded_tile=self._reactable_tile,
-            last_discard_player=last_discard_player_rel,
-            called_sets=called_sets,
-            player_discards=player_discards,
-            called_discards=called_discards,
-            state=Action if self._next_move_is_action else Reaction,
-            newly_drawn_tile=self.last_drawn_tile,
-            can_call=self._reactable_tile is not None and self._owner_of_reactable_tile is not None and self._owner_of_reactable_tile != player_id,
-            seat_winds=seat_winds,
-            round_wind=self.round_wind,
-            riichi_declared=riichi_declared,
-        )
+        return GamePerspective(player_hand=self._player_hands[player_id], remaining_tiles=len(self.tiles),
+                               reactable_tile=self._reactable_tile, owner_of_reactable_tile=last_discard_player_rel,
+                               called_sets=called_sets, player_discards=player_discards,
+                               called_discards=called_discards, newly_drawn_tile=self.last_drawn_tile,
+                               seat_winds=seat_winds, round_wind=self.round_wind, dora_indicators=self.dora_indicators,
+                               riichi_declaration_tile=riichi_declaration_tile)
 
     def is_legal(self, actor_id: int, move: Union[Action, Reaction]) -> bool:
         if self.game_over:
@@ -1415,13 +1419,14 @@ class MediumJong:
             self._on_win(actor_id, win_by_tsumo=True)
         if isinstance(move, Riichi):
             # Declare riichi by discarding specified tile
-            self.riichi_declared[actor_id] = True
             self.riichi_ippatsu_active[actor_id] = True
             self.riichi_sticks_pot += 1000
             # Account riichi stick payment immediately in cumulative points
             self.cumulative_points[actor_id] -= 1000
             self._player_hands[actor_id].remove(move.tile)
             self.player_discards[actor_id].append(move.tile)
+            # Record the discard order index for this player's riichi declaration
+            self.riichi_declaration_tile[actor_id] = len(self.player_discards[actor_id]) - 1
             self._reactable_tile = move.tile
             self._owner_of_reactable_tile = actor_id
             self.last_discard_was_riichi = True
@@ -1432,7 +1437,7 @@ class MediumJong:
             self._reactable_tile = move.tile
             self._owner_of_reactable_tile = actor_id
             # Discard after riichi cancels ippatsu for this player
-            if self.riichi_declared.get(actor_id, False):
+            if self.riichi_declaration_tile.get(actor_id, -1) != -1:
                 self._cancel_ippatsu_for(actor_id)
             self.last_discard_was_riichi = False
             self._next_move_is_action = False
@@ -1853,21 +1858,22 @@ class MediumJong:
     def _score_hand(self, winner_id: int, win_by_tsumo: bool, winning_tile: Optional[Tile] = None) -> Dict[str, Any]:
         concealed = list(self._player_hands[winner_id])
         cs = list(self._player_called_sets[winner_id])
+        riichi_bool = self.riichi_declaration_tile.get(winner_id, -1) != -1
         fu, han, dora_han = _score_fu_and_han(
             concealed_tiles=concealed,
             called_sets=cs,
             winner_id=winner_id,
             dealer_id=DEALER_ID_START,
             win_by_tsumo=win_by_tsumo,
-            riichi_declared=self.riichi_declared[winner_id],
+            riichi_declared=riichi_bool,
             seat_wind=self.seat_winds[winner_id],
             round_wind=self.round_wind,
             dora_indicators=self.dora_indicators,
-            ura_indicators=self.ura_dora_indicators if self.riichi_declared[winner_id] else [],
+            ura_indicators=self.ura_dora_indicators if riichi_bool else [],
             winning_tile=winning_tile,
         )
         # Ippatsu: +1 han (yaku) if riichi declared, ippatsu active, and win occurs on next draw before any call or discard
-        if self.riichi_declared[winner_id] and self.riichi_ippatsu_active.get(winner_id, False):
+        if riichi_bool and self.riichi_ippatsu_active.get(winner_id, False):
             han += IPPATSU_HAN
             # Consumed on win
             self.riichi_ippatsu_active[winner_id] = False

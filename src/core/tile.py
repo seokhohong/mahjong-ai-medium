@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional, List
 
 from .constants import SUIT_ORDER
 
@@ -100,3 +100,69 @@ def tile_flat_index(tile: Tile) -> int:
         return 20 + int(tile.tile_type.value)
     # Honors 30..36
     return 29 + int(tile.tile_type.value)
+
+
+# Inverse mapping from flat index (0..36) back to Tile
+def tile_from_flat_index(idx: int) -> Tile:
+    """Inverse of tile_flat_index for indices 0..36.
+    Layout mirrors tile_flat_index:
+    - 0      : Manzu aka 5
+    - 1..9   : Manzu 1..9
+    - 10     : Pinzu aka 5
+    - 11..19 : Pinzu 1..9
+    - 20     : Souzu aka 5
+    - 21..29 : Souzu 1..9
+    - 30..36 : Honors EAST(1)..RED(7)
+    """
+    if idx < 0 or idx > 36:
+        # Fallback to a harmless default; callers should guard padding separately
+        return Tile(Suit.MANZU, TileType.ONE)
+    if idx == 0:
+        return Tile(Suit.MANZU, TileType.FIVE, aka=True)
+    if 1 <= idx <= 9:
+        return Tile(Suit.MANZU, TileType(idx))
+    if idx == 10:
+        return Tile(Suit.PINZU, TileType.FIVE, aka=True)
+    if 11 <= idx <= 19:
+        return Tile(Suit.PINZU, TileType(idx - 10))
+    if idx == 20:
+        return Tile(Suit.SOUZU, TileType.FIVE, aka=True)
+    if 21 <= idx <= 29:
+        return Tile(Suit.SOUZU, TileType(idx - 20))
+    # 30..36 honors
+    return Tile(Suit.HONORS, Honor(idx - 29))
+
+
+# -----------------------------
+# Canonical serialization utils
+# -----------------------------
+# Number of unique canonical tile indices used in counts/vectors (0..36)
+# Does NOT include any extra no-op index used by heads.
+UNIQUE_TILE_COUNT: int = 37
+def encode_tile(t: Optional[Tile]) -> Optional[Tuple[str, int, int]]:
+    """Encode a Tile as (suit_char, value_int, aka_flag). Honors suit is 'z'."""
+    if t is None:
+        return None
+    return (str(t.suit.value), int(t.tile_type.value), 1 if getattr(t, 'aka', False) else 0)
+
+
+def decode_tile(t: Optional[Tuple[str, int, int]]) -> Optional[Tile]:
+    if t is None:
+        return None
+    s, v, a = t
+    if s == Suit.HONORS.value:
+        return Tile(Suit.HONORS, Honor(int(v)), aka=bool(a))
+    return Tile(Suit(s), TileType(int(v)), aka=bool(a))
+
+
+def encode_tiles(ts: List[Tile]) -> List[Tuple[str, int, int]]:
+    return [encode_tile(x) for x in ts]  # type: ignore[return-value]
+
+
+def decode_tiles(arr: List[Tuple[str, int, int]]) -> List[Tile]:
+    out: List[Tile] = []
+    for tup in arr:
+        t = decode_tile(tup)
+        if t is not None:
+            out.append(t)
+    return out

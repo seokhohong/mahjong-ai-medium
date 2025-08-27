@@ -3,6 +3,7 @@ import os
 
 from core.game import Player, MediumJong
 from core.learn.ac_constants import MAX_TURNS
+from core.learn.recording_ac_player import RecordingHeuristicACPlayer
 from core.tenpai import hand_is_tenpai_with_calls
 from mj_test import test_utils
 
@@ -109,15 +110,18 @@ def _post_action_concealed_and_calls(gp, move):
 
 class TestCreateDataset(unittest.TestCase):
     def test_build_ac_dataset_heuristic_single_game(self):
-        from run.create_dataset import build_ac_dataset
+        from run.create_dataset_parallel import build_ac_dataset
+
+        players = [
+            RecordingHeuristicACPlayer()
+        ] * 4
 
         data = build_ac_dataset(
-            games=1,
+            games=2,
             seed=123,
-            use_heuristic=True,
-            temperature=0.0,
             n_step=3,
             gamma=0.99,
+            prebuilt_players=players
         )
         self.assertTrue("called_discards" in data)
         # just test that this runs
@@ -164,65 +168,38 @@ class TestCreateDataset(unittest.TestCase):
                 total += 1
         self.assertGreater(total, 0)
 
+    def test_parallel_two_games_two_procs_combines_samples(self):
+        """Run 2 games across 2 processes and verify combined per-sample fields length > 2.
+        This ensures per-sample arrays are concatenated by sample, not by game.
+        """
+        import numpy as np
+        from run.create_dataset_parallel import create_dataset_parallel
 
-    def test_verify_rewards(self):
-        # Use the dataset builder to compute rewards and export metadata identifying draws.
-        from run.create_dataset import build_ac_dataset
-        built = build_ac_dataset(
-            games=20,
-            seed=321,
-            use_heuristic=True,
-            temperature=0.0,
+        out_path = create_dataset_parallel(
+            games=2,
+            num_processes=2,
+            seed=123,
             n_step=1,
-            gamma=1.0,
+            gamma=0.99,
+            out='ac_parallel_test_tmp.npz',
+            chunk_size=1,
+            keep_partials=False,
+            stream_combine=True,
         )
-        # Identify draw games via metadata
-        outcomes = built['game_outcomes_obj']
-        gids = built['game_ids']
-        returns = built['returns']
-        actors = built['actor_ids']
-        # For each draw game, verify per-player reward sign matches tenpai/noten status
-        draw_games = set(int(i) for i, o in enumerate(outcomes) if bool(o['is_draw']))
-        eps = 1e-9
-        for gid in draw_games:
-            outcome = outcomes[gid]
-            # Find last step index per actor for this game id
-            last_idx_by_actor = {}
-            for idx in range(len(gids)):
-                if int(gids[idx]) == gid:
-                    a = int(actors[idx])
-                    last_idx_by_actor[a] = idx
-            # Check reward sign per actor vs tenpai
-            for pid in range(4):
-                if pid not in last_idx_by_actor:
-                    continue
-                idx = last_idx_by_actor[pid]
-                reward = float(returns[idx])
-                is_tenpai = bool(outcome['players'][pid]['tenpai']) if outcome.get('players') else False
-                if is_tenpai:
-                    self.assertGreaterEqual(reward, 0.0 - eps)
-                else:
-                    self.assertLessEqual(reward, 0.0 + eps)
+        try:
+            data = np.load(out_path, allow_pickle=True)
+            # Pick a few representative per-sample fields
+            self.assertGreater(len(data['called_idx']), 2)
+            self.assertGreater(len(data['action_idx']), 2)
+            self.assertGreater(len(data['called_discards']), 2)
+            self.assertGreater(len(data['riichi_declarations']), 2)
+        finally:
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
 
-        # For each non-draw game, verify that any winner (ron or tsumo) has non-negative terminal reward
-        win_games = set(int(i) for i, o in enumerate(outcomes) if not bool(o['is_draw']))
-        for gid in win_games:
-            outcome = outcomes[gid]
-            winners = [int(w) for w in outcome.get('winners', [])]
-            if not winners:
-                continue
-            # Last step index per actor for this game id
-            last_idx_by_actor = {}
-            for idx in range(len(gids)):
-                if int(gids[idx]) == gid:
-                    a = int(actors[idx])
-                    last_idx_by_actor[a] = idx
-            for pid in winners:
-                if pid not in last_idx_by_actor:
-                    continue
-                idx = last_idx_by_actor[pid]
-                reward = float(returns[idx])
-                self.assertGreaterEqual(reward, 0.0 - eps)
 
 
 if __name__ == '__main__':

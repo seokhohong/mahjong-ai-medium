@@ -3,6 +3,7 @@ from .constants import SUIT_ORDER
 from .tile import Suit, TileType, Honor, Tile
 from .game import CalledSet
 from .action import Riichi
+from .learn.ac_constants import NULL_TILE_INDEX
 
 # Cache for meld checking results
 _meld_cache: Dict[Tuple[Tuple[int, ...], int], bool] = {}
@@ -475,7 +476,7 @@ def can_complete_standard_with_calls(concealed_tiles: List[Tile], called_sets: L
 	return False
 
 
-def legal_riichi_moves(riichi_declared, called_sets, player_hand) -> List[Riichi]:
+def legal_riichi_moves(riichi_declaration_tile, called_sets, player_hand) -> List[Riichi]:
     """Return all legal Riichi moves by checking tenpai-after-discard directly.
 
     Requirements per is_legal(Riichi):
@@ -485,7 +486,7 @@ def legal_riichi_moves(riichi_declared, called_sets, player_hand) -> List[Riichi
     - Discarding the specified tile keeps the hand in tenpai (13 tiles check)
     """
     # Preconditions
-    if riichi_declared.get(0, False):
+    if riichi_declaration_tile.get(0, NULL_TILE_INDEX) != NULL_TILE_INDEX:
         return []
     if called_sets.get(0, []):
         return []

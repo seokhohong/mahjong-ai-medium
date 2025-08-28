@@ -75,12 +75,8 @@ class ACNetwork:
                 self.hc_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
                 self.hc_gap = nn.AdaptiveAvgPool2d((1, 1))
 
-                # Opponents conv shared for each of 3 stacks over (B*3,1,MAX_CALLED_TILES_PER_PLAYER,emb)
-                self.opp_conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-                self.opp_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-                self.opp_gap = nn.AdaptiveAvgPool2d((1, 1))
-                # Reduce each opponent's feature to 16-d
-                self.opp_reduce = nn.Linear(64, 16)
+                # Unified call processing: shared linear encoder for all players' calls
+                self.call_linear = nn.Linear(outer.embedding_dim, 64)
 
                 # Discards attention (query-based):
                 # - Keys/values built from discard tokens: tile_emb + pos_emb(8) + player_emb(4) -> Dkv
@@ -97,13 +93,13 @@ class ACNetwork:
                 self.hand_conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
                 self.hand_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
                 self.hand_gap = nn.AdaptiveAvgPool2d((1, 1))
-                # Separate reducer for player's calls for clarity (64 -> 16)
-                self.player_calls_reduce = nn.Linear(64, 16)
+                # Final call feature reducer (64 -> 16 per player)
+                self.call_reduce = nn.Linear(64, 16)
 
                 # Separate trunks for policy and value; input is
-                #   hand(64) + player_calls(16) + opp(3*16) + disc_attn(32) + react(emb) + gsv(GSV)
+                #   hand(64) + all_calls(4*16) + disc_attn(32) + react(emb) + gsv(GSV)
                 from .ac_constants import GAME_STATE_VEC_LEN as GSV
-                input_dim = 64 + 16 + (3 * 16) + 32 + outer.embedding_dim + int(GSV)
+                input_dim = 64 + (4 * 16) + 32 + outer.embedding_dim + int(GSV)
                 # Shared trunk for policy, value, and auxiliary heads
                 self.trunk = nn.Sequential(
                     nn.Linear(input_dim, outer.hidden_size),
@@ -146,21 +142,25 @@ class ACNetwork:
                 gri0 = padify(game_tile_indicator_idx[:, 0]).long()                    # (B,)
                 react_vec = self.tile_emb(gri0)                                        # (B,emb)
 
-                # Player called tiles: conv path (same style as opponents) -> reduce to 16
-                pc_idx = padify(player_called_idx).long()                               # (B,MAX_CALLED_TILES_PER_PLAYER)
-                pc_emb = self.tile_emb(pc_idx).unsqueeze(1)                             # (B,1,MAX_CALLED_TILES_PER_PLAYER,emb)
-                pc_feat_agg = self.opp_gap(F.relu(self.opp_conv2(F.relu(self.opp_conv1(pc_emb)))))  # (B,64,1,1)
-                pc_feat = pc_feat_agg.view(B, 64)
-                pc_feat_small = self.player_calls_reduce(pc_feat)                       # (B,16)
-
-                # Opponents called tiles: (B,3,MAX_CALLED_TILES_PER_PLAYER) -> embed -> conv per opponent (shared weights) -> (B, 3*64)
-                o_idx = padify(opp_called_idx).long()                                  # (B,3,MAX_CALLED_TILES_PER_PLAYER)
-                o_emb = self.tile_emb(o_idx)                                           # (B,3,MAX_CALLED_TILES_PER_PLAYER,emb)
-                o_emb = o_emb.view(B * 3, int(MAX_CALLED_TILES_PER_PLAYER), -1).unsqueeze(1)  # (B*3,1,MAX_CALLED_TILES_PER_PLAYER,emb)
-                o_feat_agg = self.opp_gap(F.relu(self.opp_conv2(F.relu(self.opp_conv1(o_emb)))))  # (B*3,64,1,1)
-                o_feat_agg = o_feat_agg.view(B, 3, 64)                                  # (B,3,64)
-                o_feat_small = self.opp_reduce(o_feat_agg)                              # (B,3,16)
-                o_feat = o_feat_small.view(B, 3 * 16)                                   # (B,48)
+                # Batch all call sequences to process together
+                all_calls = torch.cat([
+                    player_called_idx.unsqueeze(1),  # (B, 1, MAX_CALLED_TILES_PER_PLAYER)
+                    opp_called_idx                    # (B, 3, MAX_CALLED_TILES_PER_PLAYER)
+                ], dim=1)  # (B, 4, MAX_CALLED_TILES_PER_PLAYER)
+                
+                # Single embedding lookup for all calls
+                all_calls_padded = padify(all_calls)  # (B, 4, MAX_CALLED_TILES_PER_PLAYER)
+                all_calls_emb = self.tile_emb(all_calls_padded)  # (B, 4, MAX_CALLED_TILES_PER_PLAYER, emb)
+                
+                # Shared call encoder: pool + linear
+                # Pool over sequence dimension (since call order doesn't matter much)
+                call_mask = (all_calls_padded != self.pad_index).float().unsqueeze(-1)  # (B, 4, MAX_CALLED_TILES_PER_PLAYER, 1)
+                call_pooled = (all_calls_emb * call_mask).sum(dim=2) / call_mask.sum(dim=2).clamp_min(1)  # (B, 4, emb)
+                
+                # Shared linear processing for all players' calls
+                call_features = F.dropout(F.relu(self.call_linear(call_pooled)), p=0.3)  # (B, 4, 64)
+                call_features_reduced = self.call_reduce(call_features)  # (B, 4, 16)
+                call_feat = call_features_reduced.view(B, 4 * 16)  # (B, 64)
 
                 # Discards: query-based attention with MAX_CONCEALED_TILES queries
                 d_idx = padify(disc_idx).long()                                        # (B,NUM_PLAYERS,disc_seq_len)
@@ -202,7 +202,7 @@ class ACNetwork:
                 gsv_feat = game_state_vec.float()                                       # (B,GSV)
 
                 # Concatenate all features
-                x = torch.cat([hand_feat, pc_feat_small, o_feat, d_feat, react_vec, gsv_feat], dim=1)
+                x = torch.cat([hand_feat, call_feat, d_feat, react_vec, gsv_feat], dim=1)
 
                 # Process through shared trunk
                 trunk_features = self.trunk(x)

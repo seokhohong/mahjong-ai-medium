@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Any, Union, Tuple
 import numpy as np
 
 from .learn.ac_constants import chi_variant_index, ACTION_HEAD_INDEX, ACTION_HEAD_ORDER, TILE_HEAD_NOOP, TILE_HEAD_SIZE, NULL_TILE_INDEX
+
 from .constants import (
     NUM_PLAYERS as MC_NUM_PLAYERS,
     DEALER_ID_START,
@@ -67,6 +68,7 @@ from .tile import (
     Honor,
     Tile,
     tile_flat_index,
+    UNIQUE_TILE_COUNT,
     _dora_next,
     _tile_sort_key,
     make_tile,
@@ -255,7 +257,7 @@ def _decompose_standard_with_pred(tiles: List[Tile], pred_meld, pred_pair) -> bo
 
     for i in range(len(tiles) - 1):
         a, b = tiles[i], tiles[i + 1]
-        if a.suit == b.suit and a.tile_type == b.tile_type and pred_pair(a):
+        if a.functionally_equal(b) and pred_pair(a):
             remaining = tiles[:i] + tiles[i+2:]
             counts, honors = build_counts(remaining)
 
@@ -441,10 +443,11 @@ def hand_is_tenpai_for_tiles(tiles: List[Tile]) -> bool:
     return _tenpai_tiles(tiles)
 
 
-def hand_is_tenpai(hand: List[Tile]) -> bool:
+def hand_is_tenpai(hand: List[Tile], called_sets: Optional[List[CalledSet]] = None) -> bool:
     from .tenpai import hand_is_tenpai as _tenpai
-    # Closed hand path preserved; game-level exhaustive draw checks tenpai without calls
-    return _tenpai(hand)
+    if called_sets is None:
+        return _tenpai(hand)
+    return _tenpai(hand, called_sets)
 
 
 def _calc_dora_han(hand_tiles: List[Tile], called_sets: List[CalledSet], indicators: List[Tile]) -> int:
@@ -453,7 +456,7 @@ def _calc_dora_han(hand_tiles: List[Tile], called_sets: List[CalledSet], indicat
     for cs in called_sets:
         all_tiles.extend(cs.tiles)
     dora_tiles = [_dora_next(ind) for ind in indicators]
-    return sum(1 for t in all_tiles for d in dora_tiles if t.suit == d.suit and t.tile_type == d.tile_type)
+    return sum(1 for t in all_tiles for d in dora_tiles if t.functionally_equal(d))
 
 
 def _count_aka_han(all_tiles: List[Tile]) -> int:
@@ -650,7 +653,7 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
                 else:
                     removed = False
                     for t in base_tiles:
-                        if (not removed) and t.suit == cand.suit and t.tile_type == cand.tile_type:
+                        if (not removed) and t.functionally_equal(cand):
                             removed = True
                             continue
                         hand13.append(t)
@@ -658,7 +661,7 @@ def _score_fu_and_han(concealed_tiles: List[Tile], called_sets: List[CalledSet],
                         continue
                 waits = _waits_13(hand13)
                 # Check if cand is indeed a wait
-                if any(w.suit == cand.suit and w.tile_type == cand.tile_type for w in waits):
+                if any(w.functionally_equal(cand) for w in waits):
                     # Classify wait type for suits only
                     if cand.suit == Suit.HONORS:
                         # Honors cannot form sequences; only tanki or shanpon. Tanki if hand13 had exactly one of cand.
@@ -785,13 +788,63 @@ def _chi_variant_index(last_discarded_tile: Optional[Tile], tiles: List[Tile]) -
         return 2
     return -1
 
+class GameOracle:
+    """Holds derived game information like waits per player.
+
+    For now, it tracks waits only, computed via `tenpai.waits_optimized`.
+    """
+
+    def __init__(self) -> None:
+        # Per-player waits
+        self._waits: Dict[int, List[Tile]] = {i: [] for i in range(4)}
+
+    def update_waits_for(self, game: 'MediumJong', player_id: int) -> None:
+        """Update waits for a player using the game's current state.
+
+        Early-exit only for 13-tile non-tenpai hands. For 14-tile hands, always
+        compute waits via the optimized function.
+        """
+        from .tenpai import waits_optimized as _waits_opt
+
+        hand = list(game._player_hands[player_id])
+        called_sets = list(game._player_called_sets[player_id])
+
+        if len(hand) == 13 and not hand_is_tenpai(hand, called_sets):
+            self._waits[player_id] = []
+            return
+
+        waits = _waits_opt(hand, called_sets)
+        waits = sorted(waits, key=_tile_sort_key)
+        self._waits[player_id] = waits
+
+    def get_waits(self, player_id: int) -> List[Tile]:
+        return list(self._waits.get(player_id, []))
+
+    def deal_in_tiles(self, player_id: int) -> List[Tile]:
+        """Aggregate waits from all opponents of player_id.
+
+        Returns a deduplicated, sorted list of tiles that would deal into
+        at least one other player's hand if discarded by `player_id`.
+        """
+        seen: set[Tile] = set()
+        for pid, waits in self._waits.items():
+            if pid == player_id:
+                continue
+            for t in waits:
+                # Use Tile equality/hash directly (aka-aware)
+                seen.add(t)
+        # Return tiles sorted canonically
+        return sorted(list(seen), key=_tile_sort_key)
 
 class GamePerspective:
     def __init__(self, player_hand: List[Tile], remaining_tiles: int, reactable_tile: Optional[Tile],
                  owner_of_reactable_tile: Optional[int], called_sets: Dict[int, List[CalledSet]],
                  player_discards: Dict[int, List[Tile]], called_discards: Dict[int, List[int]],
                  newly_drawn_tile: Optional[Tile], seat_winds: Dict[int, Honor], round_wind: Honor,
-                 dora_indicators: List[Tile], riichi_declaration_tile: Dict[int, int]) -> None:
+                 dora_indicators: List[Tile], riichi_declaration_tile: Dict[int, int],
+                 # Oracle fields used only for auxiliary tasks. Leaking would be bad...!
+                 deal_in_tiles: Optional[List[Tile]] = None,
+                 wall_count: Optional[List[int] | np.ndarray] = None) -> None:
         self.player_hand = sorted(list(player_hand), key=_tile_sort_key)
         self.remaining_tiles = remaining_tiles
         self._reactable_tile = reactable_tile
@@ -806,6 +859,11 @@ class GamePerspective:
         self.round_wind = round_wind
         self.dora_indicators = list(dora_indicators)
         self.riichi_declaration_tile = dict(riichi_declaration_tile)
+
+        # Aka-insensitive list of tiles that would deal in if discarded by the perspective player
+        self.deal_in_tiles: List[Tile] = list(deal_in_tiles or [])
+        # Optional remaining-wall counts by flat tile index (0..UNIQUE_TILE_COUNT-1)
+        self.wall_count = None if wall_count is None else np.asarray(wall_count, dtype=np.int8)
 
     def __repr__(self) -> str:
         def _fmt_hand(tiles: List[Tile]) -> str:
@@ -862,11 +920,12 @@ class GamePerspective:
         For tile-parameterized actions, mark 1 if there exists at least one legal instantiation.
         """
         import numpy as _np
-        m = _np.zeros((len(ACTION_HEAD_ORDER),), dtype=_np.float64)
+        # Boolean mask for clarity and memory efficiency
+        m = _np.zeros((len(ACTION_HEAD_ORDER),), dtype=_np.bool_)
         for mv in self.legal_moves():
             ai, _ti = encode_two_head_action(mv)
             if isinstance(ai, int) and 0 <= ai < len(ACTION_HEAD_ORDER):
-                m[ai] = 1.0
+                m[ai] = True
         return m
 
     def legal_tile_mask(self, action_idx: int) -> np.ndarray:
@@ -877,12 +936,13 @@ class GamePerspective:
         """
         import numpy as _np
         name = ACTION_HEAD_ORDER[action_idx] if 0 <= action_idx < len(ACTION_HEAD_ORDER) else None
-        m = _np.zeros((TILE_HEAD_SIZE,), dtype=_np.float64)
+        # Boolean mask for clarity and memory efficiency
+        m = _np.zeros((TILE_HEAD_SIZE,), dtype=_np.bool_)
         if name is None:
             return m
         # Non-parameterized -> no-op only
         if name in ('tsumo', 'ron', 'pass') or name.startswith('chi_') or name.startswith('pon_'):
-            m[TILE_HEAD_NOOP] = 1.0
+            m[TILE_HEAD_NOOP] = True
             return m
         # Parameterized actions: collect tile indices from concrete legal moves that match action_idx
         any_set = False
@@ -890,14 +950,14 @@ class GamePerspective:
             ai, ti = encode_two_head_action(mv)
             if isinstance(ai, int) and ai == action_idx:
                 if ti == TILE_HEAD_NOOP:
-                    m[TILE_HEAD_NOOP] = 1.0
+                    m[TILE_HEAD_NOOP] = True
                     any_set = True
                 elif isinstance(ti, int) and 0 <= ti < TILE_HEAD_SIZE:
-                    m[ti] = 1.0
+                    m[ti] = True
                     any_set = True
         # If nothing matched, allow no-op to avoid degenerate sampling
         if not any_set:
-            m[TILE_HEAD_NOOP] = 1.0
+            m[TILE_HEAD_NOOP] = True
         return m
 
 
@@ -1015,7 +1075,7 @@ class GamePerspective:
         waits = self._waits()
         own_discards = self.player_discards.get(0, [])
         for w in waits:
-            if any(d.suit == w.suit and d.tile_type == w.tile_type for d in own_discards):
+            if any(d.functionally_equal(w) for d in own_discards):
                 return True
         return False
 
@@ -1035,7 +1095,7 @@ class GamePerspective:
             return reactions
         hand = list(self.player_hand)
         # Pon
-        same = [t for t in hand if t.suit == last.suit and t.tile_type == last.tile_type]
+        same = [t for t in hand if t.functionally_equal(last)]
         if len(same) >= 2:
             reactions.append(Pon([same[0], same[1]]))
         # Chi (left player only)
@@ -1075,12 +1135,12 @@ class GamePerspective:
             if isinstance(move, KanKakan):
                 # Must have an existing pon of this tile
                 for cs in self.called_sets.get(0, []):
-                    if cs.call_type == 'pon' and cs.tiles and cs.tiles[0].suit == move.tile.suit and cs.tiles[0].tile_type == move.tile.tile_type:
-                        return move.tile in self.player_hand
+                    if cs.call_type == 'pon' and cs.tiles and cs.tiles[0].functionally_equal(move.tile):
+                        return any(t.functionally_equal(move.tile) for t in self.player_hand)
                 return False
             if isinstance(move, KanAnkan):
                 # Need four in hand
-                cnt = sum(1 for t in self.player_hand if t.suit == move.tile.suit and t.tile_type == move.tile.tile_type)
+                cnt = sum(1 for t in self.player_hand if t.functionally_equal(move.tile))
                 return cnt >= 4
             if isinstance(move, Discard):
                 if riichi_locked:
@@ -1198,7 +1258,7 @@ class GamePerspective:
 
 class Player:
 
-    def play(self, game_state: GamePerspective) -> Action:
+    def act(self, game_state: GamePerspective) -> Action:
         moves = game_state.legal_moves()
         # Auto-win
         for m in moves:
@@ -1215,7 +1275,7 @@ class Player:
         # Fallback
         return moves[0]
 
-    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
+    def react(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
         if game_state.can_ron():
             return Ron()
         for r in options:
@@ -1242,6 +1302,8 @@ class MediumJong:
         self._player_to_id: Dict[Player, int] = {p: i for i, p in enumerate(players)}
         self._player_hands: Dict[int, List[Tile]] = {i: [] for i in range(4)}
         self._player_called_sets: Dict[int, List[CalledSet]] = {i: [] for i in range(4)}
+        # Track waits for each player when in tenpai
+        self._waits: Dict[int, List[Tile]] = {i: [] for i in range(4)}
         self.player_discards: Dict[int, List[Tile]] = {i: [] for i in range(4)}
         # Track which discard indices were called by other players for each player
         self.called_discards: Dict[int, List[int]] = {i: [] for i in range(4)}
@@ -1319,6 +1381,11 @@ class MediumJong:
         for pid in range(4):
             for _ in range(STANDARD_HAND_TILE_COUNT):
                 self._player_hands[pid].append(self.tiles.pop())
+        # Oracle for derived state (e.g., waits)
+        self.oracle = GameOracle()
+        # Initialize waits after initial deal via oracle
+        for pid in range(4):
+            self.oracle.update_waits_for(self, pid)
 
         # Helper methods for riichi/ippatsu state management
 
@@ -1377,12 +1444,31 @@ class MediumJong:
         seat_winds = {rot_idx(pid): wind for pid, wind in self.seat_winds.items()}
         riichi_declaration_tile = {rot_idx(pid): val for pid, val in self.riichi_declaration_tile.items()}
         last_discard_player_rel = None if self._owner_of_reactable_tile is None else rot_idx(self._owner_of_reactable_tile)
-        return GamePerspective(player_hand=self._player_hands[player_id], remaining_tiles=len(self.tiles),
-                               reactable_tile=self._reactable_tile, owner_of_reactable_tile=last_discard_player_rel,
-                               called_sets=called_sets, player_discards=player_discards,
-                               called_discards=called_discards, newly_drawn_tile=self.last_drawn_tile,
-                               seat_winds=seat_winds, round_wind=self.round_wind, dora_indicators=self.dora_indicators,
-                               riichi_declaration_tile=riichi_declaration_tile)
+        # Precompute deal-in tiles for this player via oracle
+        deal_in_tiles = self.oracle.deal_in_tiles(player_id)
+        # Compute wall_count over drawable wall tiles (exclude dead wall).
+        wc = np.zeros((UNIQUE_TILE_COUNT,), dtype=np.int8)
+        for t in self.tiles:
+            idx = int(tile_flat_index(t))
+            if 0 <= idx < UNIQUE_TILE_COUNT:
+                # Clip at 4 just in case, but counts in wall can be more than 4 across all copies; int8 is fine
+                wc[idx] = np.int8(int(wc[idx]) + 1)
+
+        return GamePerspective(
+            player_hand=self._player_hands[player_id],
+            remaining_tiles=len(self.tiles),
+            reactable_tile=self._reactable_tile,
+            owner_of_reactable_tile=last_discard_player_rel,
+            called_sets=called_sets,
+            player_discards=player_discards,
+            called_discards=called_discards,
+            newly_drawn_tile=self.last_drawn_tile,
+            seat_winds=seat_winds,
+            round_wind=self.round_wind,
+            dora_indicators=self.dora_indicators,
+            riichi_declaration_tile=riichi_declaration_tile,
+            deal_in_tiles=deal_in_tiles,
+            wall_count=wc)
 
     def is_legal(self, actor_id: int, move: Union[Action, Reaction]) -> bool:
         if self.game_over:
@@ -1394,11 +1480,18 @@ class MediumJong:
             return []
         return self.get_game_perspective(actor_id).legal_moves()
 
+    def get_oracle(self) -> GameOracle:
+        return self.oracle
+
+    
+
     def _draw_tile(self) -> None:
         assert self.tiles
         t = self.tiles.pop()
         self._player_hands[self.current_player_idx].append(t)
         self.last_drawn_tile = t
+        # Update waits for current player after draw
+        self.oracle.update_waits_for(self, self.current_player_idx)
 
     def _rinshan_draw(self) -> None:
         # Draw from dead wall (rinshan) after a Kan
@@ -1406,6 +1499,8 @@ class MediumJong:
         t = self.dead_wall.pop()
         self._player_hands[self.current_player_idx].append(t)
         self.last_drawn_tile = t
+        # Update waits for current player after rinshan draw
+        self.oracle.update_waits_for(self, self.current_player_idx)
 
     def _add_kan_dora(self) -> None:
         # Flip an additional dora indicator from the dead wall (kandora); uradora mirrors count
@@ -1417,6 +1512,7 @@ class MediumJong:
     def _step_action(self, actor_id, move: Action):
         if isinstance(move, Tsumo):
             self._on_win(actor_id, win_by_tsumo=True)
+            return
         if isinstance(move, Riichi):
             # Declare riichi by discarding specified tile
             self.riichi_ippatsu_active[actor_id] = True
@@ -1484,6 +1580,7 @@ class MediumJong:
         # Reactions to discard
         if isinstance(move, Ron):
             self._on_win(actor_id, win_by_tsumo=False, winning_tile=self._reactable_tile)
+            return
         if isinstance(move, Pon):
             # Any call cancels ippatsu
             self._on_any_call_side_effects()
@@ -1622,7 +1719,7 @@ class MediumJong:
     def _action(self) -> None:
         # we call this here because _poll_reactions can recurse on action
         self._resolve_reactions()
-        action = self.players[self.current_player_idx].play(self.get_game_perspective(self.current_player_idx))
+        action = self.players[self.current_player_idx].act(self.get_game_perspective(self.current_player_idx))
         self.step(self.current_player_idx, action)
         # Resolve reactions if any
         if self.is_reactable():
@@ -1640,9 +1737,9 @@ class MediumJong:
             opts = gs.get_call_options()
             if gs.can_ron():
                 can_ron[pid] = True
-                choices[pid] = self.players[pid].choose_reaction(gs, [])
+                choices[pid] = self.players[pid].react(gs, [])
             elif opts:
-                choices[pid] = self.players[pid].choose_reaction(gs, opts)
+                choices[pid] = self.players[pid].react(gs, opts)
         # Ron first
         rons = [pid for pid, ch in choices.items() if isinstance(ch, Ron) and can_ron.get(pid, False)]
         if rons:
@@ -1748,7 +1845,8 @@ class MediumJong:
         # Determine tenpai players using current hands without constructing perspectives
         tenpai_players: List[int] = []
         for pid in range(4):
-            if hand_is_tenpai(self._player_hands[pid]):
+            # Consider called sets (open hand) when checking tenpai
+            if hand_is_tenpai(self._player_hands[pid], self._player_called_sets[pid]):
                 tenpai_players.append(pid)
         n_t = len(tenpai_players)
         payments: Dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
@@ -1827,7 +1925,8 @@ class MediumJong:
             # Determine tenpai from current hands to be robust even when 0 or 4 tenpai
             tenpai_flags: Dict[int, bool] = {}
             for pid in range(NUM_PLAYERS):
-                tenpai_flags[pid] = hand_is_tenpai(self._player_hands[pid])
+                # Use called sets for open-hand tenpai detection
+                tenpai_flags[pid] = hand_is_tenpai(self._player_hands[pid], self._player_called_sets[pid])
         for pid in range(NUM_PLAYERS):
             otype: Optional[OutcomeType] = None
             if is_draw:
@@ -1994,5 +2093,3 @@ class MediumJong:
             self.play_turn()
             steps += 1
         return None
-
-

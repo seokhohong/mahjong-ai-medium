@@ -64,7 +64,7 @@ class MediumHeuristicsPlayer(Player):
       - Decline Chi/Pon unless either there is a yakuhai ankō in hand or the hand is pure tanyao (all 2-8)
     """
 
-    def play(self, game_state: GamePerspective):  # type: ignore[override]
+    def act(self, game_state: GamePerspective):  # type: ignore[override]
         # Fetch legal moves once to avoid repeated computation
         legal_moves = game_state.legal_moves()
         # Win immediately if possible
@@ -116,7 +116,7 @@ class MediumHeuristicsPlayer(Player):
         # Fallback: first legal move
         return legal_moves[0]
 
-    def choose_reaction(self, game_state: GamePerspective, options: List):  # type: ignore[override]
+    def react(self, game_state: GamePerspective, options: List):  # type: ignore[override]
         # Ron if possible (fast path)
         if game_state.can_ron():
             return Ron()

@@ -34,7 +34,7 @@ class PlayalongACPlayer(ACPlayer):
     # --- helpers ---
     def _record_accuracy(self, gs: GamePerspective, chosen_move: Any) -> None:
         try:
-            baseline_move = self._baseline.play(gs)
+            baseline_move = self._baseline.act(gs)
         except Exception:
             # Fallback: if baseline call fails for some reason, skip counting
             return
@@ -44,7 +44,7 @@ class PlayalongACPlayer(ACPlayer):
 
     def _record_reaction_accuracy(self, gs: GamePerspective, options: List[Reaction], chosen_move: Any) -> None:
         try:
-            baseline_move = self._baseline.choose_reaction(gs, options)
+            baseline_move = self._baseline.react(gs, options)
         except Exception:
             return
         self._total_decisions += 1
@@ -59,12 +59,12 @@ class PlayalongACPlayer(ACPlayer):
             return repr(a) == repr(b)
 
     # --- overrides ---
-    def play(self, game_state: GamePerspective):
+    def act(self, game_state: GamePerspective):
         move = self.compute_play(game_state)[0]
         self._record_accuracy(game_state, move)
         return move
 
-    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
+    def react(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
         move = self.compute_play(game_state)[0]
         self._record_reaction_accuracy(game_state, options, move)
         return move

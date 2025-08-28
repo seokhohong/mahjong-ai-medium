@@ -41,7 +41,7 @@ def _post_action_concealed_and_calls(gp, move):
         removed = False
         new_hand = []
         for t in concealed:
-            if not removed and t.suit == move.tile.suit and t.tile_type == move.tile.tile_type:
+            if not removed and t.exactly_equal(move.tile):
                 removed = True
                 continue
             new_hand.append(t)
@@ -51,54 +51,55 @@ def _post_action_concealed_and_calls(gp, move):
             removed = False
             new_hand = []
             for h in concealed:
-                if not removed and h.suit == t.suit and h.tile_type == t.tile_type:
+                if not removed and h.exactly_equal(t):
                     removed = True
                     continue
                 new_hand.append(h)
             concealed = new_hand
         seq = sorted([move.tiles[0], last, move.tiles[1]], key=lambda t: (t.suit.value, int(t.tile_type.value)))
-        called_sets.append(CalledSet(tiles=seq, call_type='chi', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp._owner_of_reactable_tile))
+        # Preserve aka by using the actual tile instances
+        called_sets.append(CalledSet(tiles=seq, call_type='chi', called_tile=last, caller_position=0, source_position=gp._owner_of_reactable_tile))
     elif isinstance(move, Pon) and last is not None:
         consumed = 0
         new_hand = []
         for t in concealed:
-            if consumed < 2 and t.suit == last.suit and t.tile_type == last.tile_type:
+            if consumed < 2 and t.functionally_equal(last):
                 consumed += 1
                 continue
             new_hand.append(t)
         concealed = new_hand
-        called_sets.append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(3)], call_type='pon', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp._owner_of_reactable_tile))
+        called_sets.append(CalledSet(tiles=[last, last, last], call_type='pon', called_tile=last, caller_position=0, source_position=gp._owner_of_reactable_tile))
     elif isinstance(move, KanDaimin) and last is not None:
         consumed = 0
         new_hand = []
         for t in concealed:
-            if consumed < 3 and t.suit == last.suit and t.tile_type == last.tile_type:
+            if consumed < 3 and t.functionally_equal(last):
                 consumed += 1
                 continue
             new_hand.append(t)
         concealed = new_hand
-        called_sets.append(CalledSet(tiles=[Tile(last.suit, last.tile_type) for _ in range(4)], call_type='kan_daimin', called_tile=Tile(last.suit, last.tile_type), caller_position=0, source_position=gp._owner_of_reactable_tile))
+        called_sets.append(CalledSet(tiles=[last, last, last, last], call_type='kan_daimin', called_tile=last, caller_position=0, source_position=gp._owner_of_reactable_tile))
     elif isinstance(move, KanAnkan):
         consumed = 0
         new_hand = []
         for t in concealed:
-            if consumed < 4 and t.suit == move.tile.suit and t.tile_type == move.tile.tile_type:
+            if consumed < 4 and t.functionally_equal(move.tile):
                 consumed += 1
                 continue
             new_hand.append(t)
         concealed = new_hand
-        called_sets.append(CalledSet(tiles=[Tile(move.tile.suit, move.tile.tile_type) for _ in range(4)], call_type='kan_ankan', called_tile=None, caller_position=0, source_position=None))
+        called_sets.append(CalledSet(tiles=[move.tile, move.tile, move.tile, move.tile], call_type='kan_ankan', called_tile=None, caller_position=0, source_position=None))
     elif isinstance(move, KanKakan):
         removed = False
         new_hand = []
         for t in concealed:
-            if not removed and t.suit == move.tile.suit and t.tile_type == move.tile.tile_type:
+            if not removed and t.exactly_equal(move.tile):
                 removed = True
                 continue
             new_hand.append(t)
         concealed = new_hand
         for cs in called_sets:
-            if cs.call_type == 'pon' and cs.tiles and cs.tiles[0].suit == move.tile.suit and cs.tiles[0].tile_type == move.tile.tile_type:
+            if cs.call_type == 'pon' and cs.tiles and cs.tiles[0].functionally_equal(move.tile):
                 cs.call_type = 'kan_kakan'
                 cs.tiles.append(move.tile)
                 cs.called_tile = None
@@ -176,23 +177,26 @@ class TestCreateDataset(unittest.TestCase):
         from run.create_dataset_parallel import create_dataset_parallel
 
         out_path = create_dataset_parallel(
-            games=2,
+            games=4,
             num_processes=2,
             seed=123,
             n_step=1,
             gamma=0.99,
             out='ac_parallel_test_tmp.npz',
-            chunk_size=1,
+            chunk_size=2,
             keep_partials=False,
-            stream_combine=True,
+            stream_combine=True
         )
         try:
             data = np.load(out_path, allow_pickle=True)
             # Pick a few representative per-sample fields
-            self.assertGreater(len(data['called_idx']), 2)
-            self.assertGreater(len(data['action_idx']), 2)
-            self.assertGreater(len(data['called_discards']), 2)
-            self.assertGreater(len(data['riichi_declarations']), 2)
+            self.assertGreater(len(data['called_idx']), 4)
+            self.assertGreater(len(data['action_idx']), 4)
+            self.assertGreater(len(data['called_discards']), 4)
+            self.assertGreater(len(data['riichi_declarations']), 4)
+            self.assertGreater(len(data['deal_in_tiles']), 4)
+            self.assertGreater(len(data['wall_count']), 4)
+            data.close()
         finally:
             try:
                 if os.path.isfile(out_path):

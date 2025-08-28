@@ -64,8 +64,8 @@ class LoggingPlayer(Player):
     def set_abs_player_id(self, pid: int) -> None:
         self._abs_player_id = pid
 
-    def play(self, gs):  # type: ignore[override]
-        move = self.inner.play(gs)
+    def act(self, gs):  # type: ignore[override]
+        move = self.inner.act(gs)
         # Pretty print current perspective and chosen move
         # GamePerspective is rotated so that index 0 is always the current (self) player
         actor = 0  # local index in perspective
@@ -83,8 +83,8 @@ class LoggingPlayer(Player):
         print(f"    Action: {type(move).__name__}: {move}")
         return move
 
-    def choose_reaction(self, gs, options: List[Reaction]):  # type: ignore[override]
-        move = self.inner.choose_reaction(gs, options)
+    def react(self, gs, options: List[Reaction]):  # type: ignore[override]
+        move = self.inner.react(gs, options)
         # Pretty print reaction decision
         actor = 0
         abs_pid = self._abs_player_id

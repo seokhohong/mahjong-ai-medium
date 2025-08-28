@@ -45,7 +45,7 @@ class TestTenpaiHelpers(unittest.TestCase):
         # Create a 14-tile hand by adding a junk tile and discard that tile
         extra = Tile(Suit.HONORS, Honor.WHITE)
         hand14 = list(tenpai13) + [extra]
-        gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=, owner_of_reactable_tile=None,
+        gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=None, owner_of_reactable_tile=None,
                              called_sets={0: [], 1: [], 2: [], 3: []}, player_discards={0: [], 1: [], 2: [], 3: []},
                              called_discards={0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None,
                              seat_winds={0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH},
@@ -72,7 +72,7 @@ class TestTenpaiHelpers(unittest.TestCase):
         # Build 8 concealed: concealed7 + one extra junk to discard
         extra = Tile(Suit.HONORS, Honor.WHITE)
         hand14 = list(concealed7) + [extra]
-        gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=, owner_of_reactable_tile=None,
+        gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=None, owner_of_reactable_tile=None,
                              called_sets={0: [chi, pon], 1: [], 2: [], 3: []},
                              player_discards={0: [], 1: [], 2: [], 3: []}, called_discards={0: [], 1: [], 2: [], 3: []},
                              newly_drawn_tile=None,

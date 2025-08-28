@@ -104,7 +104,8 @@ class ACNetwork:
                 #   hand(64) + player_calls(16) + opp(3*16) + disc_attn(32) + react(emb) + gsv(GSV)
                 from .ac_constants import GAME_STATE_VEC_LEN as GSV
                 input_dim = 64 + 16 + (3 * 16) + 32 + outer.embedding_dim + int(GSV)
-                self.policy_trunk = nn.Sequential(
+                # Shared trunk for policy, value, and auxiliary heads
+                self.trunk = nn.Sequential(
                     nn.Linear(input_dim, outer.hidden_size),
                     nn.ReLU(),
                     nn.Dropout(0.3),
@@ -112,19 +113,13 @@ class ACNetwork:
                     nn.ReLU(),
                     nn.Dropout(0.3),
                 )
-                # value trunk overfits so it should be smaller
-                self.value_trunk = nn.Sequential(
-                    nn.Linear(input_dim, outer.hidden_size // 2),
-                    nn.ReLU(),
-                    nn.Dropout(0.3),
-                    nn.Linear(outer.hidden_size // 2, outer.hidden_size // 4),
-                    nn.ReLU(),
-                    nn.Dropout(0.3),
-                )
-                # Heads: two-head policy (action, tile) + value
-                self.head_action = nn.Linear(outer.hidden_size // 2, int(ACTION_HEAD_SIZE))
-                self.head_tile = nn.Linear(outer.hidden_size // 2, int(TILE_HEAD_SIZE))
-                self.head_value = nn.Linear(outer.hidden_size // 4, 1)
+                trunk_dim = outer.hidden_size // 2
+                # Heads: policy (action, tile), value, wall_counts, and deal_in
+                self.head_action = nn.Linear(trunk_dim, int(ACTION_HEAD_SIZE))
+                self.head_tile = nn.Linear(trunk_dim, int(TILE_HEAD_SIZE))
+                self.head_value = nn.Linear(trunk_dim, 1)
+                self.head_wall_counts = nn.Linear(trunk_dim, int(UNIQUE_TILE_COUNT))
+                self.head_deal_in = nn.Linear(trunk_dim, int(UNIQUE_TILE_COUNT))
 
             def forward(
                 self,
@@ -209,16 +204,17 @@ class ACNetwork:
                 # Concatenate all features
                 x = torch.cat([hand_feat, pc_feat_small, o_feat, d_feat, react_vec, gsv_feat], dim=1)
 
-                # Process through separate trunks
-                policy_features = self.policy_trunk(x)
-                value_features = self.value_trunk(x)
+                # Process through shared trunk
+                trunk_features = self.trunk(x)
 
-                action_logits = self.head_action(policy_features)
-                tile_logits = self.head_tile(policy_features)
+                action_logits = self.head_action(trunk_features)
+                tile_logits = self.head_tile(trunk_features)
                 action_pp = F.softmax(action_logits, dim=-1)
                 tile_pp = F.softmax(tile_logits, dim=-1)
-                val = self.head_value(value_features)
-                return action_pp, tile_pp, val
+                val = self.head_value(trunk_features)
+                wall_counts = self.head_wall_counts(trunk_features)
+                deal_in = torch.sigmoid(self.head_deal_in(trunk_features))
+                return action_pp, tile_pp, val, wall_counts, deal_in
 
         self._net = _ACModule(self)
         self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -345,6 +341,24 @@ class ACNetwork:
             game_tile_indicators=game_tile_indicators,
         )
 
+        gsv_std = self._game_state_vector(feat)
+
+        with torch.no_grad():
+            action_pp, tile_pp, val, _wall_counts, _deal_in = self._net(
+                torch.from_numpy(player_hand_idx[None, ...]).to(self._device),
+                torch.from_numpy(player_called_idx[None, ...]).to(self._device),
+                torch.from_numpy(opp_called_idx[None, ...]).to(self._device),
+                torch.from_numpy(disc_idx_seq[None, ...]).to(self._device),
+                torch.from_numpy(game_tile_indicators[None, ...]).to(self._device),
+                torch.from_numpy(gsv_std[None, ...]).to(self._device),
+            )
+        return (
+            action_pp.cpu().numpy()[0],
+            tile_pp.cpu().numpy()[0],
+            float(val.cpu().numpy()[0][0]),
+        )
+
+    def _game_state_vector(self, feat: Dict[str, Any]) -> np.ndarray:
         # Game-state vector: explicit layout per ac_constants.GAME_STATE_VEC_LEN doc
         from .ac_constants import GAME_STATE_VEC_LEN as GSV
         gsv = np.zeros((int(GSV),), dtype=np.float32)
@@ -373,21 +387,8 @@ class ACNetwork:
             gsv_std[0] = float(col0_scaled)
         except Exception:
             gsv_std[0] = 0.0
+        return gsv_std
 
-        with torch.no_grad():
-            action_pp, tile_pp, val = self._net(
-                torch.from_numpy(player_hand_idx[None, ...]).to(self._device),
-                torch.from_numpy(player_called_idx[None, ...]).to(self._device),
-                torch.from_numpy(opp_called_idx[None, ...]).to(self._device),
-                torch.from_numpy(disc_idx_seq[None, ...]).to(self._device),
-                torch.from_numpy(game_tile_indicators[None, ...]).to(self._device),
-                torch.from_numpy(gsv_std[None, ...]).to(self._device),
-            )
-        return (
-            action_pp.cpu().numpy()[0],
-            tile_pp.cpu().numpy()[0],
-            float(val.cpu().numpy()[0][0]),
-        )
     def torch_module(self) -> nn.Module:
         return self._net
 

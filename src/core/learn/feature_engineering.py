@@ -128,28 +128,26 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
 
     # Explicit meta fields to return in place of packed game_state
     lam = gp.legal_action_mask()
-    try:
-        lam_list = [int(x) for x in lam.tolist()]
-    except Exception:
-        # Fallback in unlikely cases
-        lam_list = [int(v) for v in np.asarray(lam).astype(np.int32).tolist()]
     owner_idx = -1 if gp._owner_of_reactable_tile is None else int(gp._owner_of_reactable_tile)
     # Note: store current_player_idx is not directly available from perspective; infer via is_current_turn + players' turns is outside scope.
-    return {
+    out = {
         'hand_idx': hand_idx,
         'called_idx': called_idx,
         'disc_idx': disc_idx,
         'called_discards': called_discards,
         'round_wind': int(gp.round_wind.value),
         'seat_winds': seat_winds_vals, # technically we don't need all seat winds, just one, since they're always in order
-        'legal_action_mask': np.asarray(lam_list, dtype=np.int32),
+        'legal_action_mask': lam,
         'riichi_declarations': riichi_decl_idxs,
         'remaining_tiles': int(gp.remaining_tiles),
         'owner_of_reactable_tile': int(owner_idx),
         'reactable_tile': int(reactable_idx),
         'newly_drawn_tile': int(newly_idx),
         'dora_indicator_tiles': dora_indicator_tiles,
+        'deal_in_tiles': gp.deal_in_tiles,
+        'wall_count': gp.wall_count
     }
+    return out
 
 
 def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
@@ -171,6 +169,9 @@ def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
     reactable_idx = int(features.get('reactable_tile', -1))
     newly_idx = int(features.get('newly_drawn_tile', -1))
     dora_idxs = [int(v) for v in np.asarray(features.get('dora_indicator_tiles', []), dtype=np.int32).tolist()]
+    wall_count = np.asarray(features.get('wall_count', []), dtype=np.int8)
+    # Optional: deal-in tiles mask back to list of Tiles for GamePerspective
+    deal_in_tiles = features.get('deal_in_tiles', [])
 
     # Build basic fields from indices
     player_hand: List[Tile] = []
@@ -238,6 +239,7 @@ def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
                          owner_of_reactable_tile=last_discard_player_val, called_sets=called_sets,
                          player_discards=player_discards, called_discards=called_discards,
                          newly_drawn_tile=newly_drawn_tile, seat_winds=seat_winds, round_wind=round_wind,
-                         dora_indicators=dora_indicators, riichi_declaration_tile=riichi_declaration_tile)
+                         dora_indicators=dora_indicators, riichi_declaration_tile=riichi_declaration_tile,
+                         wall_count=wall_count, deal_in_tiles=deal_in_tiles)
     return gp
 

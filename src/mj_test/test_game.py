@@ -179,7 +179,7 @@ class TestMediumJongBasics(unittest.TestCase):
     def test_ankan_keeps_turn_and_leads_to_one_discard(self):
         # Player 0 with 4x NORTH should Ankan on first play_turn, keep turn, then discard on second
         class KanThenDiscard(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 from core.action import KanAnkan
                 for m in gs.legal_moves():
                     if isinstance(m, KanAnkan):
@@ -229,7 +229,7 @@ class TestYakuAndRiichi(unittest.TestCase):
     def test_yaku_required_no_yaku_no_win(self):
         # Use a player that asserts inside its play() when tsumo would be legal
         class CheckTsumoLegal(Player):
-            def play(self, game_state):  # type: ignore[override]
+            def act(self, game_state):  # type: ignore[override]
                 # Should NOT be legal to tsumo: hand has no yaku and is open (called set)
                 assert not game_state.can_tsumo(), "yakuless open hand should not be able to tsumo"
                 # Return any discard to continue
@@ -358,7 +358,7 @@ class TestYakuAndRiichi(unittest.TestCase):
         # Hand includes a concealed kan of NORTH; after rinshan draw, tsumo should be legal
         # and the only yaku should be menzen tsumo.
         class KanThenTsumo(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 from core.action import KanAnkan
                 # If ankan is legal, perform it first
                 for m in gs.legal_moves():
@@ -459,7 +459,7 @@ class TestScoring(unittest.TestCase):
     def test_non_dealer_tsumo_tanyao_two_aka_split(self):
         # Player 1 (non-dealer) tsumo a tanyao hand with two aka dora fives
         class TsumoIfPossible(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 if gs.can_tsumo():
                     return Tsumo()
                 return Discard(gs.player_hand[0])
@@ -640,7 +640,7 @@ class TestScoring(unittest.TestCase):
     def test_riichi_stick_not_paid_on_immediate_ron(self):
         # P0 declares riichi and immediately deals into P1; P1 should NOT get riichi stick
         class DiscardWinning(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 # Discard 3p if present
                 t = Tile(Suit.PINZU, TileType.THREE)
                 if t in gs.player_hand:
@@ -707,6 +707,51 @@ class TestScoring(unittest.TestCase):
         pay = g.get_points()
         # P0 should have +3000 from three noten players, minus 1000 riichi stick -> +2000
         self.assertEqual(pay[0], 2000)
+
+    def test_open_hand_tenpai_gets_points_on_exhaustive_draw(self):
+        # Open-hand tenpai should still count as Tenpai at exhaustive draw and receive keiten payments
+        g = MediumJong([Player(), Player(), Player(), Player()])
+        # Player 0: open chi 4-5-6p; concealed tiles form 13-tile tenpai waiting on 3p to become 333p
+        # Concealed (10 tiles): 234m, 456s, pair 77m, pair 33p (tenpai on 3p)
+        g._player_hands[0] = [
+            Tile(Suit.MANZU, TileType.TWO), Tile(Suit.MANZU, TileType.THREE), Tile(Suit.MANZU, TileType.FOUR),
+            Tile(Suit.SOUZU, TileType.FOUR), Tile(Suit.SOUZU, TileType.FIVE), Tile(Suit.SOUZU, TileType.SIX),
+            Tile(Suit.MANZU, TileType.SEVEN), Tile(Suit.MANZU, TileType.SEVEN),
+            Tile(Suit.PINZU, TileType.THREE), Tile(Suit.PINZU, TileType.THREE),
+        ]
+        g._player_called_sets[0] = [CalledSet([
+            Tile(Suit.PINZU, TileType.FOUR), Tile(Suit.PINZU, TileType.FIVE), Tile(Suit.PINZU, TileType.SIX)
+        ], 'chi', Tile(Suit.PINZU, TileType.FIVE), caller_position=0, source_position=1)]
+
+        # Players 1..3: clearly noten hands (honors and terminals that cannot be one away)
+        for pid in [1, 2, 3]:
+            g._player_hands[pid] = [
+                Tile(Suit.HONORS, Honor.EAST), Tile(Suit.HONORS, Honor.SOUTH), Tile(Suit.HONORS, Honor.WEST),
+                Tile(Suit.HONORS, Honor.NORTH), Tile(Suit.HONORS, Honor.WHITE), Tile(Suit.HONORS, Honor.GREEN),
+                Tile(Suit.HONORS, Honor.RED),
+                Tile(Suit.MANZU, TileType.ONE), Tile(Suit.MANZU, TileType.NINE),
+                Tile(Suit.PINZU, TileType.ONE), Tile(Suit.PINZU, TileType.NINE),
+                Tile(Suit.SOUZU, TileType.ONE), Tile(Suit.SOUZU, TileType.NINE),
+            ]
+
+        # Force an exhaustive draw quickly
+        g.tiles = [Tile(Suit.MANZU, TileType.ONE)]
+        g.play_turn()
+        g.play_turn()
+        self.assertTrue(g.is_game_over())
+
+        # Keiten payments: one tenpai -> others pay -1000 each, P0 gets +3000
+        pts = g.get_points()
+        self.assertIsNotNone(pts)
+        self.assertEqual(pts[0], 3000)
+        self.assertEqual([pts[1], pts[2], pts[3]], [-1000, -1000, -1000])
+
+        # Outcome types reflect Tenpai/Noten on draw
+        outcome = g.get_game_outcome()
+        self.assertTrue(outcome.is_draw)
+        self.assertEqual(outcome.outcome_type(0), OutcomeType.TENPAI)
+        for pid in [1, 2, 3]:
+            self.assertEqual(outcome.outcome_type(pid), OutcomeType.NOTEN)
 
     def test_sanankou_counts_with_open_hand(self):
         # Three concealed triplets and one open chi should count Sanankou (2 han)
@@ -1078,7 +1123,7 @@ class TestGameOutcome(unittest.TestCase):
         from core.tile import Tile, Suit, TileType
         import core.game
         class TsumoIfCan(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 if gs.can_tsumo():
                     return Tsumo()
                 return core.game.Discard(gs.player_hand[0])

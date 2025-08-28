@@ -247,7 +247,7 @@ class TestMediumLegality(unittest.TestCase):
     def test_furiten_blocks_ron(self):
         # Player 0 has a hand waiting on 3p; they have previously discarded 3p -> furiten
         class TsumoIfPossible(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 if gs.can_tsumo():
                     return Tsumo()
                 # Otherwise discard first
@@ -431,7 +431,7 @@ class TestMediumLegality(unittest.TestCase):
                 super().__init__()
                 self.t = tester
 
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 # Verify all legal moves align with masks; then pick a move.
                 moves = gs.legal_moves()
                 act_mask = gs.legal_action_mask()
@@ -443,9 +443,9 @@ class TestMediumLegality(unittest.TestCase):
                     self.t.assertEqual(int(act_mask[action_idx]), 1)
                     self.t.assertEqual(int(tile_mask[tile_idx]), 1)
                 # Delegate move selection to base Player
-                return super().play(gs)
+                return super().act(gs)
 
-            def choose_reaction(self, gs, options):  # type: ignore[override]
+            def react(self, gs, options):  # type: ignore[override]
                 act_mask = gs.legal_action_mask()
                 # Validate each option matches action mask bits
                 for r in options:
@@ -454,7 +454,7 @@ class TestMediumLegality(unittest.TestCase):
                     self.t.assertEqual(int(act_mask[action_idx]), 1)
                     self.t.assertEqual(int(tile_mask[tile_idx]), 1)
                 # Delegate reaction selection to base Player
-                return super().choose_reaction(gs, options)
+                return super().react(gs, options)
 
         # Seed for deterministic shuffling
         rng_seed = 0

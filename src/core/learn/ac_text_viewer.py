@@ -100,13 +100,13 @@ class TextViewerPlayer(Player):
         except Exception:
             pass
 
-    def play(self, game_state: Any) -> Any:
-        action = self._base.play(game_state)
+    def act(self, game_state: Any) -> Any:
+        action = self._base.act(game_state)
         self._log_turn(game_state, action)
         return action
 
-    def choose_reaction(self, game_state: Any, options: List[Reaction]) -> Any:  # type: ignore[name-defined]
-        action = self._base.choose_reaction(game_state, options)
+    def react(self, game_state: Any, options: List[Reaction]) -> Any:  # type: ignore[name-defined]
+        action = self._base.react(game_state, options)
         self._log_reaction(game_state, options, action)
         return action
 

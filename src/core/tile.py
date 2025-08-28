@@ -52,11 +52,35 @@ class Tile:
             return f"0{self.suit.value}"
         return f"{int(self.tile_type.value)}{self.suit.value}"
 
+    def functionally_equal(self, other: object) -> bool:
+        """Aka-insensitive equality for rule logic (dora, furiten, waits).
+
+        Compares only suit and tile_type.
+        """
+        return (
+            isinstance(other, Tile)
+            and self.suit == other.suit
+            and self.tile_type == other.tile_type
+        )
+
+    def exactly_equal(self, other: object) -> bool:
+        """Aka-sensitive equality for exact tile identity in gameplay state changes.
+
+        Compares suit, tile_type, and aka flag.
+        """
+        return (
+            isinstance(other, Tile)
+            and self.suit == other.suit
+            and self.tile_type == other.tile_type
+            and bool(self.aka) == bool(other.aka)
+        )
+
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Tile) and self.suit == other.suit and self.tile_type == other.tile_type
+        # Route default equality to aka-sensitive exact equality
+        return self.exactly_equal(other)
 
     def __hash__(self) -> int:
-        return hash((self.suit, self.tile_type))
+        return hash((self.suit, self.tile_type, bool(self.aka)))
 
 
 def _tile_sort_key(t: Tile) -> Tuple[int, int]:

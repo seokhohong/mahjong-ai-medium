@@ -97,9 +97,32 @@ class ACDataset(Dataset):
         # Keep only the handle to the npz to avoid loading everything in memory
         self._data = np.load(npz_path, allow_pickle=True, mmap_mode=('r' if mmap else None))
 
+        # Cache references to arrays we access in __getitem__ (still memmap-backed if mmap=True)
+        d = self._data
+        # Feature inputs
+        self.hand_idx = d['hand_idx']
+        self.called_idx = d['called_idx']
+        self.disc_idx = d['disc_idx']
+        self.remaining_tiles = d['remaining_tiles']
+        self.owner_of_reactable_tile = d['owner_of_reactable_tile']
+        self.seat_winds = d['seat_winds']
+        self.riichi_declarations = d['riichi_declarations']
+        self.legal_action_mask = d['legal_action_mask']
+        self.dora_indicator_tiles = d['dora_indicator_tiles']
+        self.reactable_tile = d['reactable_tile']
+        # Targets and aux
+        self.action_idx = d['action_idx']
+        self.tile_idx = d['tile_idx']
+        self.returns = d['returns']
+        self.advantages = d['advantages']
+        self.joint_log_probs = d['joint_log_probs']
+        self.game_ids = d['game_ids']
+        self.wall_count = d['wall_count']
+        self.deal_in_tiles = d['deal_in_tiles']
+
         # Optionally fit the scaler on remaining_tiles (column 0 of GSV)
         if fit_scaler:
-            remaining_tiles_arr = np.asarray(self._data['remaining_tiles'], dtype=np.float32).reshape(-1, 1)
+            remaining_tiles_arr = np.asarray(self.remaining_tiles, dtype=np.float32).reshape(-1, 1)
             net.fit_scaler(remaining_tiles_arr)
 
         self._net = net
@@ -116,11 +139,10 @@ class ACDataset(Dataset):
             # No validation split requested
             return Subset(self, list(range(len(self)))), None
 
-        # Access game_ids lazily from file (NpzFile doesn't guarantee .get())
-        if 'game_ids' not in getattr(self._data, 'files', []):
+        # Use cached game_ids
+        if self.game_ids is None:
             raise ValueError("ACDataset: game_ids not found in dataset; cannot split by game. Please regenerate dataset with 'game_ids'.")
-        game_ids = self._data['game_ids']
-        game_ids_arr = _np.asarray(game_ids)
+        game_ids_arr = _np.asarray(self.game_ids)
         unique_games = _np.unique(game_ids_arr)
         if unique_games.size == 0:
             # Degenerate case; treat as no validation
@@ -143,15 +165,13 @@ class ACDataset(Dataset):
 
     def __len__(self) -> int:
         # Use length of the primary arrays (action_idx)
-        return int(len(self._data['action_idx']))
+        return int(len(self.action_idx))
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Compute features on demand to save RAM
-        data = self._data
-
         # Build game_tile_indicators_idx = [react, d1, d2, d3, d4]
-        react_idx = int(data['reactable_tile'][idx]) if 'reactable_tile' in data else -1
-        dora = np.asarray(data['dora_indicator_tiles'][idx], dtype=np.int32)
+        react_idx = int(self.reactable_tile[idx]) if self.reactable_tile is not None else -1
+        dora = np.asarray(self.dora_indicator_tiles[idx], dtype=np.int32)
         dora_vals = dora.tolist()
         while len(dora_vals) < 4:
             dora_vals.append(-1)
@@ -163,28 +183,28 @@ class ACDataset(Dataset):
             opp_called_idx,
             disc_idx,
         ) = self._net.extract_features_from_indexed(
-            hand_idx=np.asarray(data['hand_idx'][idx], dtype=np.int32),
-            called_idx=np.asarray(data['called_idx'][idx], dtype=np.int32),
-            disc_idx=np.asarray(data['disc_idx'][idx], dtype=np.int32),
+            hand_idx=np.asarray(self.hand_idx[idx], dtype=np.int32),
+            called_idx=np.asarray(self.called_idx[idx], dtype=np.int32),
+            disc_idx=np.asarray(self.disc_idx[idx], dtype=np.int32),
             game_tile_indicators=game_tile_indicators_idx,
         )
 
         # Construct game_state_vec to length GAME_STATE_VEC_LEN
         gsv = np.zeros((int(GAME_STATE_VEC_LEN),), dtype=np.float32)
         # [0] remaining_tiles (to be standardized later)
-        gsv[0] = float(int(data['remaining_tiles'][idx]))
+        gsv[0] = float(int(self.remaining_tiles[idx]))
         # [1] owner_of_reactable_tile
-        gsv[1] = float(int(data['owner_of_reactable_tile'][idx]))
+        gsv[1] = float(int(self.owner_of_reactable_tile[idx]))
         # [2..5] seat_winds[4]
-        sw = np.asarray(data['seat_winds'][idx], dtype=np.int32)
+        sw = np.asarray(self.seat_winds[idx], dtype=np.int32)
         for i in range(4):
             gsv[2 + i] = float(int(sw[i]) if i < sw.shape[0] else 0)
         # [6..9] riichi_declarations[4]
-        rd = np.asarray(data['riichi_declarations'][idx], dtype=np.int32)
+        rd = np.asarray(self.riichi_declarations[idx], dtype=np.int32)
         for i in range(4):
             gsv[6 + i] = float(int(rd[i]) if i < rd.shape[0] else -1)
         # [10..] legal_action_mask[ACTION_HEAD_SIZE]
-        lam = np.asarray(data['legal_action_mask'][idx], dtype=np.int32)
+        lam = np.asarray(self.legal_action_mask[idx], dtype=np.int32)
         lam_fixed = np.zeros((int(ACTION_HEAD_SIZE),), dtype=np.float32)
         k = min(int(ACTION_HEAD_SIZE), int(lam.shape[0]))
         lam_fixed[:k] = lam[:k]
@@ -198,6 +218,18 @@ class ACDataset(Dataset):
         except Exception:
             gsv_std[0] = 0.0
 
+        # Build deal_in_mask (37-dim multi-hot from deal_in_tiles), and passthrough wall_count
+        if self.deal_in_tiles is not None:
+            tiles = np.asarray(self.deal_in_tiles[idx], dtype=np.int32).ravel()
+            deal_in_mask = np.zeros((int(UNIQUE_TILE_COUNT),), dtype=np.float32)
+            for t in tiles:
+                ti = int(t)
+                if 0 <= ti < int(UNIQUE_TILE_COUNT):
+                    deal_in_mask[ti] = 1.0
+        else:
+            deal_in_mask = np.zeros((int(UNIQUE_TILE_COUNT),), dtype=np.float32)
+        wall_count = self.wall_count[idx]
+
         return {
             'player_hand_idx': np.asarray(player_hand_idx_fixed, dtype=np.int32),
             'player_called_idx': np.asarray(player_called_idx, dtype=np.int32),
@@ -205,11 +237,14 @@ class ACDataset(Dataset):
             'disc_idx': disc_idx.astype(np.int32),
             'game_tile_indicators_idx': game_tile_indicators_idx.astype(np.int32),
             'game_state_vec': gsv_std.astype(np.float32),
-            'action_idx': int(self._data['action_idx'][idx]),
-            'tile_idx': int(self._data['tile_idx'][idx]),
-            'return': float(self._data['returns'][idx]),
-            'advantage': float(self._data['advantages'][idx]),
-            'joint_old_log_prob': float(self._data['joint_log_probs'][idx]),
+            'action_idx': int(self.action_idx[idx]),
+            'tile_idx': int(self.tile_idx[idx]),
+            'return': float(self.returns[idx]),
+            'advantage': float(self.advantages[idx]),
+            'joint_old_log_prob': float(self.joint_log_probs[idx]),
+            # Aux targets
+            'wall_count': wall_count,
+            'deal_in_mask': deal_in_mask,
         }
 
 
@@ -233,12 +268,16 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
     joint_old_log_probs = _to_dev(batch['joint_old_log_prob'], torch.float32)
     advantages = _to_dev(batch['advantage'], torch.float32)
     returns = _to_dev(batch['return'], torch.float32)
+    # Aux targets
+    wall_count = _to_dev(batch['wall_count'], torch.float32)
+    deal_in_mask = _to_dev(batch['deal_in_mask'], torch.float32)
 
     return (
         player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
         action_idx, tile_idx,
         joint_old_log_probs,
         advantages, returns,
+        wall_count, deal_in_mask,
     )
 
 def safe_entropy_calculation(probs, min_prob=1e-8):
@@ -290,19 +329,20 @@ def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val
             
             for batch in dataloader:
                 (player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
-                 action_idx, tile_idx, joint_old_log_probs, advantages, returns) = _prepare_batch_tensors(batch, dev)
+                 action_idx, tile_idx, joint_old_log_probs, advantages, returns, wall_count, deal_in_mask) = _prepare_batch_tensors(batch, dev)
                 
                 # Compute losses
                 total_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
                     model,
                     player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                     action_idx, tile_idx, joint_old_log_probs, advantages, returns,
+                    wall_count, deal_in_mask,
                     bc_fallback_ratio=bc_fallback_ratio,
                     bc_weight=0.0, policy_weight=1.0,
                 )
                 
                 # Compute accuracy
-                a_logits, t_logits, _ = model(
+                a_logits, t_logits, _, _, _ = model(
                     player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
                 )
                 pred_a = torch.argmax(a_logits, dim=1)
@@ -356,6 +396,8 @@ def _compute_losses(
         joint_old_log_probs: torch.Tensor,
         advantages: torch.Tensor,
         returns: torch.Tensor,
+        wall_count: torch.Tensor,
+        deal_in_mask: torch.Tensor,
         *,
         epsilon: float = 0.2,
         value_coeff: float = 0.5,
@@ -363,9 +405,11 @@ def _compute_losses(
         bc_fallback_ratio: float = 5.0,
         bc_weight: float = 0.0,
         policy_weight: float = 1.0,
+        aux_wall_coeff: float = 0.1,
+        aux_deal_in_coeff: float = 0.1,
         print_debug: bool = False,
 ):
-    a_pp, t_pp, value_pred = model(
+    a_pp, t_pp, value_pred, wall_counts_pred, deal_in_pred = model(
         player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
     )
     value_pred = value_pred.squeeze(1)
@@ -419,7 +463,10 @@ def _compute_losses(
     if (bc_weight == 0.0) and (policy_weight == 0.0):
         policy_loss = torch.zeros((), device=value_pred.device, dtype=value_pred.dtype)
         value_loss = F.smooth_l1_loss(value_pred, returns)
-        total = value_loss
+        # Aux losses also contribute during value-only pretraining
+        wall_loss = F.mse_loss(wall_counts_pred, wall_count)
+        deal_in_loss = F.binary_cross_entropy(deal_in_pred.clamp(1e-6, 1-1e-6), deal_in_mask)
+        total = value_loss + aux_wall_coeff * wall_loss + aux_deal_in_coeff * deal_in_loss
         dbg = {
             'bsz': batch_size_curr,
             'ratio_sum': 0.0,
@@ -430,7 +477,7 @@ def _compute_losses(
             'bc_fallback_used': False,
             'max_ratio': 0.0,
         }
-        return total, policy_loss, value_loss, batch_size_curr, dbg
+        return total, policy_loss, value_loss, wall_loss, deal_in_loss, batch_size_curr, dbg
 
     # Compute BC policy loss (NLL on current logits)
     log_a = (a_pp.clamp_min(1e-8)).log()
@@ -463,96 +510,16 @@ def _compute_losses(
 
     # Value and entropy terms
     value_loss = F.smooth_l1_loss(value_pred, returns)
+    # Aux terms
+    wall_loss = F.smooth_l1_loss(wall_counts_pred, wall_count)
+    deal_in_loss = F.binary_cross_entropy(deal_in_pred.clamp(1e-6, 1-1e-6), deal_in_mask)
     entropy_a = safe_entropy_calculation(a_pp)
     entropy_t = safe_entropy_calculation(t_pp)
     entropy = entropy_a + entropy_t
 
-    total = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
+    total = policy_loss + value_coeff * value_loss + aux_wall_coeff * wall_loss + aux_deal_in_coeff * deal_in_loss - entropy_coeff * entropy
 
-    return total, policy_loss, value_loss, batch_size_curr, dbg
-
-
-def _run_value_pretraining(
-    model: torch.nn.Module,
-    dl: DataLoader,
-    dl_validation: DataLoader | None,
-    dev: torch.device,
-    lr: float,
-    value_lr: float | None,
-    bc_fallback_ratio: float,
-) -> None:
-    """Run value-only pretraining for specified number of epochs."""
-    value_pre_epochs = int(os.environ.get('MJ_VALUE_EPOCHS', '0'))
-    if hasattr(train_ppo, '_value_epochs_override'):
-        value_pre_epochs = int(getattr(train_ppo, '_value_epochs_override'))
-    
-    if value_pre_epochs <= 0:
-        return
-    
-    # Use separate learning rate for value pretraining if specified
-    effective_value_lr = value_lr if value_lr is not None else lr
-    value_opt = torch.optim.Adam(model.parameters(), lr=effective_value_lr)
-    print(f"Starting value-only pretraining for {value_pre_epochs} epoch(s) with lr={effective_value_lr:.2e}...")
-    
-    for ve in range(value_pre_epochs):
-        total_v = 0.0
-        total_n = 0
-        progress = tqdm(dl, desc=f"ValuePre {ve+1}/{value_pre_epochs}", leave=False)
-        for batch in progress:
-            (
-                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
-                action_idx, tile_idx,
-                joint_old_log_probs,
-                advantages, returns,
-            ) = _prepare_batch_tensors(batch, dev)
-            total_loss_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
-                model,
-                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
-                action_idx, tile_idx, joint_old_log_probs, advantages, returns,
-                bc_fallback_ratio=bc_fallback_ratio,
-                bc_weight=0.0, policy_weight=0.0,
-            )
-            value_opt.zero_grad(set_to_none=True)
-            total_loss_v.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            value_opt.step()
-            total_v += float(value_loss_v.item()) * bsz
-            total_n += int(bsz)
-            progress.set_postfix(value=f"{float(value_loss_v.item()):.4f}")
-        
-        train_value_loss = total_v / max(1, total_n)
-        
-        # Validation phase - for value pretraining, evaluate on ALL batches (no BC filtering)
-        validation_value_loss = None
-        if dl_validation is not None:
-            model.eval()
-            validation_total_v = 0.0
-            validation_total_n = 0
-            with torch.no_grad():
-                for validation_batch in dl_validation:
-                    (
-                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
-                        action_idx, tile_idx,
-                        joint_old_log_probs,
-                        advantages, returns,
-                    ) = _prepare_batch_tensors(validation_batch, dev)
-                    
-                    # For value pretraining, use all batches regardless of BC mode
-                    _, _, value_loss_v, bsz, _ = _compute_losses(
-                        model,
-                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
-                        action_idx, tile_idx, joint_old_log_probs, advantages, returns,
-                        bc_fallback_ratio=bc_fallback_ratio,
-                        bc_weight=0.0, policy_weight=0.0,
-                    )
-                    validation_total_v += float(value_loss_v.item()) * bsz
-                    validation_total_n += int(bsz)
-            
-            validation_value_loss = validation_total_v / max(1, validation_total_n)
-            model.train()
-            print(f"ValuePre {ve+1}/{value_pre_epochs} - train: {train_value_loss:.4f} | validation: {validation_value_loss:.4f}")
-        else:
-            print(f"ValuePre {ve+1}/{value_pre_epochs} - train: {train_value_loss:.4f}")
+    return total, policy_loss, value_loss, wall_loss, deal_in_loss, batch_size_curr, dbg
 
 
 def _run_warmup_bc(
@@ -566,17 +533,15 @@ def _run_warmup_bc(
     value_coeff: float,
     bc_fallback_ratio: float,
     lr: float,
-    value_lr: float | None,
-    warm_up_value: bool,
 ) -> None:
     """Run behavior cloning warm-up until accuracy threshold is met."""
     if not warm_up_acc or warm_up_acc <= 0.0:
         return
     
-    # Use value_lr for warm-up if available, otherwise fallback to main lr
-    warmup_lr = value_lr if value_lr is not None else lr
+    # Use main lr for warm-up
+    warmup_lr = lr
     warmup_opt = torch.optim.Adam(model.parameters(), lr=warmup_lr)
-    print(f"Warm-up BC using learning rate: {warmup_lr}, value training: {'enabled' if warm_up_value else 'disabled'}")
+    print(f"Warm-up BC using learning rate: {warmup_lr}")
     
     def _eval_policy_accuracy(dloader: DataLoader) -> float:
         model.eval()
@@ -590,8 +555,9 @@ def _run_warmup_bc(
                     _joint_old_log_probs,
                     _advantages,
                     _returns,
+                    _wall_count, _deal_in_mask,
                 ) = _prepare_batch_tensors(batch, dev)
-                a_pp, t_pp, _ = model(
+                a_pp, t_pp, _, _, _ = model(
                     player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
                 )
                 pred_a = torch.argmax(a_pp, dim=1)
@@ -617,6 +583,8 @@ def _run_warmup_bc(
         total_examples = 0
         pol_loss_acc = 0.0
         value_loss_acc = 0.0
+        wall_loss_acc = 0.0
+        deal_in_loss_acc = 0.0
         correct = 0
         progress = tqdm(dl, desc=f"WarmUp {epoch+1}", leave=False)
         for batch in progress:
@@ -626,16 +594,19 @@ def _run_warmup_bc(
                 joint_old_log_probs,
                 advantages,
                 returns,
+                wall_count, deal_in_mask,
             ) = _prepare_batch_tensors(batch, dev)
 
-            loss, policy_loss, value_loss, _, _dbg = _compute_losses(
+            loss, policy_loss, value_loss, wall_loss, deal_in_loss, _, _dbg = _compute_losses(
                 model,
                 player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages,
                 returns,
-                value_coeff=value_coeff if warm_up_value else 0.0,
+                wall_count, deal_in_mask,
+                value_coeff=value_coeff,
+                entropy_coeff=0.0,  # no entropy regularization during warm-up
                 bc_fallback_ratio=bc_fallback_ratio,
                 bc_weight=1.0, policy_weight=0.0,
             )
@@ -650,11 +621,13 @@ def _run_warmup_bc(
             total_loss += float(loss.item()) * bsz
             pol_loss_acc += float(policy_loss.item()) * bsz
             value_loss_acc += float(value_loss.item()) * bsz
+            wall_loss_acc += float(wall_loss.item()) * bsz
+            deal_in_loss_acc += float(deal_in_loss.item()) * bsz
             # Compute training accuracy in eval mode for parity with validation accuracy
             with torch.no_grad():
                 was_training = model.training
                 model.eval()
-                a_pp, t_pp, _ = model(
+                a_pp, t_pp, _, _, _ = model(
                     player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
                 )
                 pred_a = torch.argmax(a_pp, dim=1)
@@ -668,7 +641,9 @@ def _run_warmup_bc(
             progress.set_postfix(
                 loss=f"{(total_loss/denom):.4f}",
                 pol=f"{(pol_loss_acc/denom):.4f}",
-                value=f"{(value_loss_acc/denom):.4f}"
+                value=f"{(value_loss_acc/denom):.4f}",
+                wall=f"{(wall_loss_acc/denom):.4f}",
+                deal_in=f"{(deal_in_loss_acc/denom):.4f}",
             )
 
         # Calculate train metrics (averaged)
@@ -677,12 +652,15 @@ def _run_warmup_bc(
         train_total_avg = (total_loss / train_denominator)
         train_policy_avg = (pol_loss_acc / train_denominator)
         train_value_avg = (value_loss_acc / train_denominator)
+        train_wall_avg = (wall_loss_acc / train_denominator)
+        train_deal_in_avg = (deal_in_loss_acc / train_denominator)
 
         # Calculate validation accuracy if available
         validation_acc = None
         if dl_validation is not None:
             model.eval()
             validation_total = validation_pol = validation_value = 0.0
+            validation_wall = validation_deal_in = 0.0
             validation_count = 0
             validation_correct = 0
             with torch.no_grad():
@@ -693,15 +671,18 @@ def _run_warmup_bc(
                         joint_old_log_probs,
                         advantages,
                         returns,
+                        wall_count, deal_in_mask,
                     ) = _prepare_batch_tensors(vb, dev)
-                    loss_v, policy_loss_v, value_loss_v, _, _ = _compute_losses(
+                    loss_v, policy_loss_v, value_loss_v, wall_loss_v, deal_in_loss_v, _, _ = _compute_losses(
                         model,
                         player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages,
                         returns,
+                        wall_count, deal_in_mask,
                         value_coeff=value_coeff,
+                        entropy_coeff=0.0,  # no entropy regularization during warm-up validation
                         bc_fallback_ratio=bc_fallback_ratio,
                         bc_weight=1.0, policy_weight=0.0,
                     )
@@ -710,7 +691,9 @@ def _run_warmup_bc(
                     validation_pol += float(policy_loss_v.item()) * bsz
                     validation_value += float(value_loss_v.item()) * bsz
                     validation_count += bsz
-                    a_pp, t_pp, _ = model(
+                    validation_wall += float(wall_loss_v.item()) * bsz
+                    validation_deal_in += float(deal_in_loss_v.item()) * bsz
+                    a_pp, t_pp, _, _, _ = model(
                         player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
                     )
                     pred_a = torch.argmax(a_pp, dim=1)
@@ -719,12 +702,12 @@ def _run_warmup_bc(
                     validation_correct += int(both.sum().item())
             validation_denominator = max(1, validation_count)
             validation_acc = (validation_correct / max(1, validation_count))
-            print(f"\nWarmUp {epoch+1} [validation] - total: {validation_total/validation_denominator:.4f} | policy: {validation_pol/validation_denominator:.4f} | value: {validation_value/validation_denominator:.4f} | acc: {validation_acc:.4f}")
+            print(f"\nWarmUp {epoch+1} [validation] - total: {validation_total/validation_denominator:.4f} | policy: {validation_pol/validation_denominator:.4f} | value: {validation_value/validation_denominator:.4f} | wall: {validation_wall/validation_denominator:.4f} | deal_in: {validation_deal_in/validation_denominator:.4f} | acc: {validation_acc:.4f}")
             model.train()
 
         # Display both train and validation metrics
         if validation_acc is not None:
-            print(f"WarmUp {epoch+1} [train] - total: {train_total_avg:.4f} | policy: {train_policy_avg:.4f} | value: {train_value_avg:.4f} | acc: {train_acc:.4f}")
+            print(f"WarmUp {epoch+1} [train] - total: {train_total_avg:.4f} | policy: {train_policy_avg:.4f} | value: {train_value_avg:.4f} | wall: {train_wall_avg:.4f} | deal_in: {train_deal_in_avg:.4f} | acc: {train_acc:.4f}")
             epoch_acc = validation_acc  # Use validation accuracy for threshold checking
         else:
             print(f"WarmUp {epoch+1} [train] - total: {train_total_avg:.4f} | policy: {train_policy_avg:.4f} | value: {train_value_avg:.4f} | acc: {train_acc:.4f}")
@@ -789,17 +772,18 @@ def _run_ppo_training(
                 player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
-                advantages, returns,
+                advantages, returns, wall_count, deal_in_mask
             ) = _prepare_batch_tensors(batch, dev)
 
             # Print PPO debugging once per epoch at the last training step
             last_step = (bi == (len(dl) - 1))
-            total, policy_loss, value_loss, batch_size_curr, dbg = _compute_losses(
+            total, policy_loss, value_loss, wall_loss, deal_in_loss, batch_size_curr, dbg = _compute_losses(
                 model,
                 player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages, returns,
+                wall_count, deal_in_mask,
                 epsilon=epsilon,
                 value_coeff=value_coeff,
                 entropy_coeff=entropy_coeff,
@@ -816,6 +800,8 @@ def _run_ppo_training(
             total_loss += float(total.item()) * batch_size_curr
             total_policy_loss += float(policy_loss.item()) * batch_size_curr
             total_value_loss += float(value_loss.item()) * batch_size_curr
+            total_wall_loss = locals().get('total_wall_loss', 0.0) + float(wall_loss.item()) * batch_size_curr
+            total_deal_in_loss = locals().get('total_deal_in_loss', 0.0) + float(deal_in_loss.item()) * batch_size_curr
             total_policy_loss_main += float(policy_loss.item()) * batch_size_curr
             
             total_examples += batch_size_curr
@@ -837,7 +823,9 @@ def _run_ppo_training(
             progress.set_postfix(
                 loss=f"{(total_loss/denom):.4f}",
                 pol=f"{(total_policy_loss/denom):.4f}",
-                value=f"{(total_value_loss/denom):.4f}"
+                value=f"{(total_value_loss/denom):.4f}",
+                wall=f"{(locals().get('total_wall_loss',0.0)/denom):.4f}",
+                deal_in=f"{(locals().get('total_deal_in_loss',0.0)/denom):.4f}",
             )
 
         # End-of-epoch debug summary (averages over training epoch)
@@ -860,6 +848,7 @@ def _run_ppo_training(
         if dl_validation is not None:
             model.eval()
             validation_total = validation_pol = validation_value = 0.0
+            validation_wall = validation_deal_in = 0.0
             validation_pol_main = 0.0
             validation_count = 0
             # Track value loss separately for non-BC batches only
@@ -874,13 +863,15 @@ def _run_ppo_training(
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
+                        wall_count, deal_in_mask,
                     ) = _prepare_batch_tensors(vb, dev)
-                    total_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
+                    total_v, policy_loss_v, value_loss_v, wall_loss_v, deal_in_loss_v, bsz, _ = _compute_losses(
                         model,
                         player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
+                        wall_count, deal_in_mask,
                         epsilon=epsilon,
                         value_coeff=value_coeff,
                         entropy_coeff=entropy_coeff,
@@ -889,7 +880,7 @@ def _run_ppo_training(
                     )
 
                     # Compute current probs
-                    a_curr, t_curr, _ = model(
+                    a_curr, t_curr, _, _, _ = model(
                         player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
                     )
                     
@@ -897,6 +888,8 @@ def _run_ppo_training(
                     validation_pol += float(policy_loss_v.item()) * bsz
                     validation_value += float(value_loss_v.item()) * bsz
                     validation_pol_main += float(policy_loss_v.item()) * bsz
+                    validation_wall += float(wall_loss_v.item()) * bsz
+                    validation_deal_in += float(deal_in_loss_v.item()) * bsz
                     
                     # Check if this is a BC batch (ratio > bc_fallback_ratio) - if not, include in value loss tracking
                     # joint_old_log_probs are from dataset; compute current joint log-prob from probabilities
@@ -916,7 +909,7 @@ def _run_ppo_training(
                         disc_idx_cpu = disc_idx.long().to('cpu')
                         gti_cpu = game_tile_indicators_idx.long().to('cpu')
                         gsv_cpu = game_state_vec.float().to('cpu')
-                        a_prev, t_prev, _ = prev_epoch_model_cpu(
+                        a_prev, t_prev, _, _, _ = prev_epoch_model_cpu(
                             player_hand_idx_cpu, player_called_idx_cpu, opp_called_idx_cpu, disc_idx_cpu, gti_cpu, gsv_cpu,
                         )
                         a_prev_safe = a_prev.clamp_min(1e-8)
@@ -933,6 +926,8 @@ def _run_ppo_training(
             validation_avg = validation_total / validation_denominator
             validation_avg_pol = validation_pol / validation_denominator
             validation_avg_value = validation_value / validation_denominator
+            validation_avg_wall = validation_wall / validation_denominator
+            validation_avg_deal_in = validation_deal_in / validation_denominator
             # Calculate value loss average for non-BC batches only
             validation_avg_value_non_bc = validation_value_non_bc / max(1, validation_count_non_bc) if validation_count_non_bc > 0 else None
             # In low memory mode, KL is computed on-the-fly if prev model exists, else N/A for first epoch
@@ -944,7 +939,7 @@ def _run_ppo_training(
                 value_loss_display += f" (non-BC: {validation_avg_value_non_bc:.4f})"
             
             print(
-                f"\nEpoch {epoch + 1}/{epochs} [validation] - total: {validation_avg:.4f} | policy: {validation_avg_pol:.4f} | value: {value_loss_display}"
+                f"\nEpoch {epoch + 1}/{epochs} [validation] - total: {validation_avg:.4f} | policy: {validation_avg_pol:.4f} | value: {value_loss_display} | wall: {validation_avg_wall:.4f} | deal_in: {validation_avg_deal_in:.4f}"
                 + (
                     f" | joint_kl(prev||curr): {validation_avg_joint_kl_prev_curr:.4f}" if validation_avg_joint_kl_prev_curr is not None else " | joint_kl(prev||curr): N/A")
             )
@@ -979,7 +974,6 @@ def train_ppo(
     epochs: int = 3,
     batch_size: int = 256,
     lr: float = 3e-4,
-    value_lr: float | None = None,
     epsilon: float = 0.2,
     value_coeff: float = 0.5,
     entropy_coeff: float = 0.01,
@@ -1107,11 +1101,8 @@ def train_ppo(
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Optional value pretraining: optimize value-only for a few epochs before warm-up/PPO
-    _run_value_pretraining(model, dl, dl_validation, dev, lr, value_lr, bc_fallback_ratio)
-
     # Optional warm-up: behavior cloning on flat action index + value regression until accuracy threshold
-    _run_warmup_bc(model, dl, dl_validation, dev, opt, warm_up_acc, warm_up_max_epochs, value_coeff, bc_fallback_ratio, lr, value_lr, warm_up_value)
+    _run_warmup_bc(model, dl, dl_validation, dev, opt, warm_up_acc, warm_up_max_epochs, value_coeff, bc_fallback_ratio, lr)
 
     # Main PPO training loop
     timestamp = _run_ppo_training(model, dl, dl_validation, dev, opt, epochs, epsilon, value_coeff, entropy_coeff, kl_threshold, patience, bc_fallback_ratio)
@@ -1150,19 +1141,16 @@ def main():
     ap.add_argument('--epochs', type=int, default=3)
     ap.add_argument('--batch_size', type=int, default=256)
     ap.add_argument('--lr', type=float, default=3e-4)
-    ap.add_argument('--value_lr', type=float, default=None, help='Learning rate for value pretraining (defaults to --lr if not specified)')
     ap.add_argument('--bc_fallback_ratio', type=float, default=5.0, help='Ratio threshold for falling back to BC mode during PPO training')
     ap.add_argument('--epsilon', type=float, default=0.2)
     ap.add_argument('--value_coeff', type=float, default=0.5)
     ap.add_argument('--entropy_coeff', type=float, default=0.01)
-    ap.add_argument('--value_epochs', type=int, default=0, help='Run N epochs of value-only pretraining before warm-up/PPO')
     ap.add_argument('--patience', type=int, default=0, help='Early stopping patience (number of consecutive epochs validation KL(prev||curr) must be <= --kl_threshold to stop; 0 disables)')
     ap.add_argument('--min_delta', type=float, default=1e-4, help='(Legacy/unused) Reserved for potential val-loss patience; currently ignored when using KL-based early stopping')
     ap.add_argument('--kl_threshold', type=float, default=None, help='Early stop when KL(prev||curr) on validation <= this threshold (epoch >= 1)')
     ap.add_argument('--init', type=str, default=None, help='Path to initial AC model weights/module to load')
     ap.add_argument('--warm_up_acc', type=float, default=0.0, help='Accuracy threshold to reach with behavior cloning before switching to PPO (0 disables)')
     ap.add_argument('--warm_up_max_epochs', type=int, default=50, help='Maximum warm-up epochs before switching even if threshold not reached')
-    ap.add_argument('--warm_up_value', action='store_true', help='Enable value network training during warm-up BC phase')
     ap.add_argument('--hidden_size', type=int, default=128, help='Hidden size for ACNetwork')
     ap.add_argument('--embedding_dim', type=int, default=16, help='Embedding dimension for ACNetwork')
     # DataLoader tuning
@@ -1170,14 +1158,11 @@ def main():
     ap.add_argument('--prefetch_factor', type=int, default=None, help='DataLoader prefetch_factor when workers>0 (overrides platform defaults)')
     args = ap.parse_args()
 
-    # Pass value_epochs via a temporary attribute to avoid altering the function signature in many places
-    setattr(train_ppo, '_value_epochs_override', int(args.value_epochs))
     train_ppo(
         dataset_path=args.data,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        value_lr=args.value_lr,
         epsilon=args.epsilon,
         value_coeff=args.value_coeff,
         entropy_coeff=args.entropy_coeff,
@@ -1186,7 +1171,6 @@ def main():
         init_model=args.init,
         warm_up_acc=args.warm_up_acc,
         warm_up_max_epochs=args.warm_up_max_epochs,
-        warm_up_value=args.warm_up_value,
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
         kl_threshold=args.kl_threshold,

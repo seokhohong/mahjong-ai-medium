@@ -9,7 +9,7 @@ class LegalityCheckPlayer(Player):
     def __init__(self) -> None:
         super().__init__()
 
-    def play(self, gs):  # type: ignore[override]
+    def act(self, gs):  # type: ignore[override]
         # Verify all legal moves align with masks; then pick a move.
         moves = gs.legal_moves()
         act_mask = gs.legal_action_mask()
@@ -21,9 +21,9 @@ class LegalityCheckPlayer(Player):
             assert act_mask[action_idx] == 1
             assert tile_mask[tile_idx] == 1
         # Delegate move selection to base Player
-        return super().play(gs)
+        return super().act(gs)
 
-    def choose_reaction(self, gs, options):  # type: ignore[override]
+    def react(self, gs, options):  # type: ignore[override]
         act_mask = gs.legal_action_mask()
         # Validate each option matches action mask bits
         for r in options:
@@ -32,7 +32,7 @@ class LegalityCheckPlayer(Player):
             assert act_mask[action_idx] == 1
             assert tile_mask[tile_idx] == 1
         # Delegate reaction selection to base Player
-        return super().choose_reaction(gs, options)
+        return super().react(gs, options)
 
 def run():
     # Seed for deterministic shuffling

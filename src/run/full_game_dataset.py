@@ -105,7 +105,7 @@ class _LoggingProxyPlayer:
         self._sink = sink
 
     def play(self, game_state):  # type: ignore[override]
-        mv = self.inner.play(game_state)
+        mv = self.inner.act(game_state)
         a_idx, t_idx = encode_two_head_action(mv)
         value = 0.0
         jlp = 0.0
@@ -127,7 +127,7 @@ class _LoggingProxyPlayer:
         return mv
 
     def choose_reaction(self, game_state, options):  # type: ignore[override]
-        mv = self.inner.choose_reaction(game_state, options)
+        mv = self.inner.react(game_state, options)
         a_idx, t_idx = encode_two_head_action(mv)
         value = 0.0
         jlp = 0.0

@@ -378,16 +378,13 @@ def hand_is_tenpai_with_calls(concealed_tiles: List[Tile], called_sets: List[Cal
     return hand_is_tenpai(concealed_tiles, called_sets)
 
 def waits_for_tiles(tiles):
-    """Find all tiles that complete the hand (optimized)"""
-    # Types imported at module scope; no local imports needed
-    
+    """Find all tiles that complete the hand (optimized, closed 13 only)."""
     waits: List[Tile] = []
     if len(tiles) != 13:
         return waits
-    
     base_counts = _tiles_to_counts_array(tiles)
     
-    # Check for seven pairs wait
+    # Seven pairs wait detection: 6 pairs + 1 single
     pairs = 0
     single_idx = -1
     for i in range(34):
@@ -397,35 +394,129 @@ def waits_for_tiles(tiles):
             if single_idx == -1:
                 single_idx = i
             else:
-                single_idx = -2  # Multiple singles
-    
+                single_idx = -2  # multiple singles
     seven_pairs_wait = None
     if pairs == 6 and single_idx >= 0:
-        # Seven pairs tenpai - waiting on the single
         seven_pairs_wait = single_idx
     
-    # Test each possible tile
+    # Test each possible tile kind
     test_counts = list(base_counts)
     for i in range(34):
-        if test_counts[i] >= 4:  # Can't add fifth
+        if test_counts[i] >= 4:
             continue
-        
         test_counts[i] += 1
         is_complete = _can_form_standard_hand_counts(test_counts)
         test_counts[i] -= 1
-        
         if is_complete or i == seven_pairs_wait:
-            # Convert index back to Tile
-            if i >= 27:  # Honor
-                honor_val = i - 27 + 1
-                waits.append(Tile(Suit.HONORS, Honor(honor_val)))
-            else:  # Number tile
-                suit_idx = i // 9
-                tile_val = (i % 9) + 1
-                suit = [Suit.MANZU, Suit.PINZU, Suit.SOUZU][suit_idx]
-                waits.append(Tile(suit, TileType(tile_val)))
-    
+            waits.append(_index_to_tile(i))
     return waits
+
+
+def waits_optimized(hand: List[Tile], called_sets: List[CalledSet]) -> List[Tile]:
+    """Compute waits for a hand efficiently.
+
+    - Closed hand:
+      - If 13 tiles: delegate to waits_for_tiles (already optimized).
+      - If 14 tiles: union waits across unique discards to 13 (<= unique kinds).
+    - Open hand (has called sets):
+      - Generate a narrow candidate set of tile kinds using counts-based heuristics
+        similar to hand_is_tenpai_for_tiles, then verify completion with calls.
+      - Enforce <= 4 copies across concealed + called.
+    Returns a deduplicated list of Tile kinds sorted by suit/value.
+    """
+    # Fast path: closed 13
+    if not called_sets:
+        n = len(hand)
+        if n == 13:
+            return waits_for_tiles(hand)
+        if n == 14:
+            # Union across unique discards only
+            seen_idx: Dict[Tuple[str, int], int] = {}
+            for i, t in enumerate(hand):
+                key = (t.suit.value, int(t.tile_type.value))
+                if key not in seen_idx:
+                    seen_idx[key] = i
+            waits: List[Tile] = []
+            for _, idx in seen_idx.items():
+                base13 = hand[:]
+                base13.pop(idx)
+                waits.extend(waits_for_tiles(base13))
+            # Dedup and sort
+            out: List[Tile] = []
+            seen = set()
+            for t in waits:
+                key = (t.suit.value, int(t.tile_type.value))
+                if key not in seen:
+                    seen.add(key)
+                    out.append(Tile(t.suit, t.tile_type))
+            out.sort(key=_tile_sort_key)
+            return out
+        # Other sizes: no waits
+        return []
+
+    # Open hand path
+    counts = _tiles_to_counts_array(hand)
+
+    # Helper: total count including called sets
+    def total_count_with_calls(idx: int) -> int:
+        t = _index_to_tile(idx)
+        s_val = t.suit
+        v_val = int(t.tile_type.value)
+        total = sum(1 for x in hand if x.suit == s_val and int(x.tile_type.value) == v_val)
+        for cs in called_sets:
+            for x in cs.tiles:
+                if x.suit == s_val and int(x.tile_type.value) == v_val:
+                    total += 1
+        return total
+
+    # Generate candidate indices based on neighborhood patterns (avoid 34 brute force)
+    candidates: Set[int] = set()
+    # Pair/triplet completions
+    for i in range(34):
+        if counts[i] in (1, 2):
+            candidates.add(i)
+    # Sequence-related candidates for number tiles
+    for i in range(27):
+        if counts[i] == 0:
+            continue
+        suit_start = i - (i % 9)
+        suit_end = suit_start + 9
+        tile_pos = i - suit_start
+        # Neighbors imply endpoints or middles
+        if tile_pos >= 1 and counts[i-1] > 0:
+            if tile_pos >= 2:
+                candidates.add(i-2)
+            if i + 1 < suit_end:
+                candidates.add(i+1)
+        if tile_pos <= 7 and i + 1 < suit_end and counts[i+1] > 0:
+            if tile_pos >= 1:
+                candidates.add(i-1)
+            if i + 2 < suit_end:
+                candidates.add(i+2)
+        if tile_pos <= 6 and i + 2 < suit_end and counts[i+2] > 0:
+            candidates.add(i+1)
+        if tile_pos >= 2 and counts[i-2] > 0:
+            candidates.add(i-1)
+
+    # Verify candidates against standard-with-calls completion and copy limits
+    waits: List[Tile] = []
+    for idx in candidates:
+        if total_count_with_calls(idx) >= 4:
+            continue
+        t = _index_to_tile(idx)
+        if can_complete_standard_with_calls(hand + [t], called_sets):
+            waits.append(t)
+
+    # Dedup and sort
+    out: List[Tile] = []
+    seen = set()
+    for t in waits:
+        key = (t.suit.value, int(t.tile_type.value))
+        if key not in seen:
+            seen.add(key)
+            out.append(Tile(t.suit, t.tile_type))
+    out.sort(key=_tile_sort_key)
+    return out
 
 # Public function to clear caches if needed
 def clear_hand_caches():

@@ -10,10 +10,10 @@ class ForceDiscardPlayer(Player):
         super().__init__()
         self.target = target
 
-    def play(self, gs):  # type: ignore[override]
+    def act(self, gs):  # type: ignore[override]
         if self.target in gs.player_hand:
             return Discard(self.target)
-        return super().play(gs)
+        return super().act(gs)
 
 
 class ForceActionPlayer(Player):
@@ -21,16 +21,16 @@ class ForceActionPlayer(Player):
         super().__init__()
         self.action = action
 
-    def play(self, gs):  # type: ignore[override]
+    def act(self, gs):  # type: ignore[override]
         if gs.is_legal(self.action):
             return self.action
-        return super().play(gs)
+        return super().act(gs)
 
 class NoReactionPlayer(Player):
     def __init__(self):
         super().__init__()
 
-    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:  # type: ignore[override]
+    def react(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:  # type: ignore[override]
         return PassCall()
 
 

@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Tuple
 
 import numpy as np
 
+from core.tile import tile_flat_index
 
 # (Removed memory monitoring utilities)
 
@@ -110,6 +111,8 @@ def build_ac_dataset(
         ('dora_indicator_tiles', np.int8),
         ('legal_action_mask', np.int8),
         ('called_discards', np.int8),
+        # New per-sample feature: remaining drawable wall counts per flat tile index
+        ('wall_count', np.int8)
     ]
     scalar_fields = [
         ('round_wind', np.int8, -1),
@@ -125,6 +128,8 @@ def build_ac_dataset(
     all_returns: List[float] = []
     all_advantages: List[float] = []
     joint_log_probs: List[float] = []
+    # deal_in_tiles: per-sample variable-length list of flat tile indices
+    all_deal_in_tiles: List[List[int]] = []
     # Scalars per-sample
     # scalar lists are in master_scalars
     # Two-head policy stores separate log-probs for each head
@@ -161,7 +166,7 @@ def build_ac_dataset(
             # Use stored values from the experience buffer
             values: List[float] = [float(v) for v in p.experience.values]
             nstep, adv = compute_n_step_returns(rewards, n_step, gamma, values)
-            
+
             # Collect per-player episode in batches via dicts
             player_arrays: Dict[str, List[np.ndarray]] = {k: [] for k, _ in array_fields}
             player_scalars: Dict[str, List[int]] = {k: [] for k, _, _ in scalar_fields}
@@ -170,19 +175,32 @@ def build_ac_dataset(
             player_returns = []
             player_advantages = []
             player_joint_log_probs = []
+            player_deal_in_tiles: List[List[int]] = []
             player_game_ids = []
             player_step_ids = []
             player_actor_ids = []
-            
+
             for t in range(T):
                 gs = p.experience.states[t]
                 a_idx, t_idx = p.experience.actions[t]
                 # Arrays
                 for fname, dt in array_fields:
-                    player_arrays[fname].append(np.asarray(gs[fname], dtype=dt))
+                    arr_any = np.asarray(gs[fname])
+                    # Assert tile index ranges for specific fields (allow -1 pad)
+                    if fname in ('hand_idx', 'disc_idx', 'called_idx', 'dora_indicator_tiles'):
+                        flat = arr_any.astype(np.int32).ravel()
+                        if flat.size:
+                            mx = int(flat.max())
+                            mn = int(flat.min())
+                            # allow -1 for padding; valid tiles are 0..37 inclusive
+                            assert mn >= -1 and mx <= 37, f"{fname} out of range: min={mn} max={mx}"
+                    player_arrays[fname].append(arr_any.astype(dt))
                 # Scalars
                 for fname, _dt, default in scalar_fields:
-                    player_scalars[fname].append(int(gs.get(fname, default)))
+                    val = int(gs.get(fname, default))
+                    if fname in ('reactable_tile', 'newly_drawn_tile'):
+                        assert -1 <= val <= 37, f"{fname} out of range: {val}"
+                    player_scalars[fname].append(val)
                 player_action_idx.append(int(a_idx))
                 player_tile_idx.append(int(t_idx))
                 player_returns.append(float(nstep[t]))
@@ -191,6 +209,15 @@ def build_ac_dataset(
                 player_game_ids.append(int(gi))
                 player_step_ids.append(int(t))
                 player_actor_ids.append(int(pid))
+                # Collect deal_in_tiles from the experience buffer (list[Tile]) and convert to flat indices
+                tile_list = p.experience.deal_in_tiles[t] if t < len(p.experience.deal_in_tiles) else []
+                din = [int(tile_flat_index(tt)) for tt in tile_list]
+                # Assert variable list values are valid tile indices (no -1 in deal-in set)
+                if din:
+                    mx = max(din)
+                    mn = min(din)
+                    assert mn >= 0 and mx <= 37, f"deal_in_tiles out of range: min={mn} max={mx}"
+                player_deal_in_tiles.append(din)
 
             # Extend master arrays and scalars
             for k in master_arrays.keys():
@@ -202,10 +229,11 @@ def build_ac_dataset(
             all_returns.extend(player_returns)
             all_advantages.extend(player_advantages)
             joint_log_probs.extend(player_joint_log_probs)
+            all_deal_in_tiles.extend(player_deal_in_tiles)
             all_game_ids.extend(player_game_ids)
             all_step_ids.extend(player_step_ids)
             all_actor_ids.extend(player_actor_ids)
-            
+
             # Clear experience buffers for next game
             p.experience.clear()
 
@@ -219,16 +247,18 @@ def build_ac_dataset(
     built['returns'] = np.asarray(all_returns, dtype=np.float32)
     built['advantages'] = np.asarray(all_advantages, dtype=np.float32)
     built['joint_log_probs'] = np.asarray(joint_log_probs, dtype=np.float32)
-    built['game_ids'] = np.asarray(all_game_ids, dtype=np.int8)
-    built['step_ids'] = np.asarray(all_step_ids, dtype=np.int8)
+    built['game_ids'] = np.asarray(all_game_ids, dtype=np.int16)
+    built['step_ids'] = np.asarray(all_step_ids, dtype=np.int16)
     built['actor_ids'] = np.asarray(all_actor_ids, dtype=np.int8)
     built['game_outcomes_obj'] = np.asarray(game_outcomes_obj, dtype=object)
+    # Save deal_in_tiles as an object array (variable-length per sample)
+    built['deal_in_tiles'] = np.asarray(all_deal_in_tiles, dtype=object)
     return built
 
 def save_dataset(built, out_path):
     # Save all keys as-is
     np.savez(out_path, **built)
- 
+
     print(f"Saved AC dataset to {out_path}")
 
 
@@ -335,7 +365,8 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     per_sample_fields = [
         'hand_idx','disc_idx','called_idx','seat_winds','riichi_declarations',
         'dora_indicator_tiles','legal_action_mask','called_discards','round_wind',
-        'remaining_tiles','owner_of_reactable_tile','reactable_tile','newly_drawn_tile'
+        'remaining_tiles','owner_of_reactable_tile','reactable_tile','newly_drawn_tile', 'wall_count',
+        'deal_in_tiles'
     ]
     collected_lists: Dict[str, List[Any]] = {k: [] for k in per_sample_fields}
     # Per-game outcomes are collected separately
@@ -347,8 +378,8 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     returns = np.empty(total_samples, dtype=np.float32)
     advantages = np.empty(total_samples, dtype=np.float32)
     joint_log_probs = np.empty(total_samples, dtype=np.float32)
-    game_ids = np.empty(total_samples, dtype=np.int8)
-    step_ids = np.empty(total_samples, dtype=np.int8)
+    game_ids = np.empty(total_samples, dtype=np.int16)
+    step_ids = np.empty(total_samples, dtype=np.int16)
     actor_ids = np.empty(total_samples, dtype=np.int8)
 
     # Second pass: load and combine data
@@ -410,6 +441,9 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     }
     # Cast per-sample arrays to appropriate dtypes
     dtypes_map = {
+        'wall_count': np.int8,
+        # deal_in_tiles is variable-length; keep as object in the combined output
+        'deal_in_tiles': object,
         'hand_idx': np.int8,
         'disc_idx': np.int8,
         'called_idx': np.int8,
@@ -425,7 +459,10 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         'newly_drawn_tile': np.int8,
     }
     for k in per_sample_fields:
-        combined[k] = np.array(collected_lists[k], dtype=dtypes_map[k])
+        if k == 'deal_in_tiles':
+            combined[k] = np.array(collected_lists[k], dtype=object)
+        else:
+            combined[k] = np.array(collected_lists[k], dtype=dtypes_map[k])
     # Add per-game outcomes (concatenate across files)
     combined['game_outcomes_obj'] = np.array(outcomes_list, dtype=object)
 

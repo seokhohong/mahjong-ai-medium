@@ -289,10 +289,10 @@ class ACPlayer(Player):
     # move = player.play(game_state)
 
     # --- Overrides ---
-    def play(self, game_state: GamePerspective):
+    def act(self, game_state: GamePerspective):
         return self.compute_play(game_state)[0]
 
-    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
+    def react(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
         return self.compute_play(game_state)[0]
 
 

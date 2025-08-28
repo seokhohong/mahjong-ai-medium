@@ -62,12 +62,12 @@ class TestLimitScoring(unittest.TestCase):
                 super().__init__()
                 self.action = Tsumo()
 
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 if gs.is_legal(self.action):
                     return self.action
-                return super().play(gs)
+                return super().act(gs)
 
-            def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
+            def react(self, game_state: GamePerspective, options: List[Reaction]) -> Reaction:
                 return PassCall()
 
         # Non-dealer tsumo with 6 han -> split per Haneman constants

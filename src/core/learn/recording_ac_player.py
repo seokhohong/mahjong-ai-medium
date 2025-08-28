@@ -43,6 +43,8 @@ class ExperienceBuffer:
         self.values: List[float] = []
         # Stored joint log-prob for chosen move
         self.joint_log_probs: List[float] = []
+        # Per-step list of deal-in tiles (as Tile objects) captured from encoded features
+        self.deal_in_tiles: List[List[Tile]] = []
 
     def add(self, state_features: Dict[str, Any], action_indices: Tuple[int, int], reward: float, value: float,
             joint_logp: float,
@@ -67,6 +69,13 @@ class ExperienceBuffer:
         self.rewards.append(float(reward))
         self.values.append(float(value))
         self.joint_log_probs.append(float(joint_logp))
+        # Capture deal_in_tiles from encoded features when available
+        dit = state_features.get('deal_in_tiles', [])
+        if isinstance(dit, list):
+            # Ensure we store a shallow-copied list of Tile objects (or empty list)
+            self.deal_in_tiles.append(list(dit))
+        else:
+            self.deal_in_tiles.append([])
 
     def clear(self) -> None:
         self.states.clear()
@@ -74,6 +83,7 @@ class ExperienceBuffer:
         self.rewards.clear()
         self.values.clear()
         self.joint_log_probs.clear()
+        self.deal_in_tiles.clear()
 
     def __len__(self) -> int:
         return len(self.states)
@@ -123,7 +133,7 @@ class RecordingACPlayer(ACPlayer):
         self.experience.rewards[-1] = float(terminal_value)
 
     # Record decisions along with value estimates from the network
-    def play(self, game_state: GamePerspective):  # type: ignore[override]
+    def act(self, game_state: GamePerspective):  # type: ignore[override]
         move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
         # Aggregate intermediate rewards (transition to tenpai, yakuhai acquisition, etc.)
         reward = _compute_intermediate_reward(move, game_state)
@@ -138,7 +148,7 @@ class RecordingACPlayer(ACPlayer):
         )
         return move
 
-    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]):  # type: ignore[override]
+    def react(self, game_state: GamePerspective, options: List[Reaction]):  # type: ignore[override]
         move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
         reward = _compute_intermediate_reward(move, game_state)
         self.experience.add(
@@ -171,7 +181,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
         self.experience.rewards[-1] = float(terminal_value)
         # Keep heuristic value baseline at 0.0 for all steps (including terminal)
 
-    def play(self, game_state: GamePerspective):  # type: ignore[override]
+    def act(self, game_state: GamePerspective):  # type: ignore[override]
         # With probability = random_exploration, pick a random legal move (prefer discards); otherwise use heuristic strategy
         legal = game_state.legal_moves()
         if self.random_exploration > 0.0 and legal and random.random() < self.random_exploration:
@@ -179,7 +189,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
             move = random.choice(discards or legal)
         else:
             # Delegate to heuristic strategy from MediumHeuristicsPlayer
-            move = super().play(game_state)
+            move = super().act(game_state)
         assert game_state.is_legal(move)
         # Record encoded state with zero value/logp for heuristic policy (two-head indices)
         from .policy_utils import encode_two_head_action
@@ -195,7 +205,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
         )
         return move
 
-    def choose_reaction(self, game_state: GamePerspective, options: List[Reaction]):  # type: ignore[override]
+    def react(self, game_state: GamePerspective, options: List[Reaction]):  # type: ignore[override]
         # With probability = random_exploration, pick a random legal reaction from options
         if self.random_exploration > 0.0:
             legal_reacts: List[Reaction] = []
@@ -216,7 +226,7 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
                 )
                 return move
         # Otherwise, delegate to heuristic strategy
-        move = super().choose_reaction(game_state, options)
+        move = super().react(game_state, options)
         from .policy_utils import encode_two_head_action
         ai, ti = encode_two_head_action(move)
         self.experience.add(
@@ -267,7 +277,7 @@ def _transitions_into_tenpai(move: Any, game_state: GamePerspective) -> bool:
         removed_prior = True
     else:
         for t in hand:
-            if (not removed_prior) and t.suit == last.suit and t.tile_type == last.tile_type:
+            if (not removed_prior) and t.exactly_equal(last):
                 removed_prior = True
                 continue
             prior_13.append(t)
@@ -282,7 +292,7 @@ def _transitions_into_tenpai(move: Any, game_state: GamePerspective) -> bool:
     removed_post = False
     post_13: List[Tile] = []
     for t in hand:
-        if (not removed_post) and t.suit == target.suit and t.tile_type == target.tile_type:
+        if (not removed_post) and t.exactly_equal(target):
             removed_post = True
             continue
         post_13.append(t)
@@ -313,7 +323,7 @@ def _yakuhai_acquired_by_draw(game_state: GamePerspective) -> bool:
     if not _is_yakuhai_tile(last, game_state):
         return False
     hand = list(getattr(game_state, 'player_hand', []))
-    cnt = sum(1 for t in hand if t.suit == last.suit and t.tile_type == last.tile_type)
+    cnt = sum(1 for t in hand if t.functionally_equal(last))
     # If we drew one and now have 3+, we must have had >=2 before draw; treat as acquisition
     return cnt >= 3
 
@@ -327,7 +337,7 @@ def _yakuhai_acquired_by_pon(move: Any, game_state: GamePerspective) -> bool:
         return False
     a = tiles[0]
     # Ensure identical tiles
-    if not all(t.suit == a.suit and t.tile_type == a.tile_type for t in tiles):
+    if not all(t.functionally_equal(a) for t in tiles):
         return False
     return _is_yakuhai_tile(a, game_state)
 
@@ -341,3 +351,27 @@ def _compute_intermediate_reward(move: Any, game_state: GamePerspective) -> floa
     if _yakuhai_acquired_by_draw(game_state) or _yakuhai_acquired_by_pon(move, game_state):
         reward += float(YAKUHAI_REWARD)
     return reward
+
+
+def _action_deals_in(move: Any, game_state: GamePerspective) -> bool:
+    """Return True if the chosen action (Discard or Riichi) would deal in.
+
+    Uses aka-insensitive comparison against `game_state.deal_in_tiles` when available.
+    """
+    try:
+        from ..action import Discard, Riichi  # local import to avoid cycles in type checkers
+    except Exception:
+        return False
+    if not isinstance(move, (Discard, Riichi)):
+        return False
+    dealins = getattr(game_state, 'deal_in_tiles', None)
+    if not dealins:
+        return False
+    target = getattr(move, 'tile', None)
+    if target is None:
+        return False
+    # Aka-insensitive containment check
+    for t in dealins:
+        if t.functionally_equal(target):
+            return True
+    return False

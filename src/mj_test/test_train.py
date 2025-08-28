@@ -107,7 +107,6 @@ class TestEndToEndTraining(unittest.TestCase):
                 epochs=1,
                 batch_size=32,
                 lr=3e-4,
-                value_lr=None,
                 epsilon=0.2,
                 value_coeff=0.5,
                 entropy_coeff=0.01,

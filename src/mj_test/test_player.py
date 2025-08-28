@@ -29,8 +29,8 @@ class _ForcedMovePlayer(RecordingACPlayer):
 
 
 class TestRecordingPlayerTenpaiReward(unittest.TestCase):
-    def _base_gp(self, hand, called_sets_by_player, newly_drawn_tile=None):
-        return GamePerspective(player_hand=hand, remaining_tiles=30, reactable_tile=, owner_of_reactable_tile=None,
+    def _base_gp(self, hand, called_sets_by_player, newly_drawn_tile=None, reactable_tile=None):
+        return GamePerspective(player_hand=hand, remaining_tiles=30, reactable_tile=reactable_tile, owner_of_reactable_tile=None,
                                called_sets=called_sets_by_player, player_discards={0: [], 1: [], 2: [], 3: []},
                                called_discards={0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=newly_drawn_tile,
                                seat_winds={0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH},
@@ -54,7 +54,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
 
         move = Discard(tile=extra)
         player = _ForcedMovePlayer(move)
-        player.play(gp)
+        player.act(gp)
         # Last recorded reward should be TENPAI_REWARD
         self.assertAlmostEqual(player.experience.rewards[-1], TENPAI_REWARD)
 
@@ -69,11 +69,11 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         ]
         extra = Tile(Suit.PINZU, TileType.TWO)
         hand14 = list(noten13) + [extra]
-        gp = self._base_gp(hand14, {0: [], 1: [], 2: [], 3: []})
+        gp = self._base_gp(hand14, {0: [], 1: [], 2: [], 3: []}, None)
 
         move = Discard(tile=extra)
         player = _ForcedMovePlayer(move)
-        player.play(gp)
+        player.act(gp)
         self.assertAlmostEqual(player.experience.rewards[-1], 0.0)
 
     def test_reward_given_when_discard_puts_into_tenpai_open(self):
@@ -99,7 +99,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
 
         move = Discard(tile=extra)
         player = _ForcedMovePlayer(move)
-        player.play(gp)
+        player.act(gp)
         self.assertAlmostEqual(player.experience.rewards[-1], TENPAI_REWARD)
 
     def test_reward_given_after_call_then_discard_into_tenpai_open(self):
@@ -122,7 +122,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
 
         move = Discard(tile=extra)
         player = _ForcedMovePlayer(move)
-        player.play(gp)
+        player.act(gp)
         self.assertAlmostEqual(player.experience.rewards[-1], TENPAI_REWARD)
 
 
@@ -142,7 +142,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
 
         move = Discard(tile=extra)
         player = _ForcedMovePlayer(move)
-        player.play(gp)
+        player.act(gp)
         self.assertAlmostEqual(player.experience.rewards[-1], YAKUHAI_REWARD)
 
     def test_yakuhai_reward_on_pon_open(self):
@@ -153,7 +153,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         gp = self._base_gp(hand, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None)
         move = Pon(tiles=[east, east, east])
         player = _ForcedMovePlayer(move)
-        player.choose_reaction(gp, options=[move])
+        player.react(gp, options=[move])
         self.assertAlmostEqual(player.experience.rewards[-1], YAKUHAI_REWARD)
 
     def test_no_yakuhai_reward_on_draw_non_yakuhai_honor(self):
@@ -172,7 +172,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
 
         move = Discard(tile=extra)
         player = _ForcedMovePlayer(move)
-        player.play(gp)
+        player.act(gp)
         # Could be tenpai reward in some crafted hands; assert reward is not YAKUHAI_REWARD by expecting 0 or TENPAI_REWARD
         self.assertIn(player.experience.rewards[-1], (0.0, TENPAI_REWARD))
 
@@ -184,7 +184,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         hand = [Tile(Suit.MANZU, TileType.ONE)] * 14
         gp = self._base_gp(hand, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None)
         player = _ForcedMovePlayer(move)
-        player.choose_reaction(gp, options=[move])
+        player.react(gp, options=[move])
         self.assertAlmostEqual(player.experience.rewards[-1], 0.0)
 
     def test_no_yakuhai_reward_on_pon_non_yakuhai(self):
@@ -195,7 +195,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         hand = [Tile(Suit.MANZU, TileType.ONE)] * 14
         gp = self._base_gp(hand, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None)
         player = _ForcedMovePlayer(move)
-        player.choose_reaction(gp, options=[move])
+        player.react(gp, options=[move])
         self.assertAlmostEqual(player.experience.rewards[-1], 0.0)
 
     def test_finalize_rescales_positive_intermediates(self):
@@ -215,7 +215,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         gp_y = self._base_gp(hand14_y, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=Tile(Suit.HONORS, Honor.WHITE))
         pmove1 = Discard(tile=extra)
         player = _ForcedMovePlayer(pmove1)
-        player.play(gp_y)
+        player.act(gp_y)
 
         # Step 2: tenpai transition (positive)
         base_s = [
@@ -231,14 +231,14 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         gp_t = self._base_gp(hand14_t, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=newly_drawn2)
         pmove2 = Discard(tile=extra2)
         player._forced_move = pmove2
-        player.play(gp_t)
+        player.act(gp_t)
 
         # Step 3: neutral (no yakuhai, no tenpai change)
         neutral_hand = [Tile(Suit.MANZU, TileType.ONE)] * 14
         gp_n = self._base_gp(neutral_hand, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=Tile(Suit.MANZU, TileType.TWO))
         pmove3 = Discard(tile=Tile(Suit.MANZU, TileType.THREE))
         player._forced_move = pmove3
-        player.play(gp_n)
+        player.act(gp_n)
 
         # Now finalize with smaller terminal cap than sum of positives (0.05 + 0.1 = 0.15)
         terminal = 0.08
@@ -257,10 +257,10 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         gp = self._base_gp(hand14, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=white)
         move = Discard(tile=Tile(Suit.MANZU, TileType.TWO))
         player = _ForcedMovePlayer(move)
-        player.play(gp)
+        player.act(gp)
         # Add a neutral second step so we have a terminal slot
         player._forced_move = Discard(tile=Tile(Suit.MANZU, TileType.THREE))
-        player.play(self._base_gp([Tile(Suit.MANZU, TileType.ONE)]*14, {0: [], 1: [], 2: [], 3: []}))
+        player.act(self._base_gp([Tile(Suit.MANZU, TileType.ONE)] * 14, {0: [], 1: [], 2: [], 3: []}))
 
         player.finalize_episode(-1.0)
         # First reward should be clamped to 0, last reward is -1.0

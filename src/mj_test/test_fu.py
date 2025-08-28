@@ -8,7 +8,7 @@ from mj_test.test_utils import NoReactionPlayer
 
 
 class TsumoIfPossible(Player):
-    def play(self, gs):  # type: ignore[override]
+    def act(self, gs):  # type: ignore[override]
         if gs.can_tsumo():
             return Tsumo()
         return Discard(gs.player_hand[0])
@@ -46,7 +46,7 @@ class TestFuScoring(unittest.TestCase):
     def test_fu_pinfu_ron_30(self):
         # Closed pinfu ron: 20 base + 10 menzen ron = 30
         class DiscardThreePin(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 t = Tile(Suit.PINZU, TileType.THREE)
                 if t in gs.player_hand:
                     return Discard(t)
@@ -92,7 +92,7 @@ class TestFuScoring(unittest.TestCase):
     def test_fu_closed_kanchan_ron_rounds_40(self):
         # Closed hand with kanchan wait ron: 20 + 2 (kanchan) + 10 menzen ron = 32 -> 40
         class DiscardFiveMan(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 t = Tile(Suit.MANZU, TileType.FIVE)
                 if t in gs.player_hand:
                     return Discard(t)
@@ -115,7 +115,7 @@ class TestFuScoring(unittest.TestCase):
     def test_fu_open_hand_no_fu_sets_to_30(self):
         # Open pinfu-like hand should be set to 30 fu on ron
         class DiscardThreePin(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 t = Tile(Suit.PINZU, TileType.THREE)
                 if t in gs.player_hand:
                     return Discard(t)
@@ -146,7 +146,7 @@ class TestFuScoring(unittest.TestCase):
     def test_fu_closed_triplet_simple_adds_4fu(self):
         # Closed ron hand containing a closed triplet of a simple tile adds 4 fu -> 20 + 4 + 10 = 34 -> 40
         class DiscardThreeMan(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 t = Tile(Suit.MANZU, TileType.THREE)
                 if t in gs.player_hand:
                     return Discard(t)
@@ -170,7 +170,7 @@ class TestFuScoring(unittest.TestCase):
     def test_fu_closed_ankan_honor_tsumo_rounds_60(self):
         # Closed ankan of honors (e.g., NORTH): 32 fu, tsumo +2, base 20 -> 54 -> 60
         class AnkanThenTsumo(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 # Force Ankan if available, else Tsumo if available, else discard first
                 for m in gs.legal_moves():
                     if isinstance(m, KanAnkan):
@@ -202,7 +202,7 @@ class TestFuScoring(unittest.TestCase):
     def test_fu_pair_dragon_adds_2fu(self):
         # Closed ron, pair is a dragon -> +2 fu; assume ryanmen wait
         class DiscardThreeSou(Player):
-            def play(self, gs):  # type: ignore[override]
+            def act(self, gs):  # type: ignore[override]
                 t = Tile(Suit.SOUZU, TileType.THREE)
                 if t in gs.player_hand:
                     return Discard(t)

@@ -296,6 +296,50 @@ def safe_entropy_calculation(probs, min_prob=1e-8):
 
     return entropy
 
+
+# ---- Helpers: metrics accumulation/formatting ----
+class LossAccumulator:
+    def __init__(self):
+        self.total = 0.0
+        self.policy = 0.0
+        self.value = 0.0
+        self.wall = 0.0
+        self.deal_in = 0.0
+        self.count = 0
+
+    def update(self, *, total=None, policy=None, value=None, wall=None, deal_in=None, bsz: int = 0):
+        if total is not None:
+            self.total += float(total) * bsz
+        if policy is not None:
+            self.policy += float(policy) * bsz
+        if value is not None:
+            self.value += float(value) * bsz
+        if wall is not None:
+            self.wall += float(wall) * bsz
+        if deal_in is not None:
+            self.deal_in += float(deal_in) * bsz
+        self.count += int(bsz)
+
+    def averages(self) -> dict:
+        denom = max(1, self.count)
+        return {
+            'total': self.total / denom,
+            'policy': self.policy / denom,
+            'value': self.value / denom,
+            'wall': self.wall / denom,
+            'deal_in': self.deal_in / denom,
+        }
+
+    def postfix(self) -> dict:
+        avg = self.averages()
+        return {
+            'loss': f"{avg['total']:.4f}",
+            'pol': f"{avg['policy']:.4f}",
+            'value': f"{avg['value']:.4f}",
+            'wall': f"{avg['wall']:.4f}",
+            'deal_in': f"{avg['deal_in']:.4f}",
+        }
+
 def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_validation, dev: torch.device, bc_fallback_ratio: float, description: str = ""):
     """Evaluate model performance on the combined train+validation dataset with weighted averaging."""
     model.eval()
@@ -575,16 +619,13 @@ def _run_warmup_bc(
         print(f"Skipping warm-up: initial accuracy {initial_acc:.4f} >= {threshold:.4f}")
         return
     
-    print(f"Starting warm-up until accuracy >= {threshold:.2f} (behavior cloning + value regression)...")
+    print(f"Starting warm-up until accuracy >= {threshold:.2f} (behavior cloning + value/aux regression)...")
     epoch = 0
     reached = False
     while initial_acc < threshold and epoch < int(max(1, warm_up_max_epochs)) and not reached:
-        total_loss = 0.0
-        total_examples = 0
-        pol_loss_acc = 0.0
-        value_loss_acc = 0.0
-        wall_loss_acc = 0.0
-        deal_in_loss_acc = 0.0
+        # Ensure training mode for loss computation
+        model.train()
+        train_metrics = LossAccumulator()
         correct = 0
         progress = tqdm(dl, desc=f"WarmUp {epoch+1}", leave=False)
         for batch in progress:
@@ -617,12 +658,14 @@ def _run_warmup_bc(
             warmup_opt.step()
 
             bsz = int(player_hand_idx.size(0))
-            total_examples += bsz
-            total_loss += float(loss.item()) * bsz
-            pol_loss_acc += float(policy_loss.item()) * bsz
-            value_loss_acc += float(value_loss.item()) * bsz
-            wall_loss_acc += float(wall_loss.item()) * bsz
-            deal_in_loss_acc += float(deal_in_loss.item()) * bsz
+            train_metrics.update(
+                total=loss.item(),
+                policy=policy_loss.item(),
+                value=value_loss.item(),
+                wall=wall_loss.item(),
+                deal_in=deal_in_loss.item(),
+                bsz=bsz,
+            )
             # Compute training accuracy in eval mode for parity with validation accuracy
             with torch.no_grad():
                 was_training = model.training
@@ -637,30 +680,18 @@ def _run_warmup_bc(
                 if was_training:
                     model.train()
             # Show running averages to reduce noise
-            denom = max(1, total_examples)
-            progress.set_postfix(
-                loss=f"{(total_loss/denom):.4f}",
-                pol=f"{(pol_loss_acc/denom):.4f}",
-                value=f"{(value_loss_acc/denom):.4f}",
-                wall=f"{(wall_loss_acc/denom):.4f}",
-                deal_in=f"{(deal_in_loss_acc/denom):.4f}",
-            )
+            progress.set_postfix(**train_metrics.postfix())
 
         # Calculate train metrics (averaged)
-        train_denominator = max(1, total_examples)
+        train_avg = train_metrics.averages()
+        train_denominator = max(1, train_metrics.count)
         train_acc = (correct / train_denominator)
-        train_total_avg = (total_loss / train_denominator)
-        train_policy_avg = (pol_loss_acc / train_denominator)
-        train_value_avg = (value_loss_acc / train_denominator)
-        train_wall_avg = (wall_loss_acc / train_denominator)
-        train_deal_in_avg = (deal_in_loss_acc / train_denominator)
 
         # Calculate validation accuracy if available
         validation_acc = None
         if dl_validation is not None:
             model.eval()
-            validation_total = validation_pol = validation_value = 0.0
-            validation_wall = validation_deal_in = 0.0
+            val_metrics = LossAccumulator()
             validation_count = 0
             validation_correct = 0
             with torch.no_grad():
@@ -687,12 +718,15 @@ def _run_warmup_bc(
                         bc_weight=1.0, policy_weight=0.0,
                     )
                     bsz = int(player_hand_idx.size(0))
-                    validation_total += float(loss_v.item()) * bsz
-                    validation_pol += float(policy_loss_v.item()) * bsz
-                    validation_value += float(value_loss_v.item()) * bsz
+                    val_metrics.update(
+                        total=loss_v.item(),
+                        policy=policy_loss_v.item(),
+                        value=value_loss_v.item(),
+                        wall=wall_loss_v.item(),
+                        deal_in=deal_in_loss_v.item(),
+                        bsz=bsz,
+                    )
                     validation_count += bsz
-                    validation_wall += float(wall_loss_v.item()) * bsz
-                    validation_deal_in += float(deal_in_loss_v.item()) * bsz
                     a_pp, t_pp, _, _, _ = model(
                         player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
                     )
@@ -701,16 +735,17 @@ def _run_warmup_bc(
                     both = (pred_a == action_idx) & (pred_t == tile_idx)
                     validation_correct += int(both.sum().item())
             validation_denominator = max(1, validation_count)
-            validation_acc = (validation_correct / max(1, validation_count))
-            print(f"\nWarmUp {epoch+1} [validation] - total: {validation_total/validation_denominator:.4f} | policy: {validation_pol/validation_denominator:.4f} | value: {validation_value/validation_denominator:.4f} | wall: {validation_wall/validation_denominator:.4f} | deal_in: {validation_deal_in/validation_denominator:.4f} | acc: {validation_acc:.4f}")
+            validation_acc = (validation_correct / validation_denominator)
+            vavg = val_metrics.averages()
+            print(f"\nWarmUp {epoch+1} [validation] - total: {vavg['total']:.4f} | policy: {vavg['policy']:.4f} | value: {vavg['value']:.4f} | wall: {vavg['wall']:.4f} | deal_in: {vavg['deal_in']:.4f} | acc: {validation_acc:.4f}")
             model.train()
 
         # Display both train and validation metrics
         if validation_acc is not None:
-            print(f"WarmUp {epoch+1} [train] - total: {train_total_avg:.4f} | policy: {train_policy_avg:.4f} | value: {train_value_avg:.4f} | wall: {train_wall_avg:.4f} | deal_in: {train_deal_in_avg:.4f} | acc: {train_acc:.4f}")
+            print(f"WarmUp {epoch+1} [train] - total: {train_avg['total']:.4f} | policy: {train_avg['policy']:.4f} | value: {train_avg['value']:.4f} | wall: {train_avg['wall']:.4f} | deal_in: {train_avg['deal_in']:.4f} | acc: {train_acc:.4f}")
             epoch_acc = validation_acc  # Use validation accuracy for threshold checking
         else:
-            print(f"WarmUp {epoch+1} [train] - total: {train_total_avg:.4f} | policy: {train_policy_avg:.4f} | value: {train_value_avg:.4f} | acc: {train_acc:.4f}")
+            print(f"WarmUp {epoch+1} [train] - total: {train_avg['total']:.4f} | policy: {train_avg['policy']:.4f} | value: {train_avg['value']:.4f} | wall: {train_avg['wall']:.4f} | deal_in: {train_avg['deal_in']:.4f} | acc: {train_acc:.4f}")
             epoch_acc = train_acc
 
         if epoch_acc >= threshold:
@@ -767,6 +802,10 @@ def _run_ppo_training(
         # Epoch-level BC fallback counters
         epoch_bc_batches = 0
         epoch_total_batches = 0
+        # Make sure model in train mode at the start of each epoch
+        model.train()
+        # Metrics accumulator
+        train_metrics = LossAccumulator()
         for bi, batch in enumerate(progress):
             (
                 player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
@@ -797,11 +836,14 @@ def _run_ppo_training(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
 
-            total_loss += float(total.item()) * batch_size_curr
-            total_policy_loss += float(policy_loss.item()) * batch_size_curr
-            total_value_loss += float(value_loss.item()) * batch_size_curr
-            total_wall_loss = locals().get('total_wall_loss', 0.0) + float(wall_loss.item()) * batch_size_curr
-            total_deal_in_loss = locals().get('total_deal_in_loss', 0.0) + float(deal_in_loss.item()) * batch_size_curr
+            train_metrics.update(
+                total=total.item(),
+                policy=policy_loss.item(),
+                value=value_loss.item(),
+                wall=wall_loss.item(),
+                deal_in=deal_in_loss.item(),
+                bsz=batch_size_curr,
+            )
             total_policy_loss_main += float(policy_loss.item()) * batch_size_curr
             
             total_examples += batch_size_curr
@@ -819,14 +861,7 @@ def _run_ppo_training(
                 epoch_bc_batches += 1
                 overall_bc_batches += 1
             # Show running averages to reduce noise
-            denom = max(1, total_examples)
-            progress.set_postfix(
-                loss=f"{(total_loss/denom):.4f}",
-                pol=f"{(total_policy_loss/denom):.4f}",
-                value=f"{(total_value_loss/denom):.4f}",
-                wall=f"{(locals().get('total_wall_loss',0.0)/denom):.4f}",
-                deal_in=f"{(locals().get('total_deal_in_loss',0.0)/denom):.4f}",
-            )
+            progress.set_postfix(**train_metrics.postfix())
 
         # End-of-epoch debug summary (averages over training epoch)
         if dbg_count > 0:
@@ -847,8 +882,7 @@ def _run_ppo_training(
         validation_avg_joint_kl_prev_curr = None
         if dl_validation is not None:
             model.eval()
-            validation_total = validation_pol = validation_value = 0.0
-            validation_wall = validation_deal_in = 0.0
+            val_metrics = LossAccumulator()
             validation_pol_main = 0.0
             validation_count = 0
             # Track value loss separately for non-BC batches only
@@ -884,12 +918,15 @@ def _run_ppo_training(
                         player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
                     )
                     
-                    validation_total += float(total_v.item()) * bsz
-                    validation_pol += float(policy_loss_v.item()) * bsz
-                    validation_value += float(value_loss_v.item()) * bsz
+                    val_metrics.update(
+                        total=total_v.item(),
+                        policy=policy_loss_v.item(),
+                        value=value_loss_v.item(),
+                        wall=wall_loss_v.item(),
+                        deal_in=deal_in_loss_v.item(),
+                        bsz=bsz,
+                    )
                     validation_pol_main += float(policy_loss_v.item()) * bsz
-                    validation_wall += float(wall_loss_v.item()) * bsz
-                    validation_deal_in += float(deal_in_loss_v.item()) * bsz
                     
                     # Check if this is a BC batch (ratio > bc_fallback_ratio) - if not, include in value loss tracking
                     # joint_old_log_probs are from dataset; compute current joint log-prob from probabilities
@@ -923,11 +960,12 @@ def _run_ppo_training(
 
                     validation_count += bsz
             validation_denominator = max(1, validation_count)
-            validation_avg = validation_total / validation_denominator
-            validation_avg_pol = validation_pol / validation_denominator
-            validation_avg_value = validation_value / validation_denominator
-            validation_avg_wall = validation_wall / validation_denominator
-            validation_avg_deal_in = validation_deal_in / validation_denominator
+            vavg = val_metrics.averages()
+            validation_avg = vavg['total']
+            validation_avg_pol = vavg['policy']
+            validation_avg_value = vavg['value']
+            validation_avg_wall = vavg['wall']
+            validation_avg_deal_in = vavg['deal_in']
             # Calculate value loss average for non-BC batches only
             validation_avg_value_non_bc = validation_value_non_bc / max(1, validation_count_non_bc) if validation_count_non_bc > 0 else None
             # In low memory mode, KL is computed on-the-fly if prev model exists, else N/A for first epoch

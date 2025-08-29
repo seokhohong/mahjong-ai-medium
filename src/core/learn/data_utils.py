@@ -84,39 +84,78 @@ def build_state_from_arrays(
 
 
 def build_state_from_npz_row(data: Any, row_index: int) -> Dict[str, Any]:
-    """Build a state dict from a row in a loaded .npz dataset.
+    """Build a state dict from a row in a loaded .npz dataset (new explicit schema).
 
-    Expects standard keys in the .npz: 'hand_idx', 'disc_idx', 'called_idx',
-    'game_state', and optionally 'called_discards'.
+    Required keys (produced by create_dataset_parallel.py):
+    - hand_idx, called_idx, disc_idx, called_discards
+    - round_wind, seat_winds, legal_action_mask, riichi_declarations
+    - remaining_tiles, owner_of_reactable_tile, reactable_tile, newly_drawn_tile
+    - dora_indicator_tiles, deal_in_tiles, wall_count
     """
-    hand = data['hand_idx'][row_index]
-    disc = data['disc_idx'][row_index]
-    called = data['called_idx'][row_index]
-    gsv = data['game_state'][row_index]
-    cdm = data['called_discards'][row_index] if 'called_discards' in data else None
-    return build_state_from_arrays(hand, disc, called, gsv, cdm)
+    st: Dict[str, Any] = {
+        'hand_idx': np.asarray(data['hand_idx'][row_index], dtype=np.int32),
+        'called_idx': np.asarray(data['called_idx'][row_index], dtype=np.int32),
+        'disc_idx': np.asarray(data['disc_idx'][row_index], dtype=np.int32),
+        'called_discards': np.asarray(data['called_discards'][row_index], dtype=np.int32),
+        'round_wind': int(data['round_wind'][row_index]),
+        'seat_winds': np.asarray(data['seat_winds'][row_index], dtype=np.int32),
+        'legal_action_mask': np.asarray(data['legal_action_mask'][row_index], dtype=np.int32),
+        'riichi_declarations': np.asarray(data['riichi_declarations'][row_index], dtype=np.int32),
+        'remaining_tiles': int(data['remaining_tiles'][row_index]),
+        'owner_of_reactable_tile': int(data['owner_of_reactable_tile'][row_index]),
+        'reactable_tile': int(data['reactable_tile'][row_index]),
+        'newly_drawn_tile': int(data['newly_drawn_tile'][row_index]),
+        'dora_indicator_tiles': np.asarray(data['dora_indicator_tiles'][row_index], dtype=np.int32),
+        'wall_count': np.asarray(data['wall_count'][row_index], dtype=np.int8),
+    }
+    # Optional/variable-length objects
+    if 'deal_in_tiles' in getattr(data, 'files', getattr(data, 'keys', lambda: [])()):
+        st['deal_in_tiles'] = data['deal_in_tiles'][row_index]
+    else:
+        st['deal_in_tiles'] = []
+    return st
 
 
 def make_npz_state_row_getter(data: Any) -> Callable[[int], Dict[str, Any]]:
-    """Create a fast row getter that avoids repeated key lookups and reloading.
+    """Create a fast row getter for the new explicit NPZ schema.
 
-    Captures references to arrays within the provided npz dataset object so that
-    subsequent per-row calls only perform array indexing and dtype normalization.
+    Captures references to arrays so subsequent calls only index and cast.
     """
     hand_arr = data['hand_idx']
-    disc_arr = data['disc_idx']
     called_arr = data['called_idx']
-    gsv_arr = data['game_state']
-    cdm_arr = data['called_discards'] if 'called_discards' in getattr(data, 'files', getattr(data, 'keys', lambda: [])()) else None
+    disc_arr = data['disc_idx']
+    cdm_arr = data['called_discards']
+    rw_arr = data['round_wind']
+    sw_arr = data['seat_winds']
+    lam_arr = data['legal_action_mask']
+    riichi_arr = data['riichi_declarations']
+    rem_arr = data['remaining_tiles']
+    owner_arr = data['owner_of_reactable_tile']
+    react_arr = data['reactable_tile']
+    newly_arr = data['newly_drawn_tile']
+    dora_arr = data['dora_indicator_tiles']
+    wall_arr = data['wall_count']
+    dealin_arr = data['deal_in_tiles'] if 'deal_in_tiles' in getattr(data, 'files', getattr(data, 'keys', lambda: [])()) else None
 
     def _get(row_index: int) -> Dict[str, Any]:
-        return build_state_from_arrays(
-            hand_arr[row_index],
-            disc_arr[row_index],
-            called_arr[row_index],
-            gsv_arr[row_index],
-            (cdm_arr[row_index] if cdm_arr is not None else None),
-        )
+        st: Dict[str, Any] = {
+            'hand_idx': np.asarray(hand_arr[row_index], dtype=np.int32),
+            'called_idx': np.asarray(called_arr[row_index], dtype=np.int32),
+            'disc_idx': np.asarray(disc_arr[row_index], dtype=np.int32),
+            'called_discards': np.asarray(cdm_arr[row_index], dtype=np.int32),
+            'round_wind': int(rw_arr[row_index]),
+            'seat_winds': np.asarray(sw_arr[row_index], dtype=np.int32),
+            'legal_action_mask': np.asarray(lam_arr[row_index], dtype=np.int32),
+            'riichi_declarations': np.asarray(riichi_arr[row_index], dtype=np.int32),
+            'remaining_tiles': int(rem_arr[row_index]),
+            'owner_of_reactable_tile': int(owner_arr[row_index]),
+            'reactable_tile': int(react_arr[row_index]),
+            'newly_drawn_tile': int(newly_arr[row_index]),
+            'dora_indicator_tiles': np.asarray(dora_arr[row_index], dtype=np.int32),
+            'wall_count': np.asarray(wall_arr[row_index], dtype=np.int8),
+        }
+        st['deal_in_tiles'] = (dealin_arr[row_index] if dealin_arr is not None else [])
+        return st
 
     return _get
 

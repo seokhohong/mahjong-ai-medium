@@ -28,6 +28,8 @@ from ..heuristics_player import MediumHeuristicsPlayer
 # Intermediate Rewards
 TENPAI_REWARD = 0.1
 YAKUHAI_REWARD = 0.05
+# Reward for making any call (Chi, Pon, Daiminkan)
+CALL_REWARD = 0.02
 
 class ExperienceBuffer:
     """Simple experience buffer for AC training: (encoded_features, action, reward).
@@ -98,12 +100,35 @@ class RecordingACPlayer(ACPlayer):
     """
 
     def __init__(self, network: Any, temperature: float = 1.0, zero_network_reward: bool = False,
-                 gsv_scaler: Any = None):
-        super().__init__(network=network, gsv_scaler=gsv_scaler, temperature=temperature)
+                 gsv_scaler: Any = None,
+                 exploration_consumption_factor: float = 1.0,
+                 low_prob_threshold: float = 0.05,
+                 min_temperature: float = 0.1, # gets nans otherwise
+                 identifier: Optional[int] = None):
+        super().__init__(network=network, gsv_scaler=gsv_scaler, temperature=temperature, identifier=identifier)
         self.experience = ExperienceBuffer()
         self._terminal_reward: Optional[float] = None
         self._zero_network_reward = bool(zero_network_reward)
         self.last_decision_reward: Optional[float] = None
+        # Exploration consumption: multiply temperature by this factor when a low-prob move is taken
+        self.exploration_consumption_factor = float(max(0.0, min(1.0, exploration_consumption_factor)))
+        self.low_prob_threshold = float(max(0.0, low_prob_threshold))
+        self.min_temperature = float(max(1e-6, min_temperature))
+
+    def _consume_exploration(self, logp_joint: float) -> None:
+        """Reduce temperature after choosing a low-probability move.
+
+        - If `exploration_consumption_factor` < 1.0 and selected prob <= low_prob_threshold,
+          set: temperature = max(min_temperature, temperature * exploration_consumption_factor)
+        """
+        if self.exploration_consumption_factor >= 1.0:
+            return
+        try:
+            prob = float(np.exp(float(logp_joint)))
+        except Exception:
+            return
+        if prob <= self.low_prob_threshold:
+            self.temperature = max(self.min_temperature, float(self.temperature) * self.exploration_consumption_factor)
 
     # Hooks for the engine or controller to assign final rewards when the round ends
     def set_final_reward(self, reward: float) -> None:
@@ -135,6 +160,8 @@ class RecordingACPlayer(ACPlayer):
     # Record decisions along with value estimates from the network
     def act(self, game_state: GamePerspective):  # type: ignore[override]
         move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
+        # Consume exploration if the sampled move was low-probability
+        self._consume_exploration(logp_joint)
         # Aggregate intermediate rewards (transition to tenpai, yakuhai acquisition, etc.)
         reward = _compute_intermediate_reward(move, game_state)
         self.experience.add(
@@ -150,6 +177,8 @@ class RecordingACPlayer(ACPlayer):
 
     def react(self, game_state: GamePerspective, options: List[Reaction]):  # type: ignore[override]
         move, value, a_idx, t_idx, logp_joint = self.compute_play(game_state)
+        # Consume exploration if the sampled move was low-probability
+        self._consume_exploration(logp_joint)
         reward = _compute_intermediate_reward(move, game_state)
         self.experience.add(
             encode_game_perspective(game_state),
@@ -169,8 +198,8 @@ class RecordingHeuristicACPlayer(MediumHeuristicsPlayer):
     for all decisions except the terminal step, which is set via finalize_episode.
     """
 
-    def __init__(self, random_exploration: float = 0.0, gsv_scaler: Any = None) -> None:
-        super().__init__()
+    def __init__(self, random_exploration: float = 0.0, gsv_scaler: Any = None, identifier: Optional[int] = None) -> None:
+        super().__init__(identifier=identifier)
         self.random_exploration = max(0.0, float(random_exploration))
         self.experience = ExperienceBuffer()
         # Note: gsv_scaler is not used by heuristic players but kept for API consistency
@@ -350,6 +379,13 @@ def _compute_intermediate_reward(move: Any, game_state: GamePerspective) -> floa
     # Yakuhai acquisition by draw or by Pon
     if _yakuhai_acquired_by_draw(game_state) or _yakuhai_acquired_by_pon(move, game_state):
         reward += float(YAKUHAI_REWARD)
+    # Any call: Chi, Pon, or open Kan
+    try:
+        from ..action import Chi, Pon, KanDaimin
+        if isinstance(move, (Chi, Pon, KanDaimin)):
+            reward += float(CALL_REWARD)
+    except Exception:
+        pass
     return reward
 
 

@@ -62,8 +62,8 @@ class TextViewerPlayer(Player):
 
     We keep the player stateless; the engine provides GamePerspective with all info.
     """
-    def __init__(self, base: Player, lines: List[str]) -> None:
-        super().__init__()
+    def __init__(self, base: Player, lines: List[str], identifier: Optional[int] = None) -> None:
+        super().__init__(identifier=identifier)
         self._base = base
         self._lines = lines
 

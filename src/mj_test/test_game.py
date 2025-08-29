@@ -17,6 +17,7 @@ from core.game import (
 )
 from core.action import Discard, Tsumo, Chi, Riichi
 from core.tile import Tile, TileType, Suit, Honor
+from core.learn.ac_constants import NULL_TILE_INDEX
 
 
 class TestMediumJongBasics(unittest.TestCase):
@@ -226,6 +227,38 @@ class TestMediumJongBasics(unittest.TestCase):
 
 
 class TestYakuAndRiichi(unittest.TestCase):
+    def test_force_riichi_first_turn_and_perspective_marks_prev_player_riichi(self):
+        # Player 0 (dealer) will declare riichi on the drawn 6s immediately on first turn.
+        # Then we verify that from Player 1's perspective, the previous player (relative index 3)
+        # is marked as having declared riichi via riichi_declaration_tile.
+        from test_utils import ForceActionPlayer, NoReactionPlayer, _make_tenpai_hand
+
+        # Construct game with forced riichi action from dealer discarding drawn 6s
+        riichi_tile = Tile(Suit.SOUZU, TileType.SIX)
+        players = [ForceActionPlayer(Riichi(riichi_tile)), NoReactionPlayer(), NoReactionPlayer(), NoReactionPlayer()]
+        g = MediumJong(players)
+        # Dealer has a closed 13-tile tenpai hand that waits on 6s (from test_utils)
+        g._player_hands[0] = _make_tenpai_hand()
+        # Ensure deterministic environment: dealer draws 6s and can riichi on it
+        g.tiles = [riichi_tile]
+        g.dead_wall = []
+        g.dora_indicators = []
+        g.ura_dora_indicators = []
+        g.current_player_idx = 0
+        g._reactable_tile = None
+        g._owner_of_reactable_tile = None
+
+        # Execute first turn: P0 draws 6s, declares riichi discarding it, others pass reactions
+        g.play_turn()
+
+        # It should now be Player 1's action turn
+        self.assertEqual(g.current_player_idx, 1)
+
+        # From Player 1's perspective (rotation-invariant), Player 3 is the previous player (the dealer P0)
+        gp1 = g.get_game_perspective(1)
+        prev_player_riichi_idx = gp1.riichi_declaration_tile.get(3, NULL_TILE_INDEX)
+        self.assertNotEqual(prev_player_riichi_idx, NULL_TILE_INDEX, "Previous player should be marked as riichi in perspective")
+
     def test_yaku_required_no_yaku_no_win(self):
         # Use a player that asserts inside its play() when tsumo would be legal
         class CheckTsumoLegal(Player):

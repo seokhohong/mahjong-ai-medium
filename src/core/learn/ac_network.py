@@ -77,17 +77,9 @@ class ACNetwork:
 
                 # Unified call processing: shared linear encoder for all players' calls
                 self.call_linear = nn.Linear(outer.embedding_dim, 64)
-
-                # Discards attention (query-based):
-                # - Keys/values built from discard tokens: tile_emb + pos_emb(8) + player_emb(4) -> Dkv
-                # - Queries from player's concealed hand tiles (MAX_CONCEALED_TILES)
-                # - Output: per-query attended vectors (B,MAX_CONCEALED_TILES,Dkv)
-                #   Reduced via a single Linear over flattened (Q*Dkv) -> 32: (B, Q*Dkv) -> (B, 32)
-                self.disc_pos_emb = nn.Embedding(outer.disc_seq_len, 8)
-                self.disc_player_emb = nn.Embedding(int(NUM_PLAYERS), 4)
-                self.query_proj = nn.Linear(outer.embedding_dim, outer.embedding_dim + 8 + 4)  # emb -> Dkv
-                # Flattened reduction from (Q * Dkv) -> 32 (bias-free so zero attention -> zero features)
-                self.query_reduce = nn.Linear(int(MAX_CONCEALED_TILES) * (outer.embedding_dim + 8 + 4), 32, bias=False)
+                
+                # Discards: per-player counts (37) -> shared linear -> 32 per player (total 128)
+                self.disc_linear = nn.Linear(int(UNIQUE_TILE_COUNT), 32)
 
                 # Player concealed hand conv over (B,1,MAX_CONCEALED_TILES,emb)
                 self.hand_conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
@@ -97,9 +89,9 @@ class ACNetwork:
                 self.call_reduce = nn.Linear(64, 16)
 
                 # Separate trunks for policy and value; input is
-                #   hand(64) + all_calls(4*16) + disc_attn(32) + react(emb) + gsv(GSV)
+                #   hand(64) + all_calls(4*16) + disc_counts(4*32=128) + react(emb) + gsv(GSV)
                 from .ac_constants import GAME_STATE_VEC_LEN as GSV
-                input_dim = 64 + (4 * 16) + 32 + outer.embedding_dim + int(GSV)
+                input_dim = 64 + (4 * 16) + 128 + outer.embedding_dim + int(GSV)
                 # Shared trunk for policy, value, and auxiliary heads
                 self.trunk = nn.Sequential(
                     nn.Linear(input_dim, outer.hidden_size),
@@ -122,7 +114,7 @@ class ACNetwork:
                 player_hand_idx: torch.Tensor,              # (B, MAX_CONCEALED_TILES)
                 player_called_idx: torch.Tensor,            # (B, MAX_CALLED_TILES_PER_PLAYER)
                 opp_called_idx: torch.Tensor,               # (B, 3, MAX_CALLED_TILES_PER_PLAYER)
-                disc_idx: torch.Tensor,                     # (B, NUM_PLAYERS, disc_seq_len)
+                disc_bincounts: torch.Tensor,               # (B, NUM_PLAYERS, 37)
                 game_tile_indicator_idx: torch.Tensor,      # (B, 5) [react, d1..d4] as indices or -1
                 game_state_vec: torch.Tensor,               # (B, GSV) standardized numeric vector
             ):
@@ -162,41 +154,12 @@ class ACNetwork:
                 call_features_reduced = self.call_reduce(call_features)  # (B, 4, 16)
                 call_feat = call_features_reduced.view(B, 4 * 16)  # (B, 64)
 
-                # Discards: query-based attention with MAX_CONCEALED_TILES queries
-                d_idx = padify(disc_idx).long()                                        # (B,NUM_PLAYERS,disc_seq_len)
-                d_tile = self.tile_emb(d_idx)                                          # (B,NUM_PLAYERS,disc_seq_len,emb)
-                pos_ids = torch.arange(self.outer.disc_seq_len, device=d_idx.device).view(1, 1, -1).expand(B, int(NUM_PLAYERS), -1)
-                d_pos = self.disc_pos_emb(pos_ids)                                     # (B,NUM_PLAYERS,disc_seq_len,8)
-                ply_ids = torch.arange(int(NUM_PLAYERS), device=d_idx.device).view(1, -1, 1).expand(B, -1, self.outer.disc_seq_len)
-                d_ply = self.disc_player_emb(ply_ids)                                  # (B,NUM_PLAYERS,disc_seq_len,4)
-                d_kv = torch.cat([d_tile, d_pos, d_ply], dim=-1)                       # (B,NUM_PLAYERS,disc_seq_len,Dkv)
-                Dkv = d_kv.shape[-1]
-                N = int(NUM_PLAYERS) * self.outer.disc_seq_len
-                d_kv = d_kv.view(B, N, Dkv)                                            # (B,N,Dkv)
-                d_mask = (d_idx.view(B, N) != self.pad_index)                          # (B,N)
-
-                # Queries from player's hand (concealed draw+13):
-                q_idx = padify(player_hand_idx).long()                                 # (B,MAX_CONCEALED_TILES)
-                q_emb = self.tile_emb(q_idx)                                           # (B,MAX_CONCEALED_TILES,emb)
-                q_proj = self.query_proj(q_emb)                                        # (B,MAX_CONCEALED_TILES,Dkv)
-
-                # Attention: per-query weights over discard keys
-                # attn_logits: (B, Q, N) where Q = MAX_CONCEALED_TILES
-                attn_logits = torch.matmul(q_proj, d_kv.transpose(1, 2)) / (Dkv ** 0.5)
-                # mask PAD tokens in discards
-                mask = d_mask.unsqueeze(1)                                             # (B,1,N)
-                attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
-                # softmax, then zero out masked, and renormalize only if there is at least one valid token
-                attn_w = F.softmax(attn_logits, dim=-1)                                # (B,Q,N)
-                attn_w = attn_w * mask                                                # zero out masked positions
-                denom = attn_w.sum(dim=-1, keepdim=True)                               # (B,Q,1)
-                has_valid = denom > 0
-                # avoid division by zero: only normalize where sum>0
-                attn_w = torch.where(has_valid, attn_w / torch.clamp_min(denom, 1e-12), torch.zeros_like(attn_w))
-                # Weighted sum over values -> (B,Q,Dkv), then flatten and reduce to 32-d
-                d_per_query = torch.matmul(attn_w, d_kv)                               # (B,MAX_CONCEALED_TILES,Dkv)
-                q_flat = d_per_query.reshape(B, -1)                                    # (B, Q*Dkv)
-                d_feat = self.query_reduce(q_flat)                                     # (B,32)
+                # Discards: bincounts per player are provided directly -> (B,P,37)
+                counts = disc_bincounts.to(dtype=torch.float32)
+                P = int(NUM_PLAYERS)
+                # Shared linear 37->32 per player
+                disc_feat = F.dropout(F.relu(self.disc_linear(counts)), p=0.3)         # (B,P,32)
+                d_feat = disc_feat.reshape(B, P * 32)                                  # (B,128)
 
                 # Game-state features: use the standardized vector directly
                 gsv_feat = game_state_vec.float()                                       # (B,GSV)
@@ -251,7 +214,7 @@ class ACNetwork:
           - player_hand_idx_fixed: (MAX_CONCEALED_TILES,)
           - player_called_idx: (MAX_CALLED_TILES_PER_PLAYER,)
           - opp_called_idx: (3, MAX_CALLED_TILES_PER_PLAYER)
-          - disc_idx_seq: (NUM_PLAYERS, MAX_DISCARDS_PER_PLAYER) most recent discards (pad with -1)
+          - disc_bincounts: (NUM_PLAYERS, 37) bincounts of most recent discards per player
         """
         PAD = -1
         # Flatten called tiles per player
@@ -291,17 +254,17 @@ class ACNetwork:
             opp_called_list.append(np.asarray(tiles, dtype=np.int32))
         opp_called_idx = np.stack(opp_called_list, axis=0)
 
-        # Discards: take most recent up to MAX_DISCARDS_PER_PLAYER per player
+        # Discards: take most recent up to MAX_DISCARDS_PER_PLAYER per player, then produce bincounts per player
         disc = np.asarray(disc_idx, dtype=np.int32)
-        disc_seq_list: List[np.ndarray] = []
+        disc_counts_list: List[np.ndarray] = []
         for i in range(int(NUM_PLAYERS)):
             tiles = [int(v) for v in disc[i].tolist() if int(v) >= 0]
             # take last disc_seq_len
             tiles = tiles[-self.disc_seq_len:]
-            if len(tiles) < self.disc_seq_len:
-                tiles = ([PAD] * (self.disc_seq_len - len(tiles))) + tiles
-            disc_seq_list.append(np.asarray(tiles, dtype=np.int32))
-        disc_idx_seq = np.stack(disc_seq_list, axis=0)
+            # bincount over 0..36
+            counts = np.bincount(np.asarray([t for t in tiles if 0 <= t < int(UNIQUE_TILE_COUNT)], dtype=np.int32), minlength=int(UNIQUE_TILE_COUNT))[:int(UNIQUE_TILE_COUNT)]
+            disc_counts_list.append(counts.astype(np.float32))
+        disc_bincounts = np.stack(disc_counts_list, axis=0).astype(np.float32)
 
         # game_tile_indicators are handled in evaluate() and passed directly to forward()
 
@@ -309,7 +272,7 @@ class ACNetwork:
             np.asarray(player_hand_idx_fixed, dtype=np.int32),
             np.asarray(player_called_idx, dtype=np.int32),
             opp_called_idx.astype(np.int32),
-            disc_idx_seq.astype(np.int32),
+            disc_bincounts.astype(np.float32),
         )
 
     def evaluate(self, game_state: GamePerspective) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -333,7 +296,7 @@ class ACNetwork:
             player_hand_idx,
             player_called_idx,
             opp_called_idx,
-            disc_idx_seq,
+            disc_bincounts,
         ) = self.extract_features_from_indexed(
             hand_idx=hand_idx,
             disc_idx=disc_idx,
@@ -348,7 +311,7 @@ class ACNetwork:
                 torch.from_numpy(player_hand_idx[None, ...]).to(self._device),
                 torch.from_numpy(player_called_idx[None, ...]).to(self._device),
                 torch.from_numpy(opp_called_idx[None, ...]).to(self._device),
-                torch.from_numpy(disc_idx_seq[None, ...]).to(self._device),
+                torch.from_numpy(disc_bincounts[None, ...]).to(self._device),
                 torch.from_numpy(game_tile_indicators[None, ...]).to(self._device),
                 torch.from_numpy(gsv_std[None, ...]).to(self._device),
             )

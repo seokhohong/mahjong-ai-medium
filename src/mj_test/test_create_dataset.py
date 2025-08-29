@@ -17,18 +17,6 @@ def _groups_by_game_and_actor(game_ids, actor_ids):
     return groups
 
 
-def _decode_gp_from_row(data, row_idx):
-    from core.learn.feature_engineering import decode_game_perspective
-    features = {
-        'hand_idx': data['hand_idx'][row_idx],
-        'called_idx': data['called_idx'][row_idx],
-        'disc_idx': data['disc_idx'][row_idx],
-        'game_state': data['game_state'][row_idx],
-        'called_discards': data['called_discards'][row_idx],
-    }
-    return decode_game_perspective(features)
-
-
 def _post_action_concealed_and_calls(gp, move):
     from core.action import Discard, Riichi, Chi, Pon, KanDaimin, KanAnkan, KanKakan
     from core.game import CalledSet

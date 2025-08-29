@@ -40,15 +40,22 @@ Edit this function to change which agents compete. Examples:
 def build_players() -> List[Player]:
 	from core.learn.data_utils import load_gsv_scaler
 
-	return [
+	players: List[Player] = [
         #ACPlayer.from_directory("models/ac_ppo_20250826_140749", temperature=0.2),
         #ACPlayer.from_directory("models/ac_ppo_20250826_013253", temperature=0.2),
         #ACPlayer.from_directory("models/ac_ppo_20250825_172005", temperature=0.2),
-        ACPlayer.from_directory("models/ac_ppo_20250826_144021", temperature=0.2),
         RecordingHeuristicACPlayer(random_exploration=0),
-        RecordingHeuristicACPlayer(random_exploration=0),
+        ACPlayer.from_directory("models/ac_ppo_20250828_221136", temperature=0.2),
+        ACPlayer.from_directory("models/ac_ppo_20250829_080843", temperature=0.2),
         RecordingHeuristicACPlayer(random_exploration=0)
 	]
+	# Assign public identifiers 5..8 to verify identifier-based reporting
+	for i, p in enumerate(players):
+		try:
+			p.identifier = 5 + i
+		except Exception:
+			pass
+	return players
 
 
 
@@ -60,7 +67,7 @@ def play_matches(players: List[Player], games: int, *, shuffle_each_game: bool =
 	# Track per-game scores (point deltas) for each original player index
 	per_player_scores: List[List[float]] = [[] for _ in range(4)]
 
-	for gi in tqdm(range(max(1, int(games)))):
+	for gi in tqdm(range(max(1, int(games))), desc="Games", dynamic_ncols=True, mininterval=0.1):
 		order = list(range(4))
 		if shuffle_each_game:
 			random.shuffle(order)
@@ -88,6 +95,7 @@ def play_matches(players: List[Player], games: int, *, shuffle_each_game: bool =
 	return {
 		'per_player_scores': per_player_scores,
 		'stats': stats,
+		'identifiers': [int(getattr(players[i], 'identifier', i)) for i in range(4)],
 	}
 
 
@@ -101,11 +109,11 @@ def _worker_play_chunk(games: int, seed: Optional[int], shuffle_each_game: bool,
             np.random.seed(proc_seed)
 
         players = build_players()
+        identifiers = [int(getattr(players[i], 'identifier', i)) for i in range(4)]
         per_player_scores: List[List[float]] = [[] for _ in range(4)]
 
-        iterator = range(max(1, int(games)))
-        if rank == 0:
-            iterator = tqdm(iterator, desc=f"Worker {rank} games", dynamic_ncols=True, mininterval=0.1)
+        # Always show a tqdm per worker; use position to stack bars nicely
+        iterator = tqdm(range(max(1, int(games))), desc=f"Games", dynamic_ncols=True, mininterval=0.1, position=rank)
 
         for _ in iterator:
             order = list(range(4))
@@ -122,7 +130,7 @@ def _worker_play_chunk(games: int, seed: Optional[int], shuffle_each_game: bool,
             for i in range(4):
                 per_player_scores[order[i]].append(float(final_points[i]))
 
-        queue.put((rank, per_player_scores))
+        queue.put((rank, (per_player_scores, identifiers)))
     except Exception as e:
         try:
             queue.put((rank, e))
@@ -154,6 +162,7 @@ def play_matches_parallel(total_games: int, *, num_processes: int = 1, chunk_siz
     next_chunk_idx = 0
     results_received = 0
     agg_scores: List[List[float]] = [[] for _ in range(4)]
+    agg_identifiers: Optional[List[int]] = None
 
     def _start_chunk(idx: int):
         rnk, games_in_chunk = chunks[idx]
@@ -172,7 +181,18 @@ def play_matches_parallel(total_games: int, *, num_processes: int = 1, chunk_siz
             results_received += 1
             if isinstance(payload, Exception):
                 raise payload
-            per_player_scores = payload  # type: ignore
+            # Payload may be either just scores or (scores, identifiers)
+            per_player_scores: List[List[float]]
+            if isinstance(payload, tuple) and len(payload) == 2:
+                per_player_scores, ids = payload  # type: ignore
+                if agg_identifiers is None:
+                    # Capture identifiers from the first completed worker
+                    try:
+                        agg_identifiers = [int(x) for x in ids]  # type: ignore
+                    except Exception:
+                        agg_identifiers = None
+            else:
+                per_player_scores = payload  # type: ignore
             for i in range(4):
                 agg_scores[i].extend(per_player_scores[i])
         except Exception:
@@ -207,10 +227,13 @@ def play_matches_parallel(total_games: int, *, num_processes: int = 1, chunk_siz
         std = float(arr.std(ddof=0)) if arr.size > 0 else 0.0
         stats.append({'mean': mean, 'median': median, 'std': std, 'n': int(arr.size)})
 
-    return {
+    result: Dict[str, Any] = {
         'per_player_scores': agg_scores,
         'stats': stats,
     }
+    if agg_identifiers is not None:
+        result['identifiers'] = agg_identifiers
+    return result
 
 
 def main():
@@ -245,8 +268,15 @@ def main():
         )
 
     print('Results (per-player score stats):')
-    for i, s in enumerate(res['stats']):
-        print(f"Player {i}: mean={s['mean']:.2f} median={s['median']:.2f} std={s['std']:.2f} n={s['n']}")
+    if 'identifiers' in res:
+        ids = res['identifiers']
+        for i, s in enumerate(res['stats']):
+            pid = ids[i] if i < len(ids) else i
+            print(f"PlayerID {pid}: mean={s['mean']:.2f} median={s['median']:.2f} std={s['std']:.2f} n={s['n']}")
+    else:
+        # Parallel path currently aggregates by slot index
+        for i, s in enumerate(res['stats']):
+            print(f"Player {i}: mean={s['mean']:.2f} median={s['median']:.2f} std={s['std']:.2f} n={s['n']}")
 
 
 if __name__ == '__main__':

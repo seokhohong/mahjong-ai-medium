@@ -45,8 +45,9 @@ class ACPlayer(Player):
 
     def __init__(self, network: Any, gsv_scaler: StandardScaler | None = None,
                  temperature: float = 1.0,
-                 expert_injection: float = 0.0):
-        super().__init__()
+                 expert_injection: float = 0.0,
+                 identifier: Optional[int] = None):
+        super().__init__(identifier=identifier)
         self.network = network
         self.temperature = max(1e-6, float(temperature))
         self.gsv_scaler = gsv_scaler
@@ -247,7 +248,7 @@ class ACPlayer(Player):
         # First try to load the entire model (preserves original architecture)
         try:
             # Create a minimal ACNetwork to use as a loader
-            temp_network = ACNetwork(gsv_scaler=gsv_scaler)
+            temp_network = ACNetwork(gsv_scaler=gsv_scaler, embedding_dim=12, hidden_size=256)
             temp_network.load_model(model_path, load_entire_module=True)
             network = temp_network
             print(f"Loaded model with original architecture from {model_path}")
@@ -269,7 +270,7 @@ class ACPlayer(Player):
                 hidden_size = int(state_dict.get('trunk.0.weight').shape[0]) if 'trunk.0.weight' in state_dict else 128
                 # Build network with inferred sizes and load weights non-strictly
                 network = ACNetwork(gsv_scaler=gsv_scaler, hidden_size=hidden_size, embedding_dim=embed_dim)
-                missing, unexpected = network.torch_module.load_state_dict(state_dict, strict=False)
+                missing, unexpected = network.torch_module().load_state_dict(state_dict, strict=False)
                 # Move to device and eval
                 network.to(network._device)
                 network.torch_module.eval()

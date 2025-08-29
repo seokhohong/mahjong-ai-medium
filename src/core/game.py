@@ -149,7 +149,7 @@ class PlayerOutcome:
 
 @dataclass
 class GameOutcome:
-    # Per-player results keyed by absolute player id 0..3
+    # Per-player results keyed by seat index 0..3 (not public identifier)
     players: Dict[int, PlayerOutcome]
     winners: List[int]
     loser: Optional[int]
@@ -168,9 +168,11 @@ class GameOutcome:
     def deserialize(data: Dict[str, Any]) -> 'GameOutcome':
         players_list = data.get('players', [])
         players: Dict[int, PlayerOutcome] = {}
-        for p_dict in players_list:
+        # The serialized 'players' is a list ordered by seat index 0..3.
+        # Reconstruct dict keyed by seat index while preserving PlayerOutcome.player_id as-is.
+        for seat_idx, p_dict in enumerate(players_list):
             po = PlayerOutcome.from_dict(p_dict)
-            players[po.player_id] = po
+            players[seat_idx] = po
         # Ensure all four players exist if possible by filling defaults
         for pid in range(4):
             if pid not in players:
@@ -1257,6 +1259,30 @@ class GamePerspective:
 
 
 class Player:
+    # Public identifier for dataset labeling; default 0 unless set by caller
+    identifier: int = 0
+
+    def __init__(self, identifier: Optional[int] = None) -> None:
+        """Initialize player with an optional public identifier.
+
+        Args:
+            identifier: Optional integer identifier for analytics/datasets; if None, defaults to 0.
+        """
+        try:
+            self.identifier = 0 if identifier is None else int(identifier)
+        except Exception:
+            self.identifier = 0
+
+    def get_identifier(self) -> int:
+        """Return the public identifier for this player (defaults to 0).
+
+        Subclasses or instantiation sites may set `self.identifier` to any
+        integer to carry through dataset building or analytics.
+        """
+        try:
+            return int(getattr(self, 'identifier', 0))
+        except Exception:
+            return 0
 
     def act(self, game_state: GamePerspective) -> Action:
         moves = game_state.legal_moves()
@@ -1766,6 +1792,8 @@ class MediumJong:
     def _on_win(self, winner_id: int, win_by_tsumo: bool, winning_tile: Optional[Tile] = None) -> None:
         self.winners = [winner_id]
         self.loser = None if win_by_tsumo else self._owner_of_reactable_tile
+        # Mark win type for outcome building
+        self.winner_win_type = 'tsumo' if win_by_tsumo else 'ron'
         self.game_over = True
         # Populate per-player points for this outcome
         deltas = [0, 0, 0, 0]
@@ -1820,6 +1848,8 @@ class MediumJong:
             return
         self.winners = list(winner_ids)
         self.loser = discarder
+        # Multiple ron is always ron
+        self.winner_win_type = 'ron'
         self.game_over = True
         deltas = [0, 0, 0, 0]
         # Ensure loser context for scoring
@@ -1939,8 +1969,10 @@ class MediumJong:
                 else:
                     # Non-winner on tsumo: leave outcome_type None; points_delta encodes payment
                     pass
+            # Use public identifier for PlayerOutcome.player_id
+            public_id = self.players[pid].get_identifier()
             players[pid] = PlayerOutcome(
-                player_id=pid,
+                player_id=public_id,
                 outcome_type=otype,
                 points_delta=int(hand_points[pid]),
             )

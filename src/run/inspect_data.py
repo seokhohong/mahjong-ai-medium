@@ -102,8 +102,8 @@ def inspect_data(states: List[Dict[str, Any]], action_pairs: List[tuple[int, int
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Inspect an AC dataset (.npz) and print the first N games")
-    parser.add_argument("dataset", type=str, help="Path to .npz produced by create_dataset.py")
+    parser = argparse.ArgumentParser(description="Inspect an AC dataset (.npz) produced by create_dataset_parallel.py and print the first N games")
+    parser.add_argument("dataset", type=str, help="Path to .npz produced by create_dataset_parallel.py")
     parser.add_argument("--games", type=int, default=1, help="Number of games to display")
     parser.add_argument("--start_game", type=int, default=0, help="Game index offset before printing")
     args = parser.parse_args()
@@ -164,16 +164,31 @@ def main() -> int:
                 j_lp = float(joint_log_probs[i])
                 joint_p = float(np.exp(j_lp))
                 prob_s = f" | joint_p={joint_p:.4f}"
+            # Extra context from latest schema
+            try:
+                remaining_tiles = int(st.get('remaining_tiles', -1))
+                wall_count = st.get('wall_count', None)
+                extra_ctx = f" | remaining_tiles={remaining_tiles}"
+                if wall_count is not None:
+                    try:
+                        extra_ctx += f" | wall_sum={int(np.asarray(wall_count).sum())}"
+                    except Exception:
+                        pass
+            except Exception:
+                extra_ctx = ""
             if adv is not None:
-                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | advantage={adv:+.3f} | {prob_s}")
+                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | advantage={adv:+.3f}{prob_s}{extra_ctx}")
             else:
-                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f} | {prob_s}")
+                print(f"Step {step:03d} | actor P{actor} | reward={rew:+.3f}{prob_s}{extra_ctx}")
             for line in lines:
                 print(line)
         # After all steps, print the GameOutcome if present
         if outcomes_arr is not None:
             try:
-                raw = outcomes_arr[int(gid)]
+                gi_idx = int(gid)
+                if gi_idx < 0 or gi_idx >= len(outcomes_arr):
+                    raise IndexError(f"game_outcomes_obj length={len(outcomes_arr)} doesn't include game id {gi_idx}")
+                raw = outcomes_arr[gi_idx]
                 outcome_dict = raw.item() if hasattr(raw, 'item') else raw
                 outcome = GameOutcome.deserialize(outcome_dict)
                 print("-" * 80)

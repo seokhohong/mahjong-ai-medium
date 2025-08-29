@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .game import (
     Player,
@@ -63,6 +63,9 @@ class MediumHeuristicsPlayer(Player):
       - Ron if possible
       - Decline Chi/Pon unless either there is a yakuhai ankō in hand or the hand is pure tanyao (all 2-8)
     """
+
+    def __init__(self, identifier: Optional[int] = None) -> None:
+        super().__init__(identifier=identifier)
 
     def act(self, game_state: GamePerspective):  # type: ignore[override]
         # Fetch legal moves once to avoid repeated computation

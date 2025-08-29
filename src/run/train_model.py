@@ -181,7 +181,7 @@ class ACDataset(Dataset):
             player_hand_idx_fixed,
             player_called_idx,
             opp_called_idx,
-            disc_idx,
+            disc_bincounts,
         ) = self._net.extract_features_from_indexed(
             hand_idx=np.asarray(self.hand_idx[idx], dtype=np.int32),
             called_idx=np.asarray(self.called_idx[idx], dtype=np.int32),
@@ -234,7 +234,7 @@ class ACDataset(Dataset):
             'player_hand_idx': np.asarray(player_hand_idx_fixed, dtype=np.int32),
             'player_called_idx': np.asarray(player_called_idx, dtype=np.int32),
             'opp_called_idx': opp_called_idx.astype(np.int32),
-            'disc_idx': disc_idx.astype(np.int32),
+            'disc_bincounts': disc_bincounts.astype(np.float32),
             'game_tile_indicators_idx': game_tile_indicators_idx.astype(np.int32),
             'game_state_vec': gsv_std.astype(np.float32),
             'action_idx': int(self.action_idx[idx]),
@@ -259,7 +259,7 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
     player_hand_idx = torch.from_numpy(np.stack(batch['player_hand_idx'])).to(dev)
     player_called_idx = torch.from_numpy(np.stack(batch['player_called_idx'])).to(dev)
     opp_called_idx = torch.from_numpy(np.stack(batch['opp_called_idx'])).to(dev)
-    disc_idx = torch.from_numpy(np.stack(batch['disc_idx'])).to(dev)
+    disc_bincounts = torch.from_numpy(np.stack(batch['disc_bincounts'])).to(dev)
     game_tile_indicators_idx = torch.from_numpy(np.stack(batch['game_tile_indicators_idx'])).to(dev)
     game_state_vec = torch.from_numpy(np.stack(batch['game_state_vec'])).to(dev)
 
@@ -273,7 +273,7 @@ def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
     deal_in_mask = _to_dev(batch['deal_in_mask'], torch.float32)
 
     return (
-        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+        player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
         action_idx, tile_idx,
         joint_old_log_probs,
         advantages, returns,
@@ -372,13 +372,13 @@ def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val
             dataset_samples = dataset_correct = 0
             
             for batch in dataloader:
-                (player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                (player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                  action_idx, tile_idx, joint_old_log_probs, advantages, returns, wall_count, deal_in_mask) = _prepare_batch_tensors(batch, dev)
                 
                 # Compute losses
                 total_v, policy_loss_v, value_loss_v, bsz, _ = _compute_losses(
                     model,
-                    player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                    player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                     action_idx, tile_idx, joint_old_log_probs, advantages, returns,
                     wall_count, deal_in_mask,
                     bc_fallback_ratio=bc_fallback_ratio,
@@ -387,7 +387,7 @@ def _evaluate_model_on_combined_dataset(model: torch.nn.Module, dl_train, dl_val
                 
                 # Compute accuracy
                 a_logits, t_logits, _, _, _ = model(
-                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_bincounts.float(), game_tile_indicators_idx.long(), game_state_vec.float(),
                 )
                 pred_a = torch.argmax(a_logits, dim=1)
                 pred_t = torch.argmax(t_logits, dim=1)
@@ -432,7 +432,7 @@ def _compute_losses(
         player_hand_idx: torch.Tensor,
         player_called_idx: torch.Tensor,
         opp_called_idx: torch.Tensor,
-        disc_idx: torch.Tensor,
+        disc_bincounts: torch.Tensor,
         game_tile_indicators_idx: torch.Tensor,
         game_state_vec: torch.Tensor,
         action_idx: torch.Tensor,
@@ -449,12 +449,12 @@ def _compute_losses(
         bc_fallback_ratio: float = 5.0,
         bc_weight: float = 0.0,
         policy_weight: float = 1.0,
-        aux_wall_coeff: float = 0.1,
+        aux_wall_coeff: float = 0.02, # the losses here are comparatively very large in magnitude
         aux_deal_in_coeff: float = 0.1,
         print_debug: bool = False,
 ):
     a_pp, t_pp, value_pred, wall_counts_pred, deal_in_pred = model(
-        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_bincounts.float(), game_tile_indicators_idx.long(), game_state_vec.float(),
     )
     value_pred = value_pred.squeeze(1)
     batch_size_curr = int(player_hand_idx.size(0))
@@ -555,7 +555,7 @@ def _compute_losses(
     # Value and entropy terms
     value_loss = F.smooth_l1_loss(value_pred, returns)
     # Aux terms
-    wall_loss = F.smooth_l1_loss(wall_counts_pred, wall_count)
+    wall_loss = F.mse_loss(wall_counts_pred, wall_count)
     deal_in_loss = F.binary_cross_entropy(deal_in_pred.clamp(1e-6, 1-1e-6), deal_in_mask)
     entropy_a = safe_entropy_calculation(a_pp)
     entropy_t = safe_entropy_calculation(t_pp)
@@ -594,7 +594,7 @@ def _run_warmup_bc(
         with torch.no_grad():
             for batch in dloader:
                 (
-                    player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                    player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                     action_idx, tile_idx,
                     _joint_old_log_probs,
                     _advantages,
@@ -602,7 +602,7 @@ def _run_warmup_bc(
                     _wall_count, _deal_in_mask,
                 ) = _prepare_batch_tensors(batch, dev)
                 a_pp, t_pp, _, _, _ = model(
-                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_bincounts.float(), game_tile_indicators_idx.long(), game_state_vec.float(),
                 )
                 pred_a = torch.argmax(a_pp, dim=1)
                 pred_t = torch.argmax(t_pp, dim=1)
@@ -630,7 +630,7 @@ def _run_warmup_bc(
         progress = tqdm(dl, desc=f"WarmUp {epoch+1}", leave=False)
         for batch in progress:
             (
-                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages,
@@ -640,7 +640,7 @@ def _run_warmup_bc(
 
             loss, policy_loss, value_loss, wall_loss, deal_in_loss, _, _dbg = _compute_losses(
                 model,
-                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages,
@@ -671,7 +671,7 @@ def _run_warmup_bc(
                 was_training = model.training
                 model.eval()
                 a_pp, t_pp, _, _, _ = model(
-                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                    player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_bincounts.float(), game_tile_indicators_idx.long(), game_state_vec.float(),
                 )
                 pred_a = torch.argmax(a_pp, dim=1)
                 pred_t = torch.argmax(t_pp, dim=1)
@@ -697,7 +697,7 @@ def _run_warmup_bc(
             with torch.no_grad():
                 for vb in dl_validation:
                     (
-                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages,
@@ -706,7 +706,7 @@ def _run_warmup_bc(
                     ) = _prepare_batch_tensors(vb, dev)
                     loss_v, policy_loss_v, value_loss_v, wall_loss_v, deal_in_loss_v, _, _ = _compute_losses(
                         model,
-                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages,
@@ -728,7 +728,7 @@ def _run_warmup_bc(
                     )
                     validation_count += bsz
                     a_pp, t_pp, _, _, _ = model(
-                        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_bincounts.float(), game_tile_indicators_idx.long(), game_state_vec.float(),
                     )
                     pred_a = torch.argmax(a_pp, dim=1)
                     pred_t = torch.argmax(t_pp, dim=1)
@@ -808,7 +808,7 @@ def _run_ppo_training(
         train_metrics = LossAccumulator()
         for bi, batch in enumerate(progress):
             (
-                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages, returns, wall_count, deal_in_mask
@@ -818,7 +818,7 @@ def _run_ppo_training(
             last_step = (bi == (len(dl) - 1))
             total, policy_loss, value_loss, wall_loss, deal_in_loss, batch_size_curr, dbg = _compute_losses(
                 model,
-                player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                 action_idx, tile_idx,
                 joint_old_log_probs,
                 advantages, returns,
@@ -893,7 +893,7 @@ def _run_ppo_training(
             with torch.no_grad():
                 for vb in dl_validation:
                     (
-                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
@@ -901,7 +901,7 @@ def _run_ppo_training(
                     ) = _prepare_batch_tensors(vb, dev)
                     total_v, policy_loss_v, value_loss_v, wall_loss_v, deal_in_loss_v, bsz, _ = _compute_losses(
                         model,
-                        player_hand_idx, player_called_idx, opp_called_idx, disc_idx, game_tile_indicators_idx, game_state_vec,
+                        player_hand_idx, player_called_idx, opp_called_idx, disc_bincounts, game_tile_indicators_idx, game_state_vec,
                         action_idx, tile_idx,
                         joint_old_log_probs,
                         advantages, returns,
@@ -915,7 +915,7 @@ def _run_ppo_training(
 
                     # Compute current probs
                     a_curr, t_curr, _, _, _ = model(
-                        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_idx.long(), game_tile_indicators_idx.long(), game_state_vec.float(),
+                        player_hand_idx.long(), player_called_idx.long(), opp_called_idx.long(), disc_bincounts.float(), game_tile_indicators_idx.long(), game_state_vec.float(),
                     )
                     
                     val_metrics.update(
@@ -943,7 +943,7 @@ def _run_ppo_training(
                         player_hand_idx_cpu = player_hand_idx.long().to('cpu')
                         player_called_idx_cpu = player_called_idx.long().to('cpu')
                         opp_called_idx_cpu = opp_called_idx.long().to('cpu')
-                        disc_idx_cpu = disc_idx.long().to('cpu')
+                        disc_idx_cpu = disc_bincounts.float().to('cpu')
                         gti_cpu = game_tile_indicators_idx.long().to('cpu')
                         gsv_cpu = game_state_vec.float().to('cpu')
                         a_prev, t_prev, _, _, _ = prev_epoch_model_cpu(

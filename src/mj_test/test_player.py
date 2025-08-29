@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from core.tile import Tile, TileType, Suit, Honor
 from core.action import Discard, Action
 from core.game import GamePerspective, CalledSet
-from core.learn.recording_ac_player import RecordingACPlayer, TENPAI_REWARD, YAKUHAI_REWARD
+from core.learn.recording_ac_player import RecordingACPlayer, TENPAI_REWARD, YAKUHAI_REWARD, CALL_REWARD
 from core.learn.policy_utils import encode_two_head_action
 
 
@@ -154,7 +154,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         move = Pon(tiles=[east, east, east])
         player = _ForcedMovePlayer(move)
         player.react(gp, options=[move])
-        self.assertAlmostEqual(player.experience.rewards[-1], YAKUHAI_REWARD)
+        self.assertAlmostEqual(player.experience.rewards[-1], YAKUHAI_REWARD + CALL_REWARD)
 
     def test_no_yakuhai_reward_on_draw_non_yakuhai_honor(self):
         # Draw third WEST when seat wind EAST and round wind EAST -> WEST is not yakuhai => no reward
@@ -185,7 +185,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         gp = self._base_gp(hand, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None)
         player = _ForcedMovePlayer(move)
         player.react(gp, options=[move])
-        self.assertAlmostEqual(player.experience.rewards[-1], 0.0)
+        self.assertAlmostEqual(player.experience.rewards[-1], CALL_REWARD)
 
     def test_no_yakuhai_reward_on_pon_non_yakuhai(self):
         # Pon WEST when not seat/round wind -> no yakuhai reward
@@ -196,7 +196,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
         gp = self._base_gp(hand, {0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None)
         player = _ForcedMovePlayer(move)
         player.react(gp, options=[move])
-        self.assertAlmostEqual(player.experience.rewards[-1], 0.0)
+        self.assertAlmostEqual(player.experience.rewards[-1], CALL_REWARD)
 
     def test_finalize_rescales_positive_intermediates(self):
         # Build three steps: two positive intermediates (yakuhai, tenpai) and a neutral final step.

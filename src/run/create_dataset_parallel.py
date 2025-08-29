@@ -13,7 +13,7 @@ from typing import Dict, Any, List, Tuple
 
 import numpy as np
 
-from core.tile import tile_flat_index
+from core.tile import tile_flat_index, UNIQUE_TILE_COUNT
 
 # (Removed memory monitoring utilities)
 
@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 # Direct imports for dataset building
 from core.game import MediumJong
+from core.constants import NUM_PLAYERS
 from core.learn.recording_ac_player import RecordingACPlayer, RecordingHeuristicACPlayer, ACPlayer
 from core import constants
 from tqdm import tqdm
@@ -38,10 +39,10 @@ from typing import Optional, Sequence
 # to CLI options (e.g., --use_heuristic).
 def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuristicACPlayer]]:
     # Example: use heuristic players (uncomment to enable)
-    return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
-    '''
+    #return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
+
     temperature = 1
-    net = ACPlayer.from_directory("models/ac_ppo_20250826_154715", temperature=temperature).network
+    net = ACPlayer.from_directory("models/ac_ppo_20250829_011644", temperature=temperature).network
     import torch
     device = torch.device('cpu')
     net = net.to(device)
@@ -50,10 +51,17 @@ def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuri
         RecordingACPlayer(net, temperature=0.4, zero_network_reward=False),
         RecordingACPlayer(net, temperature=0.6, zero_network_reward=False),
         RecordingACPlayer(net, temperature=0.8, zero_network_reward=False),
-        RecordingACPlayer(net, temperature=1, zero_network_reward=False)
+        RecordingACPlayer(net, temperature=1, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.8),
+        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.6),
     ]
-    '''
-    return players
+
+    # Select exactly NUM_PLAYERS unique players and assign public identifiers 5..8
+    chosen = list(np.random.choice(players, NUM_PLAYERS, replace=False))
+    for off, p in enumerate(chosen):
+        p.identifier = 5 + off
+
+    return chosen
 
 def compute_n_step_returns(
     rewards: List[float],
@@ -145,7 +153,10 @@ def build_ac_dataset(
     players = list(prebuilt_players)
     # Use robust tqdm settings so progress continues to render in long runs
     for gi in tqdm(range(max(1, int(games))), dynamic_ncols=True, mininterval=0.1, miniters=1, leave=True):
-        game = MediumJong(players, tile_copies=constants.TILE_COPIES_DEFAULT)
+        # Shuffle seat order each game to avoid positional bias
+        seats = list(players)
+        random.shuffle(seats)
+        game = MediumJong(seats, tile_copies=constants.TILE_COPIES_DEFAULT)
         game.play_round()
 
         # Structured outcome from the game
@@ -153,12 +164,13 @@ def build_ac_dataset(
         game_outcomes_obj.append(outcome.serialize())
         # Compute terminal reward from points delta and assign directly to last reward slot
         pts = game.get_points()
-        for pid, p in enumerate(players):
+        # Iterate in the same seat order used by the game
+        for pid, p in enumerate(seats):
             if len(p.experience) == 0:
                 continue
             terminal_reward = reward_function(pts[pid])
             p.finalize_episode(float(terminal_reward))  # type: ignore[attr-defined]
-        for pid, p in enumerate(players):
+        for pid, p in enumerate(seats):
             T = len(p.experience)
             if T == 0:
                 continue
@@ -208,7 +220,8 @@ def build_ac_dataset(
                 player_joint_log_probs.append(float(p.experience.joint_log_probs[t]))
                 player_game_ids.append(int(gi))
                 player_step_ids.append(int(t))
-                player_actor_ids.append(int(pid))
+                # Use the player's public identifier rather than seat index
+                player_actor_ids.append(int(p.get_identifier()))
                 # Collect deal_in_tiles from the experience buffer (list[Tile]) and convert to flat indices
                 tile_list = p.experience.deal_in_tiles[t] if t < len(p.experience.deal_in_tiles) else []
                 din = [int(tile_flat_index(tt)) for tt in tile_list]
@@ -216,7 +229,7 @@ def build_ac_dataset(
                 if din:
                     mx = max(din)
                     mn = min(din)
-                    assert mn >= 0 and mx <= 37, f"deal_in_tiles out of range: min={mn} max={mx}"
+                    assert mn >= 0 and mx <= UNIQUE_TILE_COUNT, f"deal_in_tiles out of range: min={mn} max={mx}"
                 player_deal_in_tiles.append(din)
 
             # Extend master arrays and scalars
@@ -550,7 +563,6 @@ def create_dataset_parallel(*,
     args.chunk_size = chunk_size
     args.keep_partials = keep_partials
     args.stream_combine = stream_combine
-    
 
     # Starting main process
 
@@ -600,7 +612,6 @@ def create_dataset_parallel(*,
             rank_id, games_in_chunk, seed_for_chunk, cidx = chunk_tasks[next_task_idx]
             # Ensure exactly one reporter at a time; if none alive, make this one the reporter
             reporter = current_reporter if current_reporter is not None else rank_id
-
             p = mp.Process(
                 target=run_chunk_process,
                 args=(

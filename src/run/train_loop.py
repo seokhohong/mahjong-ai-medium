@@ -4,9 +4,15 @@ from __future__ import annotations
 import os
 import time
 import argparse
-from typing import Optional
+from typing import Optional, List
+import numpy as np
+from core.constants import NUM_PLAYERS
 
-from run.create_dataset_parallel import create_dataset_parallel, build_ac_dataset, save_dataset
+from run.create_dataset_parallel import (
+    create_dataset_parallel,
+    build_ac_dataset,
+    save_dataset
+)
 from core.learn.recording_ac_player import (
     RecordingACPlayer,
     RecordingHeuristicACPlayer,
@@ -15,6 +21,28 @@ from core.learn.recording_ac_player import (
 from run.train_model import train_ppo
 import torch
 
+def build_prebuilt_players(model_file) -> Optional[List[RecordingACPlayer | RecordingHeuristicACPlayer]]:
+    # Example: use heuristic players (uncomment to enable)
+    #return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
+
+    temperature = 1
+    net = ACPlayer.from_directory(model_file, temperature=temperature).network
+    import torch
+    device = torch.device('cpu')
+    net = net.to(device)
+
+    players = [
+        RecordingACPlayer(net, temperature=0.4, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.6, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=1, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.8),
+        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.6),
+    ]
+    for i, player in enumerate(players):
+        player.identifier = i
+
+    return np.random.choice(players, NUM_PLAYERS)
 
 def _default_out_name(prefix: str) -> str:
     ts = time.strftime('%Y%m%d_%H%M%S')
@@ -90,28 +118,7 @@ def run_train_loop(
             )
         else:
             # Build prebuilt players locally for serial dataset generation
-            prebuilt_players = None
-            try:
-                if current_model_dir is not None:
-                    # Load network from the current model directory
-                    net = ACPlayer.from_directory(current_model_dir, temperature=temperature).network
-                    import torch
-                    device = torch.device('cpu') if (device is None) else torch.device(device)
-                    net = net.to(device)
-                    prebuilt_players = [
-                        RecordingACPlayer(net, temperature=max(0.05, temperature * 0.4), zero_network_reward=False),
-                        RecordingACPlayer(net, temperature=max(0.05, temperature * 0.6), zero_network_reward=False),
-                        RecordingACPlayer(net, temperature=max(0.05, temperature * 0.8), zero_network_reward=False),
-                        RecordingACPlayer(net, temperature=max(0.05, temperature * 1), zero_network_reward=False),
-                    ]
-                else:
-                    # Fall back to heuristic players when no model is provided
-                    prebuilt_players = [RecordingHeuristicACPlayer(random_exploration=max(0.0, float(temperature))) for _ in range(4)]
-            except Exception as e:
-                # As a safeguard, default to heuristic players if model loading fails
-                print(f"[Gen {gen}] Warning: failed to load model players: {e}. Falling back to heuristic players.")
-                prebuilt_players = [RecordingHeuristicACPlayer(random_exploration=max(0.0, float(temperature))) for _ in range(4)]
-
+            prebuilt_players = build_prebuilt_players(current_model_dir)
             built = build_ac_dataset(
                 games=games_per_gen,
                 seed=(None if seed is None else int(seed) + gen),
@@ -132,7 +139,6 @@ def run_train_loop(
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
-            value_lr=value_lr,
             epsilon=epsilon,
             value_coeff=value_coeff,
             entropy_coeff=entropy_coeff,

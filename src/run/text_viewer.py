@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import argparse
-from typing import List, Any
+from typing import List, Any, Optional
 
 # Ensure src on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -56,8 +56,8 @@ def _fmt_called_sets(csets) -> str:
 
 
 class LoggingPlayer(Player):
-    def __init__(self, inner: Player):
-        super().__init__()
+    def __init__(self, inner: Player, identifier: Optional[int] = None):
+        super().__init__(identifier=identifier)
         self.inner = inner
         self._abs_player_id: Any = '?'
 

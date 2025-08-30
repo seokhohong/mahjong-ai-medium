@@ -36,8 +36,8 @@ from typing import Optional, Sequence
 # Defaults for asymmetric discounting
 # =========================
 # These are defaults only; actual values are configurable via function params / CLI
-POSITIVE_GAMMA_DEFAULT: float = 0.99
-POSITIVE_N_STEP_DEFAULT: int = 20
+POSITIVE_GAMMA_DEFAULT: float = 0.97
+POSITIVE_N_STEP_DEFAULT: int = 10
 NEGATIVE_GAMMA_DEFAULT: float = 0.7
 NEGATIVE_N_STEP_DEFAULT: int = 3
 # Edit this factory to define a fixed set of players to use for dataset creation.
@@ -48,19 +48,19 @@ def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuri
     #return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
 
     temperature = 1
-    net = ACPlayer.from_directory("models/ac_ppo_20250829_171423", temperature=temperature).network
+    net = ACPlayer.from_directory("models/ac_ppo_20250829_192648", temperature=temperature).network
     import torch
     device = torch.device('cpu')
     net = net.to(device)
     #players = [RecordingHeuristicACPlayer(random_exploration=0.1)] * 4
 
     players = [
-        RecordingACPlayer(net, temperature=0.4, zero_network_reward=False),
         RecordingACPlayer(net, temperature=0.6, zero_network_reward=False),
         RecordingACPlayer(net, temperature=0.8, zero_network_reward=False),
-        RecordingACPlayer(net, temperature=1, zero_network_reward=False),
-        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.8),
-        RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.6),
+        RecordingACPlayer(net, temperature=1.0, zero_network_reward=False),
+        RecordingACPlayer(net, temperature=1.2, zero_network_reward=False),
+        #RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.8),
+        #RecordingACPlayer(net, temperature=0.8, zero_network_reward=False, exploration_consumption_factor=0.6),
     ]
 
     # Select exactly NUM_PLAYERS unique players and assign public identifiers 5..8

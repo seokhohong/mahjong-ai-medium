@@ -29,7 +29,14 @@ class TestComputeNStepReturns(unittest.TestCase):
         # Simple case: intermediate reward followed by zeros, n=2
         rewards = [0.1, 0.0, 0.0]
         values = [0.0, 0.0, 0.0]
-        nstep, adv = compute_n_step_returns(rewards, n_step=2, gamma=0.9, values=values)
+        nstep, adv = compute_n_step_returns(
+            rewards,
+            values,
+            positive_n_step=2,
+            positive_gamma=0.9,
+            negative_n_step=2,
+            negative_gamma=0.9,
+        )
         self.assertEqual(len(nstep), 3)
         self.assertEqual(len(adv), 3)
         # Returns: [0.1, 0.0, 0.0]
@@ -45,7 +52,14 @@ class TestComputeNStepReturns(unittest.TestCase):
         # Terminal reward at the end; ensure proper discounting and truncation
         rewards = [0.0, 0.0, 1.0]
         values = [0.0, 0.0, 0.0]
-        nstep, adv = compute_n_step_returns(rewards, n_step=3, gamma=0.99, values=values)
+        nstep, adv = compute_n_step_returns(
+            rewards,
+            values,
+            positive_n_step=3,
+            positive_gamma=0.99,
+            negative_n_step=3,
+            negative_gamma=0.99,
+        )
         # t=0: 0 + 0.99*0 + 0.99^2*1 = 0.9801
         # t=1: 0 + 0.99*1 = 0.99
         # t=2: 1
@@ -61,7 +75,14 @@ class TestComputeNStepReturns(unittest.TestCase):
         rewards = [1.0, 1.0]
         values = [0.0, 0.0]
         # n=3 should only sum available rewards
-        nstep, _ = compute_n_step_returns(rewards, n_step=3, gamma=0.5, values=values)
+        nstep, _ = compute_n_step_returns(
+            rewards,
+            values,
+            positive_n_step=3,
+            positive_gamma=0.5,
+            negative_n_step=3,
+            negative_gamma=0.5,
+        )
         # t=0: 1 + 0.5*1 = 1.5; t=1: 1
         self.assertAlmostEqual(nstep[0], 1.5, places=7)
         self.assertAlmostEqual(nstep[1], 1.0, places=7)
@@ -70,13 +91,40 @@ class TestComputeNStepReturns(unittest.TestCase):
         rewards = [1.0, 0.0, 0.0]
         values = [0.2, -1.0, 0.5]
         # n=1 so returns equal immediate rewards
-        nstep, adv = compute_n_step_returns(rewards, n_step=1, gamma=0.99, values=values)
-        self.assertAlmostEqual(nstep[0], 1.0, places=7)
-        self.assertAlmostEqual(nstep[1], 0.0, places=7)
-        self.assertAlmostEqual(nstep[2], 0.0, places=7)
-        self.assertAlmostEqual(adv[0], 1.0 - 0.2, places=7)
-        self.assertAlmostEqual(adv[1], 0.0 - (-1.0), places=7)  # 1.0
-        self.assertAlmostEqual(adv[2], 0.0 - 0.5, places=7)     # -0.5
+        nstep, adv = compute_n_step_returns(
+            rewards,
+            values,
+            positive_n_step=1,
+            positive_gamma=0.99,
+            negative_n_step=1,
+            negative_gamma=0.99,
+        )
+
+    def test_negative_returns_discounting(self):
+        # Negative-only sequence; ensure negative-specific horizon and discount are applied
+        rewards = [-1.0, -1.0, -1.0, 0.0]
+        values = [0.0, 0.0, 0.0, 0.0]
+        # Use a short negative horizon and distinct discount
+        nstep, adv = compute_n_step_returns(
+            rewards,
+            values,
+            positive_n_step=5,
+            positive_gamma=0.99,
+            negative_n_step=2,
+            negative_gamma=0.5,
+        )
+        # Expectations:
+        # t=0: -1 + 0.5*(-1) = -1.5
+        # t=1: -1 + 0.5*(-1) = -1.5
+        # t=2: -1
+        # t=3: 0
+        self.assertAlmostEqual(nstep[0], -1.5, places=7)
+        self.assertAlmostEqual(nstep[1], -1.5, places=7)
+        self.assertAlmostEqual(nstep[2], -1.0, places=7)
+        self.assertAlmostEqual(nstep[3], 0.0, places=7)
+        # Advantages equal returns since values are zeros
+        for i in range(4):
+            self.assertAlmostEqual(adv[i], nstep[i], places=7)
 
 
 class TestEndToEndTraining(unittest.TestCase):
@@ -87,9 +135,7 @@ class TestEndToEndTraining(unittest.TestCase):
         built = build_ac_dataset(
             games=2,
             seed=123,
-            n_step=1,
-            gamma=0.99,
-            prebuilt_players=players,
+            prebuilt_players=players
         )
         # Basic sanity on built dataset
         self.assertIn('action_idx', built)

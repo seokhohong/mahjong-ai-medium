@@ -842,9 +842,9 @@ class GamePerspective:
     def __init__(self, player_hand: List[Tile], remaining_tiles: int, reactable_tile: Optional[Tile],
                  owner_of_reactable_tile: Optional[int], called_sets: Dict[int, List[CalledSet]],
                  player_discards: Dict[int, List[Tile]], called_discards: Dict[int, List[int]],
+                 last_discards: Dict[str, List[Tile]],
                  newly_drawn_tile: Optional[Tile], seat_winds: Dict[int, Honor], round_wind: Honor,
                  dora_indicators: List[Tile], riichi_declaration_tile: Dict[int, int],
-                 # Oracle fields used only for auxiliary tasks. Leaking would be bad...!
                  deal_in_tiles: Optional[List[Tile]] = None,
                  wall_count: Optional[List[int] | np.ndarray] = None) -> None:
         self.player_hand = sorted(list(player_hand), key=_tile_sort_key)
@@ -861,7 +861,8 @@ class GamePerspective:
         self.round_wind = round_wind
         self.dora_indicators = list(dora_indicators)
         self.riichi_declaration_tile = dict(riichi_declaration_tile)
-
+        # Store recent discards keyed by public player identifiers (strings)
+        self.last_discards: Dict[str, List[Tile]] = last_discards
         # Aka-insensitive list of tiles that would deal in if discarded by the perspective player
         self.deal_in_tiles: List[Tile] = list(deal_in_tiles or [])
         # Optional remaining-wall counts by flat tile index (0..UNIQUE_TILE_COUNT-1)
@@ -1331,6 +1332,10 @@ class MediumJong:
         # Track waits for each player when in tenpai
         self._waits: Dict[int, List[Tile]] = {i: [] for i in range(4)}
         self.player_discards: Dict[int, List[Tile]] = {i: [] for i in range(4)}
+        # Secondary discard log for efficient queries: (tile, player_id, turn_index)
+        # turn_index is a global discard ordinal starting at 0 and increments per discard
+        self.discard_events: List[Tuple[Tile, int, int]] = []
+        self._discard_seq: int = 0
         # Track which discard indices were called by other players for each player
         self.called_discards: Dict[int, List[int]] = {i: [] for i in range(4)}
         self.current_player_idx: int = 0
@@ -1480,6 +1485,9 @@ class MediumJong:
                 # Clip at 4 just in case, but counts in wall can be more than 4 across all copies; int8 is fine
                 wc[idx] = np.int8(int(wc[idx]) + 1)
 
+        # Compute recent discards per public id (most-recent-first up to N)
+        #recent_discards_pub: Dict[str, List[Tile]] = self.last_n_discards_per_player(n=3)
+
         return GamePerspective(
             player_hand=self._player_hands[player_id],
             remaining_tiles=len(self.tiles),
@@ -1488,6 +1496,7 @@ class MediumJong:
             called_sets=called_sets,
             player_discards=player_discards,
             called_discards=called_discards,
+            last_discards={}, # diasbled for now
             newly_drawn_tile=self.last_drawn_tile,
             seat_winds=seat_winds,
             round_wind=self.round_wind,
@@ -1547,6 +1556,9 @@ class MediumJong:
             self.cumulative_points[actor_id] -= 1000
             self._player_hands[actor_id].remove(move.tile)
             self.player_discards[actor_id].append(move.tile)
+            # Log discard event (riichi declaration is a discard)
+            self.discard_events.append((move.tile, actor_id, self._discard_seq))
+            self._discard_seq += 1
             # Record the discard order index for this player's riichi declaration
             self.riichi_declaration_tile[actor_id] = len(self.player_discards[actor_id]) - 1
             self._reactable_tile = move.tile
@@ -1556,6 +1568,9 @@ class MediumJong:
         if isinstance(move, Discard):
             self._player_hands[actor_id].remove(move.tile)
             self.player_discards[actor_id].append(move.tile)
+            # Log discard event
+            self.discard_events.append((move.tile, actor_id, self._discard_seq))
+            self._discard_seq += 1
             self._reactable_tile = move.tile
             self._owner_of_reactable_tile = actor_id
             # Discard after riichi cancels ippatsu for this player
@@ -1984,6 +1999,39 @@ class MediumJong:
         if self.game_outcome is None:
             self.game_outcome = self._build_game_outcome()
         return self.game_outcome
+
+    def last_n_discards_per_player(self, n: int) -> Dict[str, List[Tile]]:
+        """Return, for each player's public identifier, up to the last n tiles they discarded.
+
+        Keys are public player identifiers (as strings), not seat indices. Values are
+        most-recent-first lists of `Tile`.
+        """
+        # Build mapping seat -> public id (string). Prefer raw attribute to allow string IDs.
+        pub_ids: Dict[int, str] = {}
+        for i in range(4):
+            player = self.players[i]
+            raw = getattr(player, 'identifier', None)
+            if raw is None:
+                pub_ids[i] = str(player.get_identifier())
+            else:
+                pub_ids[i] = str(raw)
+        if n <= 0:
+            return {pub_ids[i]: [] for i in range(4)}
+        out_seat: Dict[int, List[Tile]] = {i: [] for i in range(4)}
+        remaining: Dict[int, int] = {i: n for i in range(4)}
+        needed_total = 4 * n
+        for tile, pid, _idx in reversed(self.discard_events):
+            if remaining[pid] > 0:
+                out_seat[pid].append(tile)
+                remaining[pid] -= 1
+                needed_total -= 1
+                if needed_total == 0:
+                    break
+            if all(v == 0 for v in remaining.values()):
+                break
+        # Convert to public-id keyed dict
+        out_pub: Dict[str, List[Tile]] = {pub_ids[i]: out_seat[i] for i in range(4)}
+        return out_pub
 
     # Scoring API
     def _score_hand(self, winner_id: int, win_by_tsumo: bool, winning_tile: Optional[Tile] = None) -> Dict[str, Any]:

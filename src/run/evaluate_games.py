@@ -20,11 +20,11 @@ from core.learn.ac_constants import ACTION_HEAD_ORDER
 DATASET_PATHS = [
     "training_data/ac_parallel_20250828_203723.npz",
     "training_data/ac_parallel_20250828_201525.npz",
-    'training_data/ac_gen3_20250829_081321.npz'
+    'training_data/ac_parallel_20250829_153655.npz'
 ]
 
 
-def _infer_per_game_riichi_and_open_calls(npz: np.lib.npyio.NpzFile) -> Tuple[Dict[int, Set[int]], Dict[int, Set[int]]]:
+def _infer_per_game_riichi_and_open_calls(npz: np.lib.npyio.NpzFile) -> Tuple[Dict[int, Set[str]], Dict[int, Set[str]]]:
     """Return (riichi_by_game, open_call_by_game) as sets of player ids per game id.
 
     - riichi: any step where actor took 'riichi'.
@@ -43,12 +43,13 @@ def _infer_per_game_riichi_and_open_calls(npz: np.lib.npyio.NpzFile) -> Tuple[Di
     reactable_tile = np.asarray(npz.get("reactable_tile", []))
     owner_of_reactable_tile = np.asarray(npz.get("owner_of_reactable_tile", []))
 
-    riichi_by_game: Dict[int, Set[int]] = {}
-    open_by_game: Dict[int, Set[int]] = {}
+    riichi_by_game: Dict[int, Set[str]] = {}
+    open_by_game: Dict[int, Set[str]] = {}
 
     for i in range(len(action_idx)):
         gid = int(game_ids[i])
-        pid = int(actor_ids[i])
+        # Public player identifier as string
+        pid = str(actor_ids[i])
         a_idx = int(action_idx[i])
         if a_idx < 0 or a_idx >= len(ACTION_HEAD_ORDER):
             continue
@@ -65,16 +66,17 @@ def _infer_per_game_riichi_and_open_calls(npz: np.lib.npyio.NpzFile) -> Tuple[Di
         if name == "kan":
             try:
                 rt = int(reactable_tile[i]) if reactable_tile.size == action_idx.size else -1
-                owner = int(owner_of_reactable_tile[i]) if owner_of_reactable_tile.size == action_idx.size else -1
+                owner_raw = owner_of_reactable_tile[i] if owner_of_reactable_tile.size == action_idx.size else -1
+                owner = str(owner_raw)
             except Exception:
-                rt, owner = -1, -1
+                rt, owner = -1, "-1"
             if rt != -1 and owner != pid:
                 open_by_game.setdefault(gid, set()).add(pid)
 
     return riichi_by_game, open_by_game
 
 
-def _actors_by_game(npz: np.lib.npyio.NpzFile) -> Dict[int, Set[int]]:
+def _actors_by_game(npz: np.lib.npyio.NpzFile) -> Dict[int, Set[str]]:
     """Collect the set of actor identifiers observed per game id.
 
     Uses `actor_ids` (public identifiers) grouped by `game_ids`.
@@ -84,15 +86,15 @@ def _actors_by_game(npz: np.lib.npyio.NpzFile) -> Dict[int, Set[int]]:
         return {}
     actors = np.asarray(npz["actor_ids"])  # [steps]
     gids = np.asarray(npz["game_ids"])     # [steps]
-    by_game: Dict[int, Set[int]] = {}
+    by_game: Dict[int, Set[str]] = {}
     for i in range(len(actors)):
         gid = int(gids[i])
-        pid = int(actors[i])
+        pid = str(actors[i])
         by_game.setdefault(gid, set()).add(pid)
     return by_game
 
 
-def _aggregate_from_file(path: str, totals: Dict[int, Dict[str, float]]) -> Tuple[int, int]:
+def _aggregate_from_file(path: str, totals: Dict[str, Dict[str, float]]) -> Tuple[int, int]:
     """Aggregate stats from one NPZ file into totals per public player identifier.
 
     Returns (games_in_file, draw_games_in_file) for additional reference.
@@ -113,11 +115,11 @@ def _aggregate_from_file(path: str, totals: Dict[int, Dict[str, float]]) -> Tupl
         for local_gid, raw in enumerate(outcomes_raw):
             go = GameOutcome.deserialize(raw)
 
-            # Map seats -> public identifiers from the outcome
-            seat_to_pub = {seat: po.player_id for seat, po in go.players.items() if po is not None}
+            # Map seats -> public identifiers as strings from the outcome
+            seat_to_pub = {seat: str(po.player_id) for seat, po in go.players.items() if po is not None}
 
             # Determine which pids to credit participation for this game (public IDs)
-            pids_in_game: Set[int] = set(seat_to_pub.values())
+            pids_in_game: Set[str] = set(seat_to_pub.values())
             pids_in_game |= set(riichi_by_game.get(local_gid, set()))
             pids_in_game |= set(open_by_game.get(local_gid, set()))
             pids_in_game |= set(actors_by_game.get(local_gid, set()))
@@ -204,7 +206,7 @@ def _safe_avg(total: float, count: float) -> float:
     return (total / count) if count > 0 else 0.0
 
 
-def _print_totals_table(title: str, totals: Dict[int, Dict[str, float]]) -> None:
+def _print_totals_table(title: str, totals: Dict[str, Dict[str, float]]) -> None:
     print(f"\n{title}\n")
     headers = [
         "PlayerID",
@@ -242,7 +244,7 @@ def _print_totals_table(title: str, totals: Dict[int, Dict[str, float]]) -> None
 
 
 def main() -> int:
-    overall: Dict[int, Dict[str, float]] = {}
+    overall: Dict[str, Dict[str, float]] = {}
     total_games_all = 0
     total_draws_all = 0
 
@@ -266,7 +268,7 @@ def main() -> int:
         if not os.path.isfile(p):
             print(f"Warning: not a file, skipping: {p}")
             continue
-        file_totals: Dict[int, Dict[str, float]] = {}
+        file_totals: Dict[str, Dict[str, float]] = {}
         g, d = _aggregate_from_file(p, file_totals)
         total_games_all += g
         total_draws_all += d

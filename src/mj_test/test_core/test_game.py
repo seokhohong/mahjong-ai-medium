@@ -3,7 +3,7 @@ import unittest
 import sys
 import os
 
-from mj_test.test_utils import _make_tenpai_hand, _make_noten_hand
+from mj_test.test_core.test_utils import _make_tenpai_hand, _make_noten_hand
 
 # Add this test directory to Python path so we can import test_utils
 sys.path.insert(0, os.path.dirname(__file__))

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 # Direct imports for dataset building
 from core.game import MediumJong
+from core.variation import create_variation
 from core.constants import NUM_PLAYERS
 from core.learn.recording_ac_player import RecordingACPlayer, RecordingHeuristicACPlayer, ACPlayer
 from core import constants
@@ -32,8 +33,13 @@ from tqdm import tqdm
 from typing import Optional, Sequence
 
 # =========================
-# In-code configuration
+# Defaults for asymmetric discounting
 # =========================
+# These are defaults only; actual values are configurable via function params / CLI
+POSITIVE_GAMMA_DEFAULT: float = 0.99
+POSITIVE_N_STEP_DEFAULT: int = 20
+NEGATIVE_GAMMA_DEFAULT: float = 0.7
+NEGATIVE_N_STEP_DEFAULT: int = 3
 # Edit this factory to define a fixed set of players to use for dataset creation.
 # Return a list of 4 Recording* players, or return None to disable and fall back
 # to CLI options (e.g., --use_heuristic).
@@ -42,10 +48,11 @@ def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuri
     #return [RecordingHeuristicACPlayer(random_exploration=0.1) for _ in range(4)]
 
     temperature = 1
-    net = ACPlayer.from_directory("models/ac_ppo_20250829_011644", temperature=temperature).network
+    net = ACPlayer.from_directory("models/ac_ppo_20250829_171423", temperature=temperature).network
     import torch
     device = torch.device('cpu')
     net = net.to(device)
+    #players = [RecordingHeuristicACPlayer(random_exploration=0.1)] * 4
 
     players = [
         RecordingACPlayer(net, temperature=0.4, zero_network_reward=False),
@@ -59,35 +66,49 @@ def build_prebuilt_players() -> Optional[List[RecordingACPlayer | RecordingHeuri
     # Select exactly NUM_PLAYERS unique players and assign public identifiers 5..8
     chosen = list(np.random.choice(players, NUM_PLAYERS, replace=False))
     for off, p in enumerate(chosen):
-        p.identifier = 5 + off
+        p.identifier = "Player_" + str(off)
 
     return chosen
 
 def compute_n_step_returns(
     rewards: List[float],
-    n_step: int,
-    gamma: float,
     values: List[float],
+    positive_n_step: int = POSITIVE_N_STEP_DEFAULT,
+    positive_gamma: float = POSITIVE_GAMMA_DEFAULT,
+    negative_n_step: int = NEGATIVE_N_STEP_DEFAULT,
+    negative_gamma: float = NEGATIVE_GAMMA_DEFAULT,
 ) -> Tuple[List[float], List[float]]:
-    """Compute n-step discounted returns and advantages for a single trajectory.
+    """Compute discounted returns and advantages with asymmetric discounting.
 
-    Returns a tuple (returns, advantages), where advantages = returns - values_t.
-
-    G_t = sum_{k=0..n-1} gamma^k * r_{t+k}, truncated at episode end.
+    For each t: G_t = sum_k (prod_{j=t}^{t+k-1} gamma_{j}) * r_{t+k},
+    where gamma_j is positive_gamma if r_{j} >= 0 else negative_gamma,
+    and the horizon for accumulating a term r_{t+k} respects the sign-specific
+    n-step: positive_n_step for r_{t+k} >= 0 else negative_n_step.
     """
     T = len(rewards)
-    n = max(1, int(n_step))
-    g = float(gamma)
     returns: List[float] = [0.0] * T
+    pos_n = int(max(1, positive_n_step))
+    neg_n = int(max(1, negative_n_step))
     for t in range(T):
         acc = 0.0
-        powg = 1.0
-        for k in range(n):
+        # Compute up to the larger of the two horizons, but break per-term by sign horizon
+        max_horizon = max(pos_n, neg_n)
+        cum_discount = 1.0
+        for k in range(max_horizon):
             idx = t + k
             if idx >= T:
                 break
-            acc += powg * float(rewards[idx])
-            powg *= g
+            r = float(rewards[idx])
+            if r >= 0.0:
+                if k >= pos_n:
+                    break
+                acc += cum_discount * r
+                cum_discount *= float(positive_gamma)
+            else:
+                if k >= neg_n:
+                    break
+                acc += cum_discount * r
+                cum_discount *= float(negative_gamma)
         returns[t] = acc
     advantages = [float(returns[t]) - float(values[t]) for t in range(T)]
     return returns, advantages
@@ -98,9 +119,12 @@ def reward_function(points_delta):
 def build_ac_dataset(
     games: int,
     seed: int | None = None,
-    n_step: int = 3,
-    gamma: float = 0.99,
     prebuilt_players: Sequence[RecordingACPlayer | RecordingHeuristicACPlayer] | None = None,
+    variation_rate: float = 0.0,
+    positive_n_step: int = POSITIVE_N_STEP_DEFAULT,
+    positive_gamma: float = POSITIVE_GAMMA_DEFAULT,
+    negative_n_step: int = NEGATIVE_N_STEP_DEFAULT,
+    negative_gamma: float = NEGATIVE_GAMMA_DEFAULT,
 ) -> dict:
     import random
     if seed is not None:
@@ -138,12 +162,14 @@ def build_ac_dataset(
     joint_log_probs: List[float] = []
     # deal_in_tiles: per-sample variable-length list of flat tile indices
     all_deal_in_tiles: List[List[int]] = []
+    # last_discards: per-sample dict[str, List[int]] (encoded by feature_engineering)
+    all_last_discards: List[dict] = []
     # Scalars per-sample
     # scalar lists are in master_scalars
     # Two-head policy stores separate log-probs for each head
     all_game_ids: List[int] = []
     all_step_ids: List[int] = []
-    all_actor_ids: List[int] = []
+    all_actor_ids: List[str] = []
     # Per-game metadata (structured only)
     game_outcomes_obj: List[dict] = []  # serialized GameOutcome per game
 
@@ -156,7 +182,11 @@ def build_ac_dataset(
         # Shuffle seat order each game to avoid positional bias
         seats = list(players)
         random.shuffle(seats)
-        game = MediumJong(seats, tile_copies=constants.TILE_COPIES_DEFAULT)
+        # Switch to a variation with probability variation_rate (%)
+        if random.random() < variation_rate:
+            game = create_variation(seats)
+        else:
+            game = MediumJong(seats, tile_copies=constants.TILE_COPIES_DEFAULT)
         game.play_round()
 
         # Structured outcome from the game
@@ -177,7 +207,15 @@ def build_ac_dataset(
             rewards = list(p.experience.rewards)
             # Use stored values from the experience buffer
             values: List[float] = [float(v) for v in p.experience.values]
-            nstep, adv = compute_n_step_returns(rewards, n_step, gamma, values)
+            # Compute asymmetric n-step returns with provided configuration
+            nstep, adv = compute_n_step_returns(
+                rewards,
+                values,
+                positive_n_step=positive_n_step,
+                positive_gamma=positive_gamma,
+                negative_n_step=negative_n_step,
+                negative_gamma=negative_gamma,
+            )
 
             # Collect per-player episode in batches via dicts
             player_arrays: Dict[str, List[np.ndarray]] = {k: [] for k, _ in array_fields}
@@ -188,9 +226,10 @@ def build_ac_dataset(
             player_advantages = []
             player_joint_log_probs = []
             player_deal_in_tiles: List[List[int]] = []
+            player_last_discards: List[dict] = []
             player_game_ids = []
             player_step_ids = []
-            player_actor_ids = []
+            player_actor_ids: List[str] = []
 
             for t in range(T):
                 gs = p.experience.states[t]
@@ -221,7 +260,8 @@ def build_ac_dataset(
                 player_game_ids.append(int(gi))
                 player_step_ids.append(int(t))
                 # Use the player's public identifier rather than seat index
-                player_actor_ids.append(int(p.get_identifier()))
+                # Store as string to standardize public player IDs across the pipeline
+                player_actor_ids.append(str(p.get_identifier()))
                 # Collect deal_in_tiles from the experience buffer (list[Tile]) and convert to flat indices
                 tile_list = p.experience.deal_in_tiles[t] if t < len(p.experience.deal_in_tiles) else []
                 din = [int(tile_flat_index(tt)) for tt in tile_list]
@@ -231,6 +271,8 @@ def build_ac_dataset(
                     mn = min(din)
                     assert mn >= 0 and mx <= UNIQUE_TILE_COUNT, f"deal_in_tiles out of range: min={mn} max={mx}"
                 player_deal_in_tiles.append(din)
+                # Collect last_discards (already encoded as dict[str, List[int]])
+                player_last_discards.append(dict(gs.get('last_discards', {})))
 
             # Extend master arrays and scalars
             for k in master_arrays.keys():
@@ -243,6 +285,7 @@ def build_ac_dataset(
             all_advantages.extend(player_advantages)
             joint_log_probs.extend(player_joint_log_probs)
             all_deal_in_tiles.extend(player_deal_in_tiles)
+            all_last_discards.extend(player_last_discards)
             all_game_ids.extend(player_game_ids)
             all_step_ids.extend(player_step_ids)
             all_actor_ids.extend(player_actor_ids)
@@ -262,10 +305,13 @@ def build_ac_dataset(
     built['joint_log_probs'] = np.asarray(joint_log_probs, dtype=np.float32)
     built['game_ids'] = np.asarray(all_game_ids, dtype=np.int16)
     built['step_ids'] = np.asarray(all_step_ids, dtype=np.int16)
-    built['actor_ids'] = np.asarray(all_actor_ids, dtype=np.int8)
+    # Store actor_ids as strings (unicode) for clarity and robustness
+    built['actor_ids'] = np.asarray(all_actor_ids, dtype=np.str_)
     built['game_outcomes_obj'] = np.asarray(game_outcomes_obj, dtype=object)
     # Save deal_in_tiles as an object array (variable-length per sample)
     built['deal_in_tiles'] = np.asarray(all_deal_in_tiles, dtype=object)
+    # Save last_discards as an object array (dict per sample)
+    built['last_discards'] = np.asarray(all_last_discards, dtype=object)
     return built
 
 def save_dataset(built, out_path):
@@ -311,9 +357,13 @@ def _aggressive_cleanup():
 
 def _worker_build_with_cleanup(games: int,
                                seed: int | None,
-                               n_step: int,
-                               gamma: float,
-                               silence_io: bool) -> Dict[str, Any]:
+                               silence_io: bool,
+                               *,
+                               variation_rate: float,
+                               positive_n_step: int,
+                               positive_gamma: float,
+                               negative_n_step: int,
+                               negative_gamma: float) -> Dict[str, Any]:
     """Build dataset with aggressive cleanup"""
 
     # Construct prebuilt players inside the process (avoids pickling issues)
@@ -324,17 +374,23 @@ def _worker_build_with_cleanup(games: int,
             result = build_ac_dataset(
                 games=games,
                 seed=seed,
-                n_step=n_step,
-                gamma=gamma,
                 prebuilt_players=prebuilt_players,
+                variation_rate=variation_rate,
+                positive_n_step=positive_n_step,
+                positive_gamma=positive_gamma,
+                negative_n_step=negative_n_step,
+                negative_gamma=negative_gamma,
             )
     else:
         result = build_ac_dataset(
             games=games,
             seed=seed,
-            n_step=n_step,
-            gamma=gamma,
             prebuilt_players=prebuilt_players,
+            variation_rate=variation_rate,
+            positive_n_step=positive_n_step,
+            positive_gamma=positive_gamma,
+            negative_n_step=negative_n_step,
+            negative_gamma=negative_gamma,
         )
 
     # Aggressive cleanup after building
@@ -379,7 +435,8 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         'hand_idx','disc_idx','called_idx','seat_winds','riichi_declarations',
         'dora_indicator_tiles','legal_action_mask','called_discards','round_wind',
         'remaining_tiles','owner_of_reactable_tile','reactable_tile','newly_drawn_tile', 'wall_count',
-        'deal_in_tiles'
+        'deal_in_tiles','last_discards',
+        'actor_ids',
     ]
     collected_lists: Dict[str, List[Any]] = {k: [] for k in per_sample_fields}
     # Per-game outcomes are collected separately
@@ -393,7 +450,7 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
     joint_log_probs = np.empty(total_samples, dtype=np.float32)
     game_ids = np.empty(total_samples, dtype=np.int16)
     step_ids = np.empty(total_samples, dtype=np.int16)
-    actor_ids = np.empty(total_samples, dtype=np.int8)
+    # actor_ids are strings; collect via lists instead of numeric preallocation
 
     # Second pass: load and combine data
     sample_offset = 0
@@ -420,7 +477,6 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
             gid = data['game_ids'] + offsets[i]
             game_ids[sample_offset:sample_offset + chunk_size] = gid
             step_ids[sample_offset:sample_offset + chunk_size] = data['step_ids']
-            actor_ids[sample_offset:sample_offset + chunk_size] = data['actor_ids']
 
             # Collect per-sample arrays
             for k in per_sample_fields:
@@ -450,13 +506,14 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         'joint_log_probs': joint_log_probs,
         'game_ids': game_ids,
         'step_ids': step_ids,
-        'actor_ids': actor_ids,
     }
     # Cast per-sample arrays to appropriate dtypes
     dtypes_map = {
         'wall_count': np.int8,
         # deal_in_tiles is variable-length; keep as object in the combined output
         'deal_in_tiles': object,
+        'last_discards': object,
+        'actor_ids': np.str_,
         'hand_idx': np.int8,
         'disc_idx': np.int8,
         'called_idx': np.int8,
@@ -472,8 +529,10 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
         'newly_drawn_tile': np.int8,
     }
     for k in per_sample_fields:
-        if k == 'deal_in_tiles':
+        if k in ('deal_in_tiles', 'last_discards'):
             combined[k] = np.array(collected_lists[k], dtype=object)
+        elif k == 'actor_ids':
+            combined[k] = np.array([str(x) for x in collected_lists[k]], dtype=np.str_)
         else:
             combined[k] = np.array(collected_lists[k], dtype=dtypes_map[k])
     # Add per-game outcomes (concatenate across files)
@@ -490,12 +549,16 @@ def _stream_combine_results(file_paths: List[str], output_path: str) -> None:
 def run_chunk_process(rank: int,
                       games_for_chunk: int,
                       seed: int | None,
-                      n_step: int,
-                      gamma: float,
                       reporter_rank: int,
                       queue: mp.Queue,
                       run_id: str,
-                      chunk_index: int) -> None:
+                      chunk_index: int,
+                      *,
+                      variation_rate: float,
+                      positive_n_step: int,
+                      positive_gamma: float,
+                      negative_n_step: int,
+                      negative_gamma: float) -> None:
     """Run a single chunk in its own process and exit.
 
     This isolates Python memory arenas so RSS drops once the process terminates.
@@ -513,9 +576,12 @@ def run_chunk_process(rank: int,
     built = _worker_build_with_cleanup(
         games=int(max(1, games_for_chunk)),
         seed=seed,
-        n_step=int(n_step),
-        gamma=float(gamma),
         silence_io=silence,
+        variation_rate=variation_rate,
+        positive_n_step=positive_n_step,
+        positive_gamma=positive_gamma,
+        negative_n_step=negative_n_step,
+        negative_gamma=negative_gamma,
     )
 
     out_path = os.path.join(tmp_dir, f'chunk_{chunk_index:06d}.npz')
@@ -535,12 +601,15 @@ def create_dataset_parallel(*,
                             games: int,
                             num_processes: int = 1,
                             seed: int | None = None,
-                            n_step: int = 3,
-                            gamma: float = 0.99,
                             out: str | None = None,
                             chunk_size: int = 250,
                             keep_partials: bool = False,
-                            stream_combine: bool = True) -> str:
+                            stream_combine: bool = True,
+                            variation_rate: float = 0.0,
+                            positive_n_step: int = POSITIVE_N_STEP_DEFAULT,
+                            positive_gamma: float = POSITIVE_GAMMA_DEFAULT,
+                            negative_n_step: int = NEGATIVE_N_STEP_DEFAULT,
+                            negative_gamma: float = NEGATIVE_GAMMA_DEFAULT) -> str:
     """Programmatic API to build a dataset in parallel and save it to disk.
 
     Returns the output .npz path.
@@ -557,12 +626,16 @@ def create_dataset_parallel(*,
     args.games = games
     args.num_processes = num_processes
     args.seed = seed
-    args.n_step = n_step
-    args.gamma = gamma
+    # Asymmetric discounting configuration
     args.out = out
     args.chunk_size = chunk_size
     args.keep_partials = keep_partials
     args.stream_combine = stream_combine
+    args.variation_rate = float(variation_rate)
+    args.positive_n_step = int(positive_n_step)
+    args.positive_gamma = float(positive_gamma)
+    args.negative_n_step = int(negative_n_step)
+    args.negative_gamma = float(negative_gamma)
 
     # Starting main process
 
@@ -616,8 +689,14 @@ def create_dataset_parallel(*,
                 target=run_chunk_process,
                 args=(
                     rank_id, int(games_in_chunk), seed_for_chunk,
-                    int(args.n_step), float(args.gamma),
                     reporter, queue, run_id, int(cidx)
+                ),
+                kwargs=dict(
+                    variation_rate=args.variation_rate,
+                    positive_n_step=args.positive_n_step,
+                    positive_gamma=args.positive_gamma,
+                    negative_n_step=args.negative_n_step,
+                    negative_gamma=args.negative_gamma,
                 ),
             )
             p.daemon = False
@@ -710,25 +789,33 @@ def main():
     ap.add_argument('--games', type=int, default=10, help='Total number of games to simulate')
     ap.add_argument('--num_processes', type=int, default=1, help='Number of parallel worker processes')
     ap.add_argument('--seed', type=int, default=None, help='Base random seed')
-    ap.add_argument('--n_step', type=int, default=3, help='N for n-step returns')
-    ap.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
     ap.add_argument('--out', type=str, default=None, help='Output .npz path')
     ap.add_argument('--chunk_size', type=int, default=250, help='Smaller chunks to reduce memory')
     ap.add_argument('--keep_partials', action='store_true')
     ap.add_argument('--stream_combine', action='store_true',
                     help='Use streaming combination to reduce memory usage (kept for compatibility, streaming is always used)')
+    ap.add_argument('--variation_rate', type=float, default=0.0,
+                    help='Chance to start a variation game instead of standard. Accepts 0..1 or 0..100 (%).')
+    # Asymmetric discounting params
+    ap.add_argument('--positive_n_step', type=int, default=POSITIVE_N_STEP_DEFAULT, help='Horizon for positive rewards')
+    ap.add_argument('--positive_gamma', type=float, default=POSITIVE_GAMMA_DEFAULT, help='Discount for positive rewards')
+    ap.add_argument('--negative_n_step', type=int, default=NEGATIVE_N_STEP_DEFAULT, help='Horizon for negative rewards')
+    ap.add_argument('--negative_gamma', type=float, default=NEGATIVE_GAMMA_DEFAULT, help='Discount for negative rewards')
     args = ap.parse_args()
 
     return create_dataset_parallel(
         games=args.games,
         num_processes=args.num_processes,
         seed=args.seed,
-        n_step=args.n_step,
-        gamma=args.gamma,
         out=args.out,
         chunk_size=int(max(1, args.chunk_size)),
         keep_partials=bool(args.keep_partials),
         stream_combine=bool(args.stream_combine),
+        variation_rate=float(args.variation_rate),
+        positive_n_step=int(args.positive_n_step),
+        positive_gamma=float(args.positive_gamma),
+        negative_n_step=int(args.negative_n_step),
+        negative_gamma=float(args.negative_gamma),
     )
 
 

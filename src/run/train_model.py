@@ -58,6 +58,12 @@ def _apply_runtime_config(*, os_hint: str | None, start_method: str | None, torc
             torch.set_num_threads(int(torch_threads))
         if interop_threads is not None and interop_threads > 0:
             torch.set_num_interop_threads(int(interop_threads))
+        # Prefer faster matmul paths when available (NVIDIA TF32)
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+            torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -251,17 +257,19 @@ class ACDataset(Dataset):
  
 
 def _prepare_batch_tensors(batch: Dict[str, Any], dev: torch.device):
+    # blocking causes nan/infs
+    non_block = False
     def _to_dev(x, dtype):
         if isinstance(x, torch.Tensor):
-            return x.to(device=dev, dtype=dtype)
+            return x.to(device=dev, dtype=dtype, non_blocking=non_block)
         return torch.as_tensor(x, dtype=dtype, device=dev)
 
-    player_hand_idx = torch.from_numpy(np.stack(batch['player_hand_idx'])).to(dev)
-    player_called_idx = torch.from_numpy(np.stack(batch['player_called_idx'])).to(dev)
-    opp_called_idx = torch.from_numpy(np.stack(batch['opp_called_idx'])).to(dev)
-    disc_bincounts = torch.from_numpy(np.stack(batch['disc_bincounts'])).to(dev)
-    game_tile_indicators_idx = torch.from_numpy(np.stack(batch['game_tile_indicators_idx'])).to(dev)
-    game_state_vec = torch.from_numpy(np.stack(batch['game_state_vec'])).to(dev)
+    player_hand_idx = torch.from_numpy(np.stack(batch['player_hand_idx'])).to(dev, non_blocking=non_block)
+    player_called_idx = torch.from_numpy(np.stack(batch['player_called_idx'])).to(dev, non_blocking=non_block)
+    opp_called_idx = torch.from_numpy(np.stack(batch['opp_called_idx'])).to(dev, non_blocking=non_block)
+    disc_bincounts = torch.from_numpy(np.stack(batch['disc_bincounts'])).to(dev, non_blocking=non_block)
+    game_tile_indicators_idx = torch.from_numpy(np.stack(batch['game_tile_indicators_idx'])).to(dev, non_blocking=non_block)
+    game_state_vec = torch.from_numpy(np.stack(batch['game_state_vec'])).to(dev, non_blocking=non_block)
 
     action_idx = _to_dev(batch['action_idx'], torch.long)
     tile_idx = _to_dev(batch['tile_idx'], torch.long)
@@ -584,6 +592,7 @@ def _run_warmup_bc(
     
     # Use main lr for warm-up
     warmup_lr = lr
+    # Optimizer: plain Adam for stability
     warmup_opt = torch.optim.Adam(model.parameters(), lr=warmup_lr)
     print(f"Warm-up BC using learning rate: {warmup_lr}")
     
@@ -652,7 +661,7 @@ def _run_warmup_bc(
                 bc_weight=1.0, policy_weight=0.0,
             )
 
-            warmup_opt.zero_grad()
+            warmup_opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             warmup_opt.step()
@@ -1137,6 +1146,7 @@ def train_ppo(
         ) if ds_validation is not None else None
     )
 
+    # Optimizer: plain Adam (pre-optimization behavior)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     # Optional warm-up: behavior cloning on flat action index + value regression until accuracy threshold

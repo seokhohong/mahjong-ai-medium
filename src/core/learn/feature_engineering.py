@@ -130,6 +130,16 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
     lam = gp.legal_action_mask()
     owner_idx = -1 if gp._owner_of_reactable_tile is None else int(gp._owner_of_reactable_tile)
     # Note: store current_player_idx is not directly available from perspective; infer via is_current_turn + players' turns is outside scope.
+    # Encode recent last_discards per public id as indices
+    last_discards_idx: Dict[str, List[int]] = {}
+    if hasattr(gp, 'last_discards') and isinstance(gp.last_discards, dict):
+        for pid_str, tiles in gp.last_discards.items():
+            try:
+                vals = [int(tile_flat_index(t)) for t in (tiles or [])]
+            except Exception:
+                vals = []
+            last_discards_idx[str(pid_str)] = vals
+
     out = {
         'hand_idx': hand_idx,
         'called_idx': called_idx,
@@ -145,7 +155,8 @@ def encode_game_perspective(gp: GamePerspective) -> Dict[str, Any]:
         'newly_drawn_tile': int(newly_idx),
         'dora_indicator_tiles': dora_indicator_tiles,
         'deal_in_tiles': gp.deal_in_tiles,
-        'wall_count': gp.wall_count
+        'wall_count': gp.wall_count,
+        'last_discards': last_discards_idx,
     }
     return out
 
@@ -172,6 +183,20 @@ def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
     wall_count = np.asarray(features.get('wall_count', []), dtype=np.int8)
     # Optional: deal-in tiles mask back to list of Tiles for GamePerspective
     deal_in_tiles = features.get('deal_in_tiles', [])
+    # Optional: last_discards dict[str, List[int]] back to dict[str, List[Tile]]
+    last_discards_idx = features.get('last_discards', {}) or {}
+    last_discards: Dict[str, List[Tile]] = {}
+    try:
+        for k, vals in last_discards_idx.items():
+            tiles: List[Tile] = []
+            for i in list(vals):
+                ii = int(i)
+                if ii < 0:
+                    continue
+                tiles.append(tile_from_flat_index(ii))
+            last_discards[str(k)] = tiles
+    except Exception:
+        last_discards = {}
 
     # Build basic fields from indices
     player_hand: List[Tile] = []
@@ -238,6 +263,7 @@ def decode_game_perspective(features: Dict[str, Any]) -> GamePerspective:
     gp = GamePerspective(player_hand=player_hand, remaining_tiles=int(remaining_tiles), reactable_tile=last_discarded_tile,
                          owner_of_reactable_tile=last_discard_player_val, called_sets=called_sets,
                          player_discards=player_discards, called_discards=called_discards,
+                         last_discards=last_discards,
                          newly_drawn_tile=newly_drawn_tile, seat_winds=seat_winds, round_wind=round_wind,
                          dora_indicators=dora_indicators, riichi_declaration_tile=riichi_declaration_tile,
                          wall_count=wall_count, deal_in_tiles=deal_in_tiles)

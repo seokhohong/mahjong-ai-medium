@@ -76,14 +76,20 @@ def inspect_data(states: List[Dict[str, Any]], action_pairs: List[tuple[int, int
                 action_desc = {'action_idx': a_idx, 'tile_idx': t_idx}
         except Exception:
             action_desc = {'action_idx': int(pair[0]), 'tile_idx': int(pair[1])}
+        # Riichi declaration turn indices per player (or -1 if not declared)
+        try:
+            riichi_turns = '[' + ', '.join(str(int(gp.riichi_declaration_tile.get(j, -1))) for j in range(4)) + ']'
+        except Exception:
+            # Fallback to unknown if structure not present
+            riichi_turns = '[-1, -1, -1, -1]'
         if include_winds:
             lines.append(
                 f"[{i}] P{(actor_id if actor_id is not None else '?')} | RW:{gp.round_wind.name} | SW["
-                + ', '.join(gp.seat_winds[j].name for j in range(4)) + "] | Riichi:" + str(int(gp.riichi_declared.get(actor_id, False) if hasattr(gp, 'riichi_declared') else 0)) + " | Hand " + hand_s
+                + ', '.join(gp.seat_winds[j].name for j in range(4)) + f"] | RiichiTurn:{riichi_turns} | Hand " + hand_s
             )
         else:
             lines.append(
-                f"[{i}] P{(actor_id if actor_id is not None else '?')} | Riichi:" + str(int(gp.riichi_declared.get(actor_id, False) if hasattr(gp, 'riichi_declared') else 0)) + " | Hand " + hand_s
+                f"[{i}] P{(actor_id if actor_id is not None else '?')} | RiichiTurn:{riichi_turns} | Hand " + hand_s
             )
         lines.append(
             f"     LastDiscard:{last_discard} by {gp._owner_of_reactable_tile} | CanCall:{int(bool(gp.can_call))} | CanRon:{int(gp.can_ron())} | CanTsumo:{int(gp.can_tsumo())}"

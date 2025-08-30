@@ -32,7 +32,7 @@ class TestRecordingPlayerTenpaiReward(unittest.TestCase):
     def _base_gp(self, hand, called_sets_by_player, newly_drawn_tile=None, reactable_tile=None):
         return GamePerspective(player_hand=hand, remaining_tiles=30, reactable_tile=reactable_tile, owner_of_reactable_tile=None,
                                called_sets=called_sets_by_player, player_discards={0: [], 1: [], 2: [], 3: []},
-                               called_discards={0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=newly_drawn_tile,
+                               called_discards={0: [], 1: [], 2: [], 3: []}, last_discards={}, newly_drawn_tile=newly_drawn_tile,
                                seat_winds={0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH},
                                round_wind=Honor.EAST, dora_indicators=[],
                                riichi_declaration_tile={0: -1, 1: -1, 2: -1, 3: -1})

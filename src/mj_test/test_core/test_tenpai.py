@@ -47,7 +47,7 @@ class TestTenpaiHelpers(unittest.TestCase):
         hand14 = list(tenpai13) + [extra]
         gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=None, owner_of_reactable_tile=None,
                              called_sets={0: [], 1: [], 2: [], 3: []}, player_discards={0: [], 1: [], 2: [], 3: []},
-                             called_discards={0: [], 1: [], 2: [], 3: []}, newly_drawn_tile=None,
+                             called_discards={0: [], 1: [], 2: [], 3: []}, last_discards={}, newly_drawn_tile=None,
                              seat_winds={0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH},
                              round_wind=Honor.EAST, dora_indicators=[],
                              riichi_declaration_tile={0: NULL_TILE_INDEX, 1: NULL_TILE_INDEX, 2: NULL_TILE_INDEX,
@@ -75,7 +75,7 @@ class TestTenpaiHelpers(unittest.TestCase):
         gp = GamePerspective(player_hand=hand14, remaining_tiles=30, reactable_tile=None, owner_of_reactable_tile=None,
                              called_sets={0: [chi, pon], 1: [], 2: [], 3: []},
                              player_discards={0: [], 1: [], 2: [], 3: []}, called_discards={0: [], 1: [], 2: [], 3: []},
-                             newly_drawn_tile=None,
+                             last_discards={}, newly_drawn_tile=None,
                              seat_winds={0: Honor.EAST, 1: Honor.SOUTH, 2: Honor.WEST, 3: Honor.NORTH},
                              round_wind=Honor.EAST, dora_indicators=[],
                              riichi_declaration_tile={0: NULL_TILE_INDEX, 1: NULL_TILE_INDEX, 2: NULL_TILE_INDEX,

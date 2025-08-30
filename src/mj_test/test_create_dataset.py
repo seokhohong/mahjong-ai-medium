@@ -1,11 +1,8 @@
 import unittest
 import os
 
-from core.game import Player, MediumJong
 from core.learn.ac_constants import MAX_TURNS
 from core.learn.recording_ac_player import RecordingHeuristicACPlayer
-from core.tenpai import hand_is_tenpai_with_calls
-from mj_test import test_utils
 
 
 # Test helpers
@@ -20,7 +17,6 @@ def _groups_by_game_and_actor(game_ids, actor_ids):
 def _post_action_concealed_and_calls(gp, move):
     from core.action import Discard, Riichi, Chi, Pon, KanDaimin, KanAnkan, KanKakan
     from core.game import CalledSet
-    from core.tile import Tile
     concealed = list(gp.player_hand)
     called_sets = list(gp.called_sets.get(0, []))
     last = gp._reactable_tile
@@ -168,8 +164,6 @@ class TestCreateDataset(unittest.TestCase):
             games=4,
             num_processes=2,
             seed=123,
-            n_step=1,
-            gamma=0.99,
             out='ac_parallel_test_tmp.npz',
             chunk_size=2,
             keep_partials=False,

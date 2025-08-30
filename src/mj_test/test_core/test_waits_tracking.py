@@ -3,7 +3,6 @@ import unittest
 import random
 
 from core.game import MediumJong, Player, OutcomeType
-from core.action import Discard
 from core.tile import Tile, TileType, Suit
 from core.tenpai import waits_optimized as _waits_opt
 
@@ -34,7 +33,7 @@ class TestWaitsTracking(unittest.TestCase):
 
     def test_waits_contains_ron_tile_in_basic_scenario(self):
         # Controlled scenario: player 1 waits on 3p (ryanmen 2-3-4p shape). After P0 discards 3p, P1 should be able to ron.
-        from mj_test.test_utils import ForceDiscardPlayer, NoReactionPlayer
+        from mj_test.test_core.test_utils import ForceDiscardPlayer, NoReactionPlayer
 
         g = MediumJong([
             ForceDiscardPlayer(Tile(Suit.PINZU, TileType.THREE)),

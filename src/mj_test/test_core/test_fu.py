@@ -4,7 +4,7 @@ import unittest
 from core.game import MediumJong, Player, CalledSet
 from core.action import Discard, Tsumo, KanAnkan
 from core.tile import Tile, TileType, Suit, Honor
-from mj_test.test_utils import NoReactionPlayer
+from mj_test.test_core.test_utils import NoReactionPlayer
 
 
 class TsumoIfPossible(Player):

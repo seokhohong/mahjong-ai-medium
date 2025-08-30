@@ -1,15 +1,11 @@
 import unittest
 
-from core.constants import MAX_CALLS, NUM_PLAYERS
-from core.game import MediumJong, Player
+from core.constants import NUM_PLAYERS
 from core.learn.policy_utils import build_move_from_two_head, encode_two_head_action
 from core.game import (
-    MediumJong, Player, Tile, TileType, Suit, Honor,
-    Discard, Tsumo, Pon, Chi, Riichi,
-    KanDaimin, KanAnkan, CalledSet,
-)
+    MediumJong, Player, Tile, TileType, Suit, )
 from core.learn.feature_engineering import encode_game_perspective, decode_game_perspective, MAX_HAND_LEN
-from mj_test.test_utils import ForceDiscardPlayer
+from mj_test.test_core.test_utils import ForceDiscardPlayer
 from core.learn.ac_constants import MAX_TURNS
 
 class TestFeatureEngineering(unittest.TestCase):
